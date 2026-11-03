@@ -1,0 +1,163 @@
+/* El Mitote Comandas — mejora responsive Android v1
+   Complementa /static/style.css; no modifica logica ni datos.
+   Instalar DESPUES de style.css en index.html.
+*/
+
+/* Bases para evitar desbordes en pantallas estrechas */
+html { -webkit-text-size-adjust: 100%; }
+body { overflow-x: hidden; }
+#app, .app-layout, main, #content { min-width: 0; }
+button, input, select, textarea { -webkit-tap-highlight-color: transparent; }
+button { touch-action: manipulation; }
+button:focus-visible, a:focus-visible, .navbtn:focus-visible {
+  outline: 3px solid var(--yellow);
+  outline-offset: 2px;
+}
+.table-wrap { max-width: 100%; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+.card, .stat, .ticket { overflow-wrap: break-word; }
+
+/* Pantallas medianas: sidebar y contenido con mejor proporcion */
+@media (min-width: 701px) and (max-width: 1024px) {
+  .app-layout { grid-template-columns: 195px minmax(0, 1fr); }
+  main { padding: 22px 20px 70px; }
+  .navigation { padding-inline: 8px; }
+}
+
+/* Telefono Android y PWA instalada */
+@media (max-width: 700px) {
+  .topbar {
+    height: auto;
+    min-height: 70px;
+    padding: 8px 12px;
+    gap: 8px;
+    padding-top: max(8px, env(safe-area-inset-top));
+  }
+  .brandline { gap: 8px; min-width: 0; flex: 1 1 auto; }
+  .brandline img { width: 74px; height: 48px; flex: 0 0 auto; }
+  .brandline > div { min-width: 0; }
+  .brandline strong {
+    display: block;
+    font-size: clamp(.92rem, 4.3vw, 1.12rem);
+    letter-spacing: .075em;
+    line-height: 1.2;
+  }
+  .brandline small {
+    font-size: .76rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 40vw;
+  }
+  .topright { flex: 0 0 auto; gap: 6px; }
+  .topright .small { min-height: 44px; padding: 8px 10px; }
+  .connection { font-size: .68rem; white-space: nowrap; }
+
+  /* Navegacion: tres botones completos y parte del siguiente a la vista.
+     Asi queda claro que se puede deslizar para descubrir mas modulos. */
+  .navigation {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 25;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    justify-content: flex-start;
+    gap: 6px;
+    width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+    scrollbar-color: #9b7700 #110b0b;
+    padding: 7px 12px max(9px, env(safe-area-inset-bottom));
+    border-top: 2px solid var(--red);
+    border-right: 0;
+    background: #110b0b;
+    box-shadow: 0 -8px 26px #0008;
+  }
+  .navigation::-webkit-scrollbar { height: 3px; }
+  .navigation::-webkit-scrollbar-thumb { background: #9b7700; border-radius: 10px; }
+  .navbtn {
+    flex: 0 0 92px;
+    width: 92px;
+    min-width: 92px;
+    min-height: 60px;
+    padding: 9px 5px;
+    gap: 4px;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    font-size: .72rem;
+    line-height: 1.15;
+    white-space: normal;
+    overflow-wrap: break-word;
+    scroll-snap-align: start;
+    border-radius: 12px;
+  }
+  .navbtn.active { box-shadow: inset 0 3px var(--yellow); }
+
+  main {
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    padding: 18px 14px calc(116px + env(safe-area-inset-bottom));
+  }
+  .heading { align-items: center; gap: 10px; margin-bottom: 16px; }
+  .heading > div { min-width: 0; }
+  .heading h1 { font-size: clamp(1.4rem, 6vw, 1.8rem); line-height: 1.15; }
+  .eyebrow { font-size: .65rem; letter-spacing: .1em; }
+  .heading .small { min-height: 44px; flex: 0 0 auto; }
+
+  .cards { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .statgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .stat { padding: 14px; min-width: 0; }
+  .stat b { font-size: 1.65rem; }
+  .stat span { font-size: .83rem; line-height: 1.3; }
+  .card { padding: 16px; min-width: 0; }
+  .card h3 { line-height: 1.35; }
+  .grid2 { grid-template-columns: minmax(0, 1fr); }
+  .formgrid { grid-template-columns: minmax(0, 1fr); }
+  .row, .inline, .switchline { min-width: 0; }
+  .row > *, .inline > *, .switchline > * { min-width: 0; }
+  .row.wrap { row-gap: 8px; }
+  .switchline { flex-wrap: wrap; }
+  input, select, textarea { min-width: 0; max-width: 100%; font-size: 16px; }
+  button { min-height: 44px; }
+  .small { min-height: 44px; }
+  .table-wrap { margin-inline: -2px; }
+  table { min-width: 520px; }
+  th, td { padding: 12px 9px; }
+  #toast {
+    left: 12px;
+    right: 12px;
+    bottom: calc(90px + env(safe-area-inset-bottom));
+    max-width: none;
+  }
+  .login-shell { padding: 18px; min-height: 100dvh; }
+  .login-card { padding: 26px 20px; }
+}
+
+/* Telefonos especialmente estrechos */
+@media (max-width: 370px) {
+  .topbar { padding-inline: 9px; }
+  .brandline img { width: 63px; }
+  .brandline strong { font-size: .9rem; }
+  .brandline small { max-width: 34vw; font-size: .68rem; }
+  .connection { font-size: .6rem; }
+  .topright .small { padding-inline: 8px; }
+  main { padding-inline: 11px; }
+  .heading h1 { font-size: 1.38rem; }
+  .heading .small { padding-inline: 9px; font-size: .78rem; }
+  .stat { padding: 12px; }
+  .stat b { font-size: 1.5rem; }
+}
+
+/* Respeta la configuracion de movimiento reducido del dispositivo */
+@media (prefers-reduced-motion: reduce) {
+  .navigation { scroll-behavior: auto; }
+}
