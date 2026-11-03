@@ -318,6 +318,12 @@ def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
 def me(user:User=Depends(auth)):
     return {'id':user.id,'username':user.username,'display':user.display,'role':user.role}
 
+@app.post('/api/auth/refresh')
+def refresh_auth(user:User=Depends(auth)):
+    """Renueva la sesión activa antes de que venza, sin cambiar permisos ni versión de sesión."""
+    token=jwt.encode({'sub':str(user.id),'ver':user.session_version,'exp':now()+timedelta(hours=10)},SECRET_KEY,algorithm='HS256')
+    return {'token':token}
+
 # Notificaciones push para los roles operativos. La suscripción pertenece al usuario autenticado.
 PUSH_ROLES = ('waiter', 'kitchen', 'bar')
 _push_tests = {}
