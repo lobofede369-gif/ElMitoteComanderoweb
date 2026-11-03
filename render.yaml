@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: el-mitote-comandas
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: el-mitote-comandas-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_USERNAME
+        value: propietario
+      - key: PYTHON_VERSION
+        value: 3.11.11
+databases:
+  - name: el-mitote-comandas-db
+    plan: free
