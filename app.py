@@ -259,7 +259,9 @@ def product_dict(p,settings):
 class LoginIn(BaseModel): username:str; secret:str
 @app.post('/api/login')
 def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
-    identifier=f'{request.client.host if request.client else 'unknown'}:{data.username.strip().lower()}'
+    
+identifier=f"{request.client.host if request.client else 'unknown'}:{data.username.strip().lower()}"
+
     attempts=[t for t in login_failures.get(identifier,[]) if time.time()-t<900]
     if len(attempts)>=7:raise HTTPException(429,'Demasiados intentos. Espera 15 minutos')
     user=db.scalar(select(User).where(User.username==data.username.strip()))
