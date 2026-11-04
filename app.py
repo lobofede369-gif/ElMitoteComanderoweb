@@ -99,6 +99,11 @@ class UserPin(Base):
     lookup = Column(String(64), nullable=False, unique=True)
     pin_hash = Column(String(255), nullable=False)
 
+class OwnerRecoveryEvent(Base):
+    __tablename__='owner_recovery_events'
+    fingerprint=Column(String(64),primary_key=True)
+    consumed_at=Column(DateTime(timezone=True),default=now,nullable=False)
+
 class Setting(Base):
     __tablename__='settings'
     id=Column(Integer,primary_key=True)
@@ -412,6 +417,22 @@ def bootstrap():
         if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False))
         if not db.scalar(select(User).where(User.role=='owner')):
             db.add(User(username=ADMIN_USERNAME,display='Propietario',role='owner',password_hash=ph.hash(ADMIN_PASSWORD)))
+            db.flush()
+        # Recuperación excepcional autorizada mediante variables PRIVADAS de Render.
+        # El token solo puede consumirse una vez, aun si Render reinicia.
+        token=os.getenv('OWNER_RECOVERY_TOKEN','').strip()
+        if token:
+            new_password=os.getenv('OWNER_RECOVERY_PASSWORD','')
+            new_pin=os.getenv('OWNER_RECOVERY_PIN','')
+            if len(token)<32 or len(new_password)<14 or not re.fullmatch(r'[0-9]{6}',new_pin):
+                raise RuntimeError('Datos de recuperación del propietario incompletos')
+            fingerprint=hashlib.sha256(token.encode('utf-8')).hexdigest()
+            if not db.get(OwnerRecoveryEvent,fingerprint):
+                owner=db.execute(select(User).where(User.role=='owner').with_for_update()).scalar_one()
+                owner.password_hash=ph.hash(new_password)
+                _set_user_pin(db,owner,new_pin)
+                db.add(OwnerRecoveryEvent(fingerprint=fingerprint))
+                audit(db,None,'owner.recovery',owner_id=owner.id)
         db.commit()
 
 @asynccontextmanager
@@ -970,6 +991,33 @@ def products(db:Session=Depends(db_session),user:User=Depends(auth)):
     query=select(Product).outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id).where(
         ArchivedProduct.product_id.is_(None)).order_by(Product.category,Product.name)
     return [product_dict(p,s,db) for p in db.scalars(query)]
+class RemoveCategoryIn(BaseModel):
+    name:str=Field(min_length=1,max_length=80)
+    destination:str=Field(min_length=1,max_length=80)
+    expected_visible_count:int=Field(ge=1)
+
+@app.post('/api/categories/remove')
+async def remove_category(data:RemoveCategoryIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    source=data.name.strip()
+    destination=data.destination.strip()
+    if not source or not destination or source.casefold()==destination.casefold():
+        raise HTTPException(400,'Indica una categoría destino diferente')
+    rows=db.scalars(select(Product).where(Product.category==source).with_for_update()).all()
+    if not rows:raise HTTPException(404,'La categoría ya no existe')
+    hidden=set(db.scalars(select(ArchivedProduct.product_id).where(
+        ArchivedProduct.product_id.in_([p.id for p in rows]))))
+    visible_count=sum(p.id not in hidden for p in rows)
+    if visible_count!=data.expected_visible_count:
+        raise HTTPException(409,'El contenido de la categoría cambió; actualiza antes de borrarla')
+    for p in rows:
+        p.category=destination
+        p.version=(p.version or 1)+1
+    audit(db,user,'category.remove',source=source,destination=destination,
+          active_products=visible_count,all_products=len(rows))
+    db.commit();await notify()
+    return {'ok':True,'moved':visible_count,'new_category':destination}
+
 class ProductArchiveIn(BaseModel):
     expected_version:int=Field(ge=1)
     reason:str=Field(min_length=3,max_length=200)
@@ -2553,3 +2601,4 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
 # Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
 import mitote_extensions  # noqa: E402
+import menu_photo_import  # noqa: E402
