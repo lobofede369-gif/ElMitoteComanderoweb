@@ -2512,7 +2512,7 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     table=Table(entries,colWidths=[220,150]);table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.4,colors.lightgrey),('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),8)]))
     from xml.sax.saxutils import escape as xml_escape
     story.append(table);story.append(Spacer(1,14))
-    # El PDF archivado lleva las ventas detalladas que desaparecen del tablero activo.
+    # Detalle inmutable de ventas y propinas del mismo turno.
     sale_by_account={}
     tip_by_payment={x.payment_id:x.cents for x in tips}
     for payment in payments:
@@ -2527,21 +2527,7 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
             name=account.name if account else 'Cuenta'
             row=sale_by_account[account_id]
             sale_rows.append((Paragraph('#'+str(account_id)+' · '+xml_escape(name),style['Normal']),
-                              '
-    story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
-    story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
-    doc.build(story)
-    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
-# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
-import mitote_extensions  # noqa: E402
-+amount(row['sales']),'
-    story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
-    story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
-    doc.build(story)
-    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
-# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
-import mitote_extensions  # noqa: E402
-+amount(row['tips'])))
+                              '$'+amount(row['sales']),'$'+amount(row['tips'])))
         detail_table=Table(sale_rows,colWidths=[210,80,80],repeatRows=1)
         detail_table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.3,colors.lightgrey),
                                          ('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
@@ -2554,21 +2540,7 @@ import mitote_extensions  # noqa: E402
         move_rows=[('Tipo','Importe','Motivo')]
         for movement in moves:
             move_rows.append(('Entrada' if movement.kind=='in' else 'Salida',
-                ('
-    story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
-    story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
-    doc.build(story)
-    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
-# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
-import mitote_extensions  # noqa: E402
- if movement.kind=='in' else '-
-    story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
-    story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
-    doc.build(story)
-    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
-# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
-import mitote_extensions  # noqa: E402
-)+amount(movement.cents),
+                ('$' if movement.kind=='in' else '-$')+amount(movement.cents),
                 Paragraph(xml_escape(movement.reason),style['Normal'])))
         movements_table=Table(move_rows,colWidths=[75,75,220],repeatRows=1)
         movements_table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.3,colors.lightgrey),
