@@ -149,7 +149,7 @@ function orderProductConfig(p){
   return `<div class="order-config-block"><div class="row"><b>Precio base</b><span class="price">${money(p.current_price??p.price)}</span></div>${promo}
     ${variants.length?`<label>Presentación<select name="variant_id"><option value="">Estándar · ${money(p.current_price??p.price)}</option>${variants.map(v=>`<option value="${v.id}">${esc(v.name)} · ${money(v.price)}</option>`).join('')}</select></label>`:''}
     ${groups.map(g=>`<fieldset class="modifier-group" data-group-id="${g.id}" data-min="${g.min_select}" data-max="${g.max_select}"><legend>${esc(g.name)} <small>${g.min_select?'Obligatorio':'Opcional'} · máximo ${g.max_select}</small></legend><div class="modifier-options">${g.options.filter(o=>o.active).map(o=>`<label class="modifier-option"><input type="checkbox" name="modifier_option_ids" value="${o.id}"><span>${esc(o.name)}</span><b>${Number(o.price_delta)>0?'+'+money(o.price_delta):'Sin costo'}</b></label>`).join('')}</div></fieldset>`).join('')}
-    <div class="formgrid"><label>Preparación estimada (min)<input name="prep_minutes" type="number" min="0" max="240" value="15"></label><label>Salida después de (min)<input name="release_after_minutes" type="number" min="0" max="240" value="0"></label></div>
+    <div class="formgrid"><label>Preparación estimada (min)<input name="prep_minutes" type="number" min="1" max="240" value="${Number(p.prep_default_minutes||15)}" readonly title="Configuración del menú"></label><label>Salida después de (min)<input name="release_after_minutes" type="number" min="0" max="240" value="0"></label></div>
     <label>Nota para cocina/barra<textarea name="note" maxlength="300" rows="2" placeholder="Ej. sin cebolla, salsa aparte, término medio…"></textarea></label>
   </div>`;
 }
@@ -412,9 +412,11 @@ async function showPeriodDetail(id){
 }
 
 async function showProducts(){
-  const ps=await api('/products');state.products=ps;
+  const [ps,prepConfig]=await Promise.all([api('/products'),api('/prep/config')]);state.products=ps;
   return `<div class="card"><h3>Agregar producto al menú</h3><p>Registra precios reales; no se cargan productos ficticios.</p><form id="product-add" class="formrow"><label>Nombre<input name="name" required></label><div class="formgrid"><label>Categoría<input name="category" value="General"></label><label>Destino<select name="station"><option value="kitchen">Cocina</option><option value="bar">Barra</option></select></label><label>Precio ($)<input name="price" type="number" min="0" step="0.01" required></label><label>Existencias iniciales<input name="stock" type="number" min="0" value="0"></label></div><label class="inline"><input name="inventory_enabled" type="checkbox" style="width:auto"> Control individual de inventario</label><button class="primary">Agregar producto</button></form></div>
+<div class="card"><h3>Tiempo general por comanda</h3><p>${prepConfig.batch_limit_minutes} min · Aviso amarillo desde ${prepConfig.warning_percent}% del plazo</p>${state.user.role==='owner'?'<button class="outline small" data-action="prep-batch-limit">Configurar tiempos</button>':''}</div>
   <h2 class="section">Menú y personalización (${ps.length})</h2><div class="cards">${ps.map(p=>`<details class="card product-config-admin"><summary><div class="row"><div><h3>${esc(p.name)}</h3><div class="mini">${esc(p.category)} · ${p.station==='kitchen'?'Cocina':'Barra'} · Base ${money(p.price)}</div></div>${pill(p.status)}</div></summary><div class="product-config-content">
+    <div class="row"><span>Tiempo estimado</span><b>${Number(p.prep_default_minutes||15)} min</b></div><button class="outline small" data-action="prep-product-limit" data-id="${p.id}">Configurar preparación</button>
     <div class="row"><span>Precio vigente</span><b class="price">${money(p.current_price??p.price)}</b></div>${p.promotion?`<div class="note">Promoción activa: ${esc(p.promotion.name)}</div>`:''}<div class="row"><button class="outline small" data-action="edit-product" data-id="${p.id}">Editar producto</button></div>
     <h4>Presentaciones</h4>${(p.variants||[]).map(v=>`<div class="lineitem row"><span>${esc(v.name)} · ${money(v.price)}</span><button class="ghost small" data-action="toggle-variant" data-id="${v.id}" data-active="${!v.active}">${v.active?'Desactivar':'Activar'}</button></div>`).join('')||'<p class="mini">Sin presentaciones adicionales.</p>'}
     <form id="variant-add-${p.id}" class="formrow"><div class="formgrid"><label>Nueva presentación<input name="name" required maxlength="100" placeholder="Grande, chico, familiar…"></label><label>Precio ($)<input name="price" type="number" min="0" step="0.01" required></label></div><button class="outline small">Agregar presentación</button></form>
@@ -514,6 +516,24 @@ case 'repeat-item':{const accountId=Number(btn.dataset.account);const qty=Number
 case 'prep-item-ready':{
   await api('/tickets/'+Number(btn.dataset.ticket)+'/items/'+id+'/ready','POST',{});
   toast('Producto marcado como listo');await render();break;
+}case 'prep-product-limit':{
+  const p=state.products.find(x=>x.id===id);if(!p)throw Error('Producto inexistente');
+  const raw=prompt('Tiempo estimado para '+p.name+' (minutos):',String(p.prep_default_minutes||15));
+  if(raw===null)return;
+  const minutes=Number(raw);if(!Number.isInteger(minutes)||minutes<1||minutes>240)throw Error('Indica entre 1 y 240 minutos');
+  await api('/prep/products/'+id,'PUT',{minutes});
+  toast('Tiempo de producto actualizado');await render();break;
+}case 'prep-batch-limit':{
+  const config=await api('/prep/config');
+  const minutesRaw=prompt('Límite general por comanda (minutos):',String(config.batch_limit_minutes));
+  if(minutesRaw===null)return;
+  const percentRaw=prompt('Aviso amarillo a partir de qué porcentaje (50-95):',String(config.warning_percent));
+  if(percentRaw===null)return;
+  const batch_limit_minutes=Number(minutesRaw),warning_percent=Number(percentRaw);
+  if(!Number.isInteger(batch_limit_minutes)||batch_limit_minutes<1||batch_limit_minutes>240||
+     !Number.isInteger(warning_percent)||warning_percent<50||warning_percent>95)throw Error('Tiempos fuera de rango');
+  await api('/prep/config','PUT',{batch_limit_minutes,warning_percent});
+  toast('Límite general actualizado');await render();break;
 }case 'toggle-variant':await api(`/product-variants/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Presentación actualizada');await render();break;
 case 'toggle-option':await api(`/modifier-options/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Modificador actualizado');await render();break;
 case 'toggle-promotion':await api(`/promotions/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Promoción actualizada');await render();break;
