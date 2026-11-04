@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import (
-    app, Base, Batch, Account, DiningTable, TableOccupancy, Product, OrderItem,
+    app, Base, Batch, Account, DiningTable, TableOccupancy, Product, ArchivedProduct, CashPeriod, OrderItem,
     OrderItemMeta, StationTicket, Payment, PaymentTip, Audit, User,
     SessionLocal, db_session, auth, allow, audit, active_period, TipDistribution, now, notify,
     push_to, fcm_to, ticket_status, StatusIn, amount
@@ -128,7 +128,9 @@ def prep_config(db: Session = Depends(db_session), user: User = Depends(auth)):
     allow(user, "owner", "admin")
     p = policy(db)
     configs = {row.product_id: row.minutes for row in db.scalars(select(ProductPrep))}
-    products = db.scalars(select(Product).order_by(Product.name, Product.id)).all()
+    products = db.scalars(select(Product).outerjoin(ArchivedProduct,
+        ArchivedProduct.product_id == Product.id).where(
+        ArchivedProduct.product_id.is_(None)).order_by(Product.name, Product.id)).all()
     return {"batch_minutes": p.batch_minutes if p else 25,
             "warning_percent": p.warning_percent if p else 80,
             "products": [{"id": pr.id, "name": pr.name, "station": pr.station,
@@ -170,7 +172,13 @@ async def put_product_prep(product_id: int, data: ProductPrepIn, db: Session = D
 @app.get("/api/preparation/tickets")
 def preparation_tickets(db: Session = Depends(db_session), user: User = Depends(auth)):
     allow(user, "owner", "admin", "kitchen", "bar")
-    query = select(StationTicket).order_by(StationTicket.id.desc()).limit(150)
+    stamp = now()
+    active = db.scalar(select(CashPeriod).where(
+        CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    if not active:
+        return {"server_time": stamp.isoformat(), "tickets": []}
+    query = select(StationTicket).join(Batch, Batch.id == StationTicket.batch_id).where(
+        Batch.created_at >= active.opened_at).order_by(StationTicket.id.desc()).limit(150)
     if user.role in ("kitchen", "bar"):
         query = query.where(StationTicket.station == user.role)
     tickets = db.scalars(query).all()
