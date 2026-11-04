@@ -30,7 +30,7 @@ const gallery={
  }
 };
 function run(selectedCategory,catalogSearch,visible){
- const ctx={selectedCategory,catalogSearch,$:(s)=>s==='#pos-catalog'?gallery:null,
+ const ctx={selectedCategory,catalogSearch,$:(s,root)=>root?root.querySelector(s):(s==='#pos-catalog'?gallery:null),
  $$:(s,root)=>root.querySelectorAll(s)};
  vm.runInNewContext(filterFunction+'\napplyCatalogFilter()',ctx);
  assert.deepEqual(products.map(p=>!p.hidden),visible);
