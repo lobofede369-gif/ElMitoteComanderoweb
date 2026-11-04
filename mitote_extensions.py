@@ -420,14 +420,25 @@ class AnalyticsQuery(BaseModel):
 
 
 @app.get("/api/owner/analytics")
-def owner_analytics(start: date, end: date, db: Session = Depends(db_session),
-                    user: User = Depends(auth)):
+def owner_analytics(start: date, end: date, scope: Literal["current","history"] = "current",
+                    db: Session = Depends(db_session), user: User = Depends(auth)):
     allow(user, "owner")
     if end < start or (end - start).days > 93:
         raise HTTPException(400, "El periodo debe ser de 1 a 94 días")
-    begin = datetime.combine(start, day_time.min, LOCAL_TZ).astimezone(timezone.utc)
-    finish = datetime.combine(end + timedelta(days=1), day_time.min, LOCAL_TZ).astimezone(timezone.utc)
-    payments = db.scalars(select(Payment).where(Payment.created_at >= begin, Payment.created_at < finish)).all()
+    active = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(
+        CashPeriod.id.desc())) if scope == "current" else None
+    if scope == "current":
+        # El corte vigente define el rango. Fechas históricas se consultan aparte.
+        end = datetime.now(LOCAL_TZ).date()
+        start = aware(active.opened_at).astimezone(LOCAL_TZ).date() if active else end
+        begin = aware(active.opened_at) if active else datetime.combine(start, day_time.min, LOCAL_TZ).astimezone(timezone.utc)
+        finish = datetime.combine(end + timedelta(days=1), day_time.min, LOCAL_TZ).astimezone(timezone.utc)
+    else:
+        begin = datetime.combine(start, day_time.min, LOCAL_TZ).astimezone(timezone.utc)
+        finish = datetime.combine(end + timedelta(days=1), day_time.min, LOCAL_TZ).astimezone(timezone.utc)
+    pay_query = select(Payment).where(Payment.created_at >= begin, Payment.created_at < finish)
+    if active: pay_query = pay_query.where(Payment.period_id == active.id)
+    payments = db.scalars(pay_query).all() if scope == "history" or active else []
     sales_cents = sum(p.cents for p in payments)
     accounts_paid = len({p.account_id for p in payments})
     methods = {method: sum(p.cents for p in payments if p.method == method)
@@ -438,7 +449,9 @@ def owner_analytics(start: date, end: date, db: Session = Depends(db_session),
         local = aware(p.created_at).astimezone(LOCAL_TZ)
         by_day[local.date().isoformat()] += p.cents
         by_hour[f"{local.hour:02d}:00"] += p.cents
-    batches = db.scalars(select(Batch).where(Batch.created_at >= begin, Batch.created_at < finish)).all()
+    batches_query = select(Batch).where(Batch.created_at >= begin, Batch.created_at < finish)
+    if active: batches_query = batches_query.where(Batch.created_at >= active.opened_at)
+    batches = db.scalars(batches_query).all() if scope == "history" or active else []
     batch_ids = [b.id for b in batches]
     products = {}
     if batch_ids:
@@ -452,13 +465,17 @@ def owner_analytics(start: date, end: date, db: Session = Depends(db_session),
     product_rank = sorted(products.values(), key=lambda x: (-x["quantity"], x["name"]))[:15]
     for product in product_rank:
         product["estimated_gross"] = amount(product.pop("estimated_gross_cents"))
-    tickets = db.scalars(select(StationTicket).where(
+    ticket_query = select(StationTicket).where(
         StationTicket.ready_at >= begin, StationTicket.ready_at < finish,
-        StationTicket.status == "ready")).all()
+        StationTicket.status == "ready")
+    if active: ticket_query = ticket_query.where(StationTicket.batch_id.in_(batch_ids))
+    tickets = db.scalars(ticket_query).all() if scope == "history" or active else []
     prep_samples = [elapsed_seconds(t.created_at, t.ready_at) for t in tickets]
     prep_average = round(sum(prep_samples) / len(prep_samples) / 60, 1) if prep_samples else None
-    assignments = db.scalars(select(Audit).where(
-        Audit.action == "table.assign", Audit.created_at >= begin, Audit.created_at < finish)).all()
+    audit_query = select(Audit).where(
+        Audit.action == "table.assign", Audit.created_at >= begin, Audit.created_at < finish)
+    if active: audit_query = audit_query.where(Audit.created_at >= active.opened_at)
+    assignments = db.scalars(audit_query).all() if scope == "history" or active else []
     rotation = {}
     for entry in assignments:
         try:
@@ -471,6 +488,7 @@ def owner_analytics(start: date, end: date, db: Session = Depends(db_session),
         rotation[label] = rotation.get(label, 0) + 1
     return {
         "period": {"start": start.isoformat(), "end": end.isoformat()},
+        "scope": scope, "active_period_id": active.id if active else None,
         "sales": amount(sales_cents), "paid_accounts": accounts_paid,
         "average_ticket": amount(round(sales_cents / accounts_paid)) if accounts_paid else "0.00",
         "methods": {k: amount(v) for k, v in methods.items()},
