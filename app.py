@@ -433,6 +433,8 @@ def bootstrap():
                 _set_user_pin(db,owner,new_pin)
                 db.add(OwnerRecoveryEvent(fingerprint=fingerprint))
                 audit(db,None,'owner.recovery',owner_id=owner.id)
+        # Solo aplica menú cuando exista la aprobación explícita en Render.
+        menu_photo_import.apply_approved_photo_menu_at_startup(db)
         db.commit()
 
 @asynccontextmanager
