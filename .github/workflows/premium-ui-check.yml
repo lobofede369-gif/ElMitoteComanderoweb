@@ -101,6 +101,7 @@ jobs:
           python -m scripts.test_pin_login
           python -m scripts.test_audit_regressions
           python -m scripts.test_new_features
+          python -m scripts.test_cash_cut_archive
 
 
   postgres-integration:
