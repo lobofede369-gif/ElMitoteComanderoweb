@@ -4,7 +4,10 @@ This file must never be run on the production service.
 Run only with MITOTE_DEMO_MODE=1 and the exact local sqlite demo URL.
 """
 import os
+import sys
+from pathlib import Path
 from sqlalchemy import select
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as mitote
 
 EXPECTED_DB = "sqlite:////tmp/mitote-preview.db"
