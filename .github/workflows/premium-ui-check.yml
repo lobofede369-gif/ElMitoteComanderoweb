@@ -5,6 +5,7 @@ on:
     branches:
       - "design/**"
       - "preview/**"
+      - "fix/**"
   pull_request:
     branches:
       - main
@@ -24,6 +25,8 @@ jobs:
           node --check static/app.js
           node --check static/pos-ui-v3.js
           node --check static/sw.js
+          node --check scripts/test_catalog_filter.cjs
+          node scripts/test_catalog_filter.cjs
 
       - name: Comprobar integración visual sin reemplazar módulos
         run: |
@@ -37,8 +40,8 @@ jobs:
           sw = Path('static/sw.js').read_text(encoding='utf-8')
           assert '/static/theme-obsidian-titanium.css?v=1' in html
           assert '/static/theme-obsidian-modules.css?v=2' in html
-          assert '/static/app.js?v=15' in html
-          assert '/static/pos-ui-v3.js?v=6' in html
+          assert '/static/app.js?v=16' in html
+          assert '/static/pos-ui-v3.js?v=7' in html
           assert 'theme-obsidian-modules.css?v=2' in sw
           assert '/static/theme-luxury-motion.css?v=1' in html
           assert 'theme-luxury-motion.css?v=1' in sw
@@ -47,11 +50,16 @@ jobs:
           waiter = Path('static/pos-ui-v3.js').read_text(encoding='utf-8')
           assert '/static/theme-service-fast.css?v=1' in html
           assert '/static/theme-service-fast.css?v=1' in sw
-          assert 'mitote-comandas-v18' in sw
+          assert 'mitote-comandas-v19' in sw
           assert 'pos-search' in waiter and 'applyCatalogFilter()' in waiter
           assert 'obs.observe(content,{childList:true});' in waiter
           assert 'subtree:true' not in waiter
           assert '.table-choice-grid' in fast and '.pos-search-wrap' in fast
+          assert '/static/theme-pin-login.css?v=1' in html
+          assert 'theme-pin-login.css?v=1' in sw
+          assert 'id="login-pin-form"' in html
+          assert 'id="login-pin"' in html
+          assert 'class PinLoginIn' in Path('app.py').read_text(encoding='utf-8')
           assert 'prefers-reduced-motion' in fast
           assert '#login[hidden],#app[hidden]' in css
           assert 'premium-shortcut-grid' in modules
@@ -64,7 +72,7 @@ jobs:
                        'showProducts', 'showInventory', 'showUsers',
                        'showApprovals', 'showAudit', 'showOverview'):
               assert 'function '+name+'(' in app, name
-          for path in (Path('static/theme-obsidian-titanium.css'), Path('static/theme-obsidian-modules.css'), Path('static/theme-luxury-motion.css'), Path('static/theme-service-fast.css')):
+          for path in (Path('static/theme-obsidian-titanium.css'), Path('static/theme-obsidian-modules.css'), Path('static/theme-luxury-motion.css'), Path('static/theme-service-fast.css'), Path('static/theme-pin-login.css')):
               text = path.read_text(encoding='utf-8')
               assert text.count('{') == text.count('}'), path
           assert "const canEditAccount=state.user?.role==='owner'" in app
@@ -85,4 +93,6 @@ jobs:
         run: python -m pip install -r requirements.txt httpx==0.28.1
 
       - name: Validar API y roles con SQLite temporal
-        run: python -m scripts.test_owner_permissions
+        run: |
+          python -m scripts.test_owner_permissions
+          python -m scripts.test_pin_login
