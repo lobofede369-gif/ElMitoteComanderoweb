@@ -67,5 +67,22 @@ jobs:
           for path in (Path('static/theme-obsidian-titanium.css'), Path('static/theme-obsidian-modules.css'), Path('static/theme-luxury-motion.css'), Path('static/theme-service-fast.css')):
               text = path.read_text(encoding='utf-8')
               assert text.count('{') == text.count('}'), path
-          print('Validaciones estructurales correctas.')
+          assert "const canEditAccount=state.user?.role==='owner'" in app
+          assert "const actionsHtml=canEditAccount" in app
+          backend = Path('app.py').read_text(encoding='utf-8')
+          for handler in ('rename_account','transfer_account_table','merge_accounts',
+                          'split_account','reassign','reopen_closed_account','void_account'):
+              assert 'def '+handler+'(' in backend
+          print('Validaciones estructurales y propietario exclusivo correctas.')
           PY
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Dependencias para pruebas de permisos
+        run: python -m pip install -r requirements.txt httpx==0.28.1
+
+      - name: Validar API y roles con SQLite temporal
+        run: python -m scripts.test_owner_permissions
