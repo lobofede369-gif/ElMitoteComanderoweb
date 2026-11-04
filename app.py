@@ -482,14 +482,24 @@ def promotion_is_active(promo, at=None):
     if not promo.active:return False
     try:
         days={int(x) for x in (promo.weekdays or '').split(',') if x.strip()!=''}
-        if at.weekday() not in days:return False
-        today=at.date().isoformat()
-        if promo.start_date and today<promo.start_date:return False
-        if promo.end_date and today>promo.end_date:return False
         current=at.strftime('%H:%M')
         start=promo.start_time or '00:00';end=promo.end_time or '23:59'
-        if start<=end:return start<=current<=end
-        return current>=start or current<=end
+        # Promociones nocturnas pertenecen al día en que comenzaron.
+        # Ej.: lunes 22:00–martes 02:00 debe seguir activa el martes 01:00.
+        effective_date=at.date()
+        if start<=end:
+            if not start<=current<=end:return False
+        elif current>=start:
+            pass
+        elif current<=end:
+            effective_date-=timedelta(days=1)
+        else:
+            return False
+        if effective_date.weekday() not in days:return False
+        day=effective_date.isoformat()
+        if promo.start_date and day<promo.start_date:return False
+        if promo.end_date and day>promo.end_date:return False
+        return True
     except Exception:
         return False
 
@@ -574,7 +584,8 @@ def login_pin(data: PinLoginIn, request: Request, db: Session = Depends(db_sessi
 class LoginIn(BaseModel): username:str; secret:str
 @app.post('/api/login')
 def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
-    identifier=f"{request.client.host if request.client else 'unknown'}:{data.username.strip().lower()}"
+    # Un límite por IP evita saltar el bloqueo probando distintos usuarios.
+    identifier=f"password:{request.client.host if request.client else 'unknown'}"
     attempts=[t for t in login_failures.get(identifier,[]) if time.time()-t<900]
     if len(attempts)>=7:raise HTTPException(429,'Demasiados intentos. Espera 15 minutos')
     user=db.scalar(select(User).where(User.username==data.username.strip()))
@@ -2400,7 +2411,8 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
             entries.append(('Reparto · '+share['employee_name'],'$'+share['share']+' · entregado $'+share['paid']))
     entries.extend([('Entradas y salidas netas','$'+amount(net)),('Efectivo esperado','$'+amount(expected)),('Efectivo contado','$'+amount(p.counted_cents)),('Diferencia','$'+amount(p.counted_cents-expected))])
     table=Table(entries,colWidths=[220,150]);table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.4,colors.lightgrey),('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),8)]))
-    story.append(table);story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+(p.note or 'Sin observaciones'),style['Normal']))
+    from xml.sax.saxutils import escape as xml_escape
+    story.append(table);story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+xml_escape(p.note or 'Sin observaciones'),style['Normal']))
     story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
     story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
     doc.build(story)
