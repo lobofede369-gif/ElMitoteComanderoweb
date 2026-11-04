@@ -7,7 +7,7 @@
 - **Al cerrar caja** (solo administrador/propietario): el cierre exige cuentas finalizadas, movimientos resueltos y reparto de propinas configurado. En la misma transacción se guarda \`cash_cut_archives\` (detalle JSON completo + archivo PDF binario). Si falla la generación del PDF, el cierre no se confirma.
 - **Historial del corte**: \`/api/cash/history\`, \`/api/cash/periods/{id}\` y \`/api/cash/periods/{id}/report.pdf\` consultan la instantánea guardada cuando existe. El PDF incluye ventas por cuenta, propinas separadas, cobros por cajero y movimientos de efectivo del corte.
 - Los cortes anteriores a esta actualización no tienen una instantánea histórica guardada retroactivamente; conservan la consulta y generación de PDF previas.
-- Las métricas analíticas globales siguen disponibles para el propietario por fechas. Los módulos de operación inmediata no muestran cobros de cortes cerrados.
+- El panel de estadísticas muestra **por defecto únicamente el corte activo**, y permite consultar cifras históricas por fechas en modo explícito. Los módulos de operación inmediata nunca muestran cobros de cortes cerrados.
 - Los registros y los PDF se conservan en PostgreSQL; **no se borran físicamente las ventas ni las propinas**. Crear un turno nuevo limpia únicamente las vistas activas.
 
 ## Compatibilidad
