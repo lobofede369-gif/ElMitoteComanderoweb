@@ -149,7 +149,7 @@ function orderProductConfig(p){
   return `<div class="order-config-block"><div class="row"><b>Precio base</b><span class="price">${money(p.current_price??p.price)}</span></div>${promo}
     ${variants.length?`<label>Presentación<select name="variant_id"><option value="">Estándar · ${money(p.current_price??p.price)}</option>${variants.map(v=>`<option value="${v.id}">${esc(v.name)} · ${money(v.price)}</option>`).join('')}</select></label>`:''}
     ${groups.map(g=>`<fieldset class="modifier-group" data-group-id="${g.id}" data-min="${g.min_select}" data-max="${g.max_select}"><legend>${esc(g.name)} <small>${g.min_select?'Obligatorio':'Opcional'} · máximo ${g.max_select}</small></legend><div class="modifier-options">${g.options.filter(o=>o.active).map(o=>`<label class="modifier-option"><input type="checkbox" name="modifier_option_ids" value="${o.id}"><span>${esc(o.name)}</span><b>${Number(o.price_delta)>0?'+'+money(o.price_delta):'Sin costo'}</b></label>`).join('')}</div></fieldset>`).join('')}
-    <div class="formgrid"><label>Preparación estimada (min)<input name="prep_minutes" type="number" min="0" max="240" value="15"></label><label>Salida después de (min)<input name="release_after_minutes" type="number" min="0" max="240" value="0"></label></div>
+    <div class="formgrid"><label>Preparación estimada (min)<input name="prep_minutes" type="number" min="1" max="240" value="${Number(p.prep_default_minutes||15)}" readonly title="Configuración del menú"></label><label>Salida después de (min)<input name="release_after_minutes" type="number" min="0" max="240" value="0"></label></div>
     <label>Nota para cocina/barra<textarea name="note" maxlength="300" rows="2" placeholder="Ej. sin cebolla, salsa aparte, término medio…"></textarea></label>
   </div>`;
 }
@@ -259,7 +259,59 @@ async function refreshAccountPanel(id,admin=false){
     await render();
   }
 }
-async function showStation(history=false,all=false){const tickets=await api('/tickets');state.data.tickets=tickets;const shown=tickets.filter(t=>history?t.status==='ready':t.status!=='ready');const newCount=tickets.filter(t=>t.status==='new'&&(all?true:t.station===state.user.role)).length;return `<div class="statgrid">${stat('Comandas nuevas',newCount)}${stat('En proceso',shown.filter(t=>t.status==='received'||t.status==='preparing').length)}</div>${!history?'<div class="note">Las comandas nuevas requieren confirmar recepción. Los tiempos de preparación y salida se muestran por producto.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':''}<div class="cards" style="margin-top:15px">${shown.map(t=>`<div class="card ticket ${t.status}"><div class="row"><h3>${esc(t.account)} · #${t.account_id}</h3>${pill(t.status)}</div><div class="mini">${t.station==='kitchen'?'🍳 Cocina':'🥤 Barra'} · Mesero: ${esc(t.waiter)} · Comanda #${t.batch_id} · ${t.created_at?new Date(t.created_at).toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'}):''}</div><div class="divider"></div>${t.items.map(i=>`<div class="lineitem"><b>${i.qty} × ${esc(i.name)}${i.variant_name?' · '+esc(i.variant_name):''}</b>${i.modifiers?.length?`<div class="mini">Extras: ${i.modifiers.map(m=>esc(m.name)).join(', ')}</div>`:''}${i.note?`<div class="note">${esc(i.note)}</div>`:''}<div class="mini">Preparación estimada: ${Number(i.prep_minutes||15)} min${i.release_after_minutes?' · Salida programada +'+Number(i.release_after_minutes)+' min desde el envío':''}</div></div>`).join('')}${!history?`<button class="primary" data-action="ticket-status" data-id="${t.id}" data-status="${t.status==='new'?'received':t.status==='received'?'preparing':'ready'}">${t.status==='new'?'Confirmar recepción':t.status==='received'?'Iniciar preparación':'Marcar como listo'}</button>`:''}</div>`).join('')||'<div class="empty">No hay comandas en esta sección.</div>'}</div>`}
+function prepClock(elapsed,minutes,done,warning=80){
+  const seconds=Math.max(0,Number(elapsed)||0),limit=Math.max(1,Number(minutes)||15);
+  return '<strong class="prep-clock" data-prep-clock data-elapsed="'+seconds+
+    '" data-origin="'+performance.now()+'" data-limit="'+limit+
+    '" data-warning="'+warning+'" data-done="'+(done?'1':'0')+'">'+
+    Math.floor(seconds/60)+' min</strong>';
+}
+function updatePrepClocks(){
+  document.querySelectorAll('[data-prep-clock]').forEach(el=>{
+    const limit=Math.max(1,Number(el.dataset.limit))*60,warning=Number(el.dataset.warning||80);
+    const elapsed=Math.floor(Number(el.dataset.elapsed)+(el.dataset.done==='1'?0:
+      Math.max(0,(performance.now()-Number(el.dataset.origin))/1000)));
+    const minutes=String(Math.floor(elapsed/60)).padStart(2,'0');
+    const seconds=String(elapsed%60).padStart(2,'0');
+    const late=elapsed>limit,soon=elapsed>=limit*warning/100;
+    el.textContent=minutes+':'+seconds+' / '+Math.floor(limit/60)+' min'+(late?' · RETRASO':soon?' · Por vencer':'');
+    el.style.color=late?'#e04b4b':soon?'#c88e1c':'#299b69';
+    el.setAttribute('aria-label','Tiempo de preparación '+el.textContent);
+  });
+}
+setInterval(updatePrepClocks,1000);
+async function showStation(history=false,all=false){
+  const tickets=await api('/tickets');state.data.tickets=tickets;
+  const shown=tickets.filter(t=>history?t.status==='ready':t.status!=='ready');
+  const newCount=tickets.filter(t=>t.status==='new'&&(all||t.station===state.user.role)).length;
+  const cards=shown.map(t=>{
+    const timer=prepClock(t.prep_batch_elapsed_seconds,t.prep_batch_minutes,
+      t.prep_batch_completed,t.prep_warning_percent);
+    const lines=t.items.map(i=>{
+      const itemTimer=prepClock(i.prep_elapsed_seconds,i.prep_minutes,i.prep_ready,t.prep_warning_percent);
+      const readyButton=!history&&t.status==='preparing'&&!i.prep_ready?
+        '<button class="outline small" data-action="prep-item-ready" data-id="'+i.id+
+        '" data-ticket="'+t.id+'">✓ Producto listo</button>':'';
+      return '<div class="lineitem"><b>'+i.qty+' × '+esc(i.name)+
+        (i.variant_name?' · '+esc(i.variant_name):'')+'</b>'+
+        (i.modifiers?.length?'<div class="mini">Extras: '+i.modifiers.map(m=>esc(m.name)).join(', ')+'</div>':'')+
+        (i.note?'<div class="note">'+esc(i.note)+'</div>':'')+
+        '<div class="mini">⏱ Producto: '+itemTimer+'</div>'+readyButton+'</div>';
+    }).join('');
+    const action=!history?'<button class="primary" data-action="ticket-status" data-id="'+t.id+
+      '" data-status="'+(t.status==='new'?'received':t.status==='received'?'preparing':'ready')+'">'+
+      (t.status==='new'?'Confirmar recepción':t.status==='received'?'Iniciar preparación':'Marcar todos como listos')+'</button>':'';
+    return '<div class="card ticket '+t.status+'"><div class="row"><h3>'+esc(t.account)+
+      ' · #'+t.account_id+'</h3>'+pill(t.status)+'</div><div class="mini">'+
+      (t.station==='kitchen'?'🍳 Cocina':'🥤 Barra')+' · Mesero: '+esc(t.waiter)+
+      ' · Comanda #'+t.batch_id+'</div><div class="note">⏱ Límite general del envío: '+
+      timer+'</div><div class="divider"></div>'+lines+action+'</div>';
+  }).join('');
+  return '<div class="statgrid">'+stat('Comandas nuevas',newCount)+
+    stat('En proceso',shown.filter(t=>t.status==='received'||t.status==='preparing').length)+
+    '</div>'+(!history?'<div class="note">Cronómetros por producto y comanda. Verde: normal; amarillo: próximo al límite; rojo: retraso.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':'')+
+    '<div class="cards" style="margin-top:15px">'+(cards||'<div class="empty">No hay comandas en esta sección.</div>')+'</div>';
+}
 
 async function showCashier(){
   const accounts=(await api('/accounts')).filter(x=>x.status==='pending');
@@ -360,9 +412,11 @@ async function showPeriodDetail(id){
 }
 
 async function showProducts(){
-  const ps=await api('/products');state.products=ps;
+  const [ps,prepConfig]=await Promise.all([api('/products'),api('/prep/config')]);state.products=ps;
   return `<div class="card"><h3>Agregar producto al menú</h3><p>Registra precios reales; no se cargan productos ficticios.</p><form id="product-add" class="formrow"><label>Nombre<input name="name" required></label><div class="formgrid"><label>Categoría<input name="category" value="General"></label><label>Destino<select name="station"><option value="kitchen">Cocina</option><option value="bar">Barra</option></select></label><label>Precio ($)<input name="price" type="number" min="0" step="0.01" required></label><label>Existencias iniciales<input name="stock" type="number" min="0" value="0"></label></div><label class="inline"><input name="inventory_enabled" type="checkbox" style="width:auto"> Control individual de inventario</label><button class="primary">Agregar producto</button></form></div>
+<div class="card"><h3>Tiempo general por comanda</h3><p>${prepConfig.batch_limit_minutes} min · Aviso amarillo desde ${prepConfig.warning_percent}% del plazo</p>${state.user.role==='owner'?'<button class="outline small" data-action="prep-batch-limit">Configurar tiempos</button>':''}</div>
   <h2 class="section">Menú y personalización (${ps.length})</h2><div class="cards">${ps.map(p=>`<details class="card product-config-admin"><summary><div class="row"><div><h3>${esc(p.name)}</h3><div class="mini">${esc(p.category)} · ${p.station==='kitchen'?'Cocina':'Barra'} · Base ${money(p.price)}</div></div>${pill(p.status)}</div></summary><div class="product-config-content">
+    <div class="row"><span>Tiempo estimado</span><b>${Number(p.prep_default_minutes||15)} min</b></div><button class="outline small" data-action="prep-product-limit" data-id="${p.id}">Configurar preparación</button>
     <div class="row"><span>Precio vigente</span><b class="price">${money(p.current_price??p.price)}</b></div>${p.promotion?`<div class="note">Promoción activa: ${esc(p.promotion.name)}</div>`:''}<div class="row"><button class="outline small" data-action="edit-product" data-id="${p.id}">Editar producto</button></div>
     <h4>Presentaciones</h4>${(p.variants||[]).map(v=>`<div class="lineitem row"><span>${esc(v.name)} · ${money(v.price)}</span><button class="ghost small" data-action="toggle-variant" data-id="${v.id}" data-active="${!v.active}">${v.active?'Desactivar':'Activar'}</button></div>`).join('')||'<p class="mini">Sin presentaciones adicionales.</p>'}
     <form id="variant-add-${p.id}" class="formrow"><div class="formgrid"><label>Nueva presentación<input name="name" required maxlength="100" placeholder="Grande, chico, familiar…"></label><label>Precio ($)<input name="price" type="number" min="0" step="0.01" required></label></div><button class="outline small">Agregar presentación</button></form>
@@ -459,7 +513,28 @@ case 'push-test':await api('/push/test','POST',{});toast('Prueba enviada. Bloque
 case 'push-disable':await disablePush();await render();break;
 case 'period-detail':await showPeriodDetail(id);break;case 'hide-period-detail':{const el=$('#period-detail');if(el)el.innerHTML='';break}case 'void-account':{const reason=ask('Motivo para anular esta cuenta sin saldo:');if(!reason)return;if(!confirm('¿Confirmas la anulación? Esta acción quedará registrada.'))return;await api(`/accounts/${id}/void`,'POST',{reason});toast('Cuenta anulada y archivada');await go('all');break}case 'enable-sound':state.alarmArmed=true;beep();toast('Alarma habilitada mientras la aplicación permanezca abierta');break;case 'reset-user':{const secret=ask(btn.dataset.role==='waiter'?'Nuevo PIN de 4 dígitos:':'Nueva contraseña (mínimo 8 caracteres):');if(!secret)return;await api(`/users/${id}`,'PATCH',{secret});toast('Clave cambiada; sesiones anteriores revocadas');await render();break}case 'toggle-user':{if(!confirm('¿Confirmar cambio de acceso?'))return;await api(`/users/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Acceso actualizado y sesiones revocadas');await render();break}case 'open-account':state.account=id;state.draft=[];await go('orders');break;case 'admin-account':{const a=await api('/accounts/'+id);if(!state.data.users)state.data.users=await api('/users');$('#content').innerHTML=`<button class="outline small" data-nav="all">← Volver</button><h2 class="section">Cuenta #${id}</h2>${await accountDetailHtml(id,true)}`;break}case 'remove-line':state.draft.splice(id,1);persistWorkState();updateDraftUI();toast('Producto retirado del borrador');break;
 case 'repeat-item':{const accountId=Number(btn.dataset.account);const qty=Number(prompt('¿Cuántas unidades deseas repetir?','1'));if(!Number.isInteger(qty)||qty<1||qty>100)throw Error('Cantidad inválida');if(!confirm('Se enviará una nueva comanda con la misma presentación, extras y notas. ¿Continuar?'))return;await api(`/accounts/${accountId}/items/${id}/repeat`,'POST',{qty,client_key:key()});toast('Producto repetido y enviado a su estación');await refreshAccountPanel(accountId,['owner','admin'].includes(state.user.role));break;}
-case 'toggle-variant':await api(`/product-variants/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Presentación actualizada');await render();break;
+case 'prep-item-ready':{
+  await api('/tickets/'+Number(btn.dataset.ticket)+'/items/'+id+'/ready','POST',{});
+  toast('Producto marcado como listo');await render();break;
+}case 'prep-product-limit':{
+  const p=state.products.find(x=>x.id===id);if(!p)throw Error('Producto inexistente');
+  const raw=prompt('Tiempo estimado para '+p.name+' (minutos):',String(p.prep_default_minutes||15));
+  if(raw===null)return;
+  const minutes=Number(raw);if(!Number.isInteger(minutes)||minutes<1||minutes>240)throw Error('Indica entre 1 y 240 minutos');
+  await api('/prep/products/'+id,'PUT',{minutes});
+  toast('Tiempo de producto actualizado');await render();break;
+}case 'prep-batch-limit':{
+  const config=await api('/prep/config');
+  const minutesRaw=prompt('Límite general por comanda (minutos):',String(config.batch_limit_minutes));
+  if(minutesRaw===null)return;
+  const percentRaw=prompt('Aviso amarillo a partir de qué porcentaje (50-95):',String(config.warning_percent));
+  if(percentRaw===null)return;
+  const batch_limit_minutes=Number(minutesRaw),warning_percent=Number(percentRaw);
+  if(!Number.isInteger(batch_limit_minutes)||batch_limit_minutes<1||batch_limit_minutes>240||
+     !Number.isInteger(warning_percent)||warning_percent<50||warning_percent>95)throw Error('Tiempos fuera de rango');
+  await api('/prep/config','PUT',{batch_limit_minutes,warning_percent});
+  toast('Límite general actualizado');await render();break;
+}case 'toggle-variant':await api(`/product-variants/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Presentación actualizada');await render();break;
 case 'toggle-option':await api(`/modifier-options/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Modificador actualizado');await render();break;
 case 'toggle-promotion':await api(`/promotions/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Promoción actualizada');await render();break;
 case 'send-order':{
