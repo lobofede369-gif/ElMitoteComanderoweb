@@ -357,7 +357,37 @@ async function showProducts(){
   </div></details>`).join('')||'<div class="empty">Todavía no hay productos registrados.</div>'}</div>`;
 }
 async function showInventory(){const [s,ps]=await Promise.all([api('/settings'),api('/products')]);state.products=ps;return `<div class="card"><h3>Control general de inventario</h3><div class="row"><span>Estado actual</span>${pill(s.inventory_on?'open':'pending')}</div><p>${s.inventory_on?'Se descuentan unidades solo de productos con control individual activado.':'Desactivado: puedes vender sin descontar existencias. Los bloqueos manuales siguen vigentes.'}</p><button class="${s.inventory_on?'red':'primary'}" data-action="toggle-inventory" data-on="${!s.inventory_on}">${s.inventory_on?'Desactivar inventario general':'Activar tras revisar existencias'}</button></div><h2 class="section">Control por producto</h2><div class="cards">${ps.map(p=>`<div class="card"><div class="row"><h3>${esc(p.name)}</h3>${pill(p.status)}</div><p>Existencias registradas: <b>${p.stock}</b> · Control individual: <b>${p.inventory_enabled?'Sí':'No'}</b></p><div class="inline"><button class="outline small" data-action="edit-product" data-id="${p.id}">Configurar</button><button class="ghost small" data-action="restock" data-id="${p.id}">＋ Reponer</button></div></div>`).join('')||'<div class="empty">Agrega productos al menú para configurar su inventario.</div>'}</div>`}
-async function showUsers(){const users=await api('/users');state.data.users=users;return `<div class="card"><h3>Registrar empleado o estación</h3><form id="user-add" class="formrow"><div class="formgrid"><label>Usuario<input name="username" required minlength="3"></label><label>Nombre para mostrar<input name="display" required minlength="2"></label><label>Rol<select name="role"><option value="waiter">Mesero (PIN de 4 dígitos)</option><option value="cashier">Cajero</option><option value="admin">Administrador</option><option value="kitchen">Celular de cocina</option><option value="bar">Celular de barra</option></select></label><label>PIN o contraseña<input name="secret" type="password" required minlength="4"></label></div><button class="primary">Crear acceso</button></form><p class="mini">Solo el propietario puede crear cuentas. Meseros: PIN de 4 dígitos. Otros: contraseña de 8 o más caracteres.</p></div><h2 class="section">Usuarios y estaciones</h2><div class="cards">${users.map(u=>`<div class="card"><h3>${esc(u.display)}</h3><p>${esc(u.username)} · ${esc(labels[u.role])}</p>${pill(u.active?'open':'rejected')}${state.user.role==='owner'&&u.role!=='owner'?`<div class="inline" style="margin-top:10px"><button class="outline small" data-action="reset-user" data-id="${u.id}" data-role="${u.role}">Cambiar clave</button><button class="ghost small" data-action="toggle-user" data-id="${u.id}" data-active="${!u.active}">${u.active?'Desactivar':'Activar'}</button></div>`:''}</div>`).join('')}</div>`}
+
+async function showUsers(){
+  const users=await api('/users');state.data.users=users;
+  const owner=state.user?.role==='owner';
+  const registration=owner?
+    '<div class="card staff-pin-setup"><h3>Registrar personal</h3>'+
+    '<p>Solo se necesita nombre y PIN de seis números. El Propietario asigna el perfil de trabajo.</p>'+
+    '<form id="staff-add" class="formrow"><div class="formgrid">'+
+    '<label>Nombre del empleado<input name="name" required minlength="2" maxlength="100" autocomplete="off" placeholder="Nombre y apellido"></label>'+
+    '<label>Perfil asignado<select name="role"><option value="waiter">Mesero</option><option value="cashier">Caja</option><option value="kitchen">Cocina</option><option value="bar">Barra</option><option value="admin">Administrador</option></select></label>'+
+    '<label>PIN personal<input name="pin" type="password" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="new-password" required placeholder="6 números"></label>'+
+    '</div><button class="primary" type="submit">Registrar empleado</button></form>'+
+    '<p class="mini">Cada PIN debe ser exclusivo de una persona; no uses fechas o secuencias fáciles.</p></div>':
+    '<p class="note">La asignación de PIN y el registro de empleados son exclusivos del Propietario.</p>';
+  const cards=users.map(u=>{
+    const status=u.has_pin?
+      '<span class="staff-pin-status">● PIN activado</span>':
+      '<span class="staff-pin-status pending">● Falta configurar PIN</span>';
+    const reset=owner?
+      '<form id="staff-pin-'+Number(u.id)+'" class="staff-pin-form" style="margin-top:12px">'+
+      '<label>Asignar PIN de 6 números<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="6" pattern="[0-9]{6}" autocomplete="new-password" placeholder="••••••" required></label>'+
+      '<button class="outline small" type="submit">'+(u.has_pin?'Cambiar PIN':'Activar PIN')+'</button></form>':'';
+    const toggle=owner&&u.role!=='owner'?
+      '<div class="inline" style="margin-top:12px"><button class="ghost small" data-action="toggle-user" data-id="'+Number(u.id)+'" data-active="'+(!u.active)+'">'+(u.active?'Desactivar':'Activar')+'</button></div>':'';
+    return '<div class="card"><h3>'+esc(u.display)+'</h3><p>'+esc(labels[u.role]||u.role)+'</p>'+
+      pill(u.active?'open':'rejected')+'<div style="margin-top:8px">'+status+'</div>'+reset+toggle+'</div>';
+  }).join('');
+  return registration+'<h2 class="section">Personal y accesos</h2>'+
+    '<div class="cards">'+cards+'</div>'+
+    (owner?'<p class="mini">Al cambiar tu propio PIN se cierra tu sesión para proteger el acceso. Vuelve a entrar con el nuevo código.</p>':'');
+}
 async function showApprovals(){const rs=await api('/requests');return `<div class="cards">${rs.map(r=>`<div class="card"><div class="row"><h3>${r.kind==='reopen'?'Reapertura':'Cancelación'} · #${r.account_id}</h3>${pill(r.status)}</div><p>${esc(r.account)} · ${esc(r.requester)}</p><p>${esc(r.reason)}</p>${r.kind==='cancel'?`<p class="mini">Producto #${r.item_id} · ${r.qty} unidad(es)</p>`:''}${r.status==='pending'?`<div class="inline"><button class="primary small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="true">Autorizar</button><button class="ghost small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="false">Rechazar</button></div>`:''}</div>`).join('')||'<div class="empty">No hay solicitudes.</div>'}</div>`}
 async function showAudit(){const rs=await api('/audit');return `<div class="card table-wrap"><table><thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Detalle</th></tr></thead><tbody>${rs.map(x=>`<tr><td>${esc(new Date(x.date).toLocaleString('es-MX'))}</td><td>${esc(x.actor)}</td><td>${esc(x.action)}</td><td class="mini">${esc(JSON.stringify(x.detail))}</td></tr>`).join('')}</tbody></table></div>`}
 async function showOverview(){
@@ -422,7 +452,20 @@ function ticketHtml(a){
   const tipTotal=(a.tips||[]).reduce((s,t)=>s+Number(t.amount||0),0);
   return `<!doctype html><html lang="es"><meta charset="utf-8"><title>Ticket #${a.id}</title><style>body{font:14px Arial,sans-serif;color:#111;max-width:350px;margin:20px auto;padding:12px}h2{text-align:center}img{display:block;margin:auto;max-width:140px}table{width:100%;border-collapse:collapse}td{padding:6px 0;border-bottom:1px dotted #bbb}footer{text-align:center;margin-top:20px}@media print{button{display:none}}</style><img src="/static/assets/logo.webp"><h2>EL MITOTE RESTAURANTE</h2><p style="text-align:center">Carretera Progreso Ixmiquilpan, Xochitlán, Hidalgo, C. P. 42740<br>Tel. 772 200 3943</p><hr><p><b>Cuenta #${a.id}</b> · ${esc(a.name)}<br>Mesero: ${esc(a.owner)}<br>Fecha de consulta: ${new Date().toLocaleString('es-MX')}</p><table>${a.items.map(i=>`<tr><td>${i.qty-i.cancelled_qty} × ${esc(i.name)}${i.variant_name?' · '+esc(i.variant_name):''}${i.modifiers?.length?`<br><small>Extras: ${i.modifiers.map(m=>esc(m.name)).join(', ')}</small>`:''}${i.note?`<br><small>Nota: ${esc(i.note)}</small>`:''}</td><td style="text-align:right">${money(Number(i.price)*(i.qty-i.cancelled_qty))}</td></tr>`).join('')}${discountRows}</table><p>Subtotal ${money(a.gross_total??a.total)}<br>Descuentos -${money(a.discount_total||0)}<br><b>Total ${money(a.total)}</b><br>Pagado ${money(a.paid)}<br><b>Saldo ${money(a.due)}</b></p><p>Pagos: ${a.payments.map(p=>`${esc(p.method)} ${money(p.amount)}${Number(p.tip)>0?` + propina ${money(p.tip)}`:''}`).join(' · ')||'Sin pagos'}</p><p>Propinas registradas: ${money(tipTotal)}</p><p>${a.status==='paid'?'PAGADO':'PENDIENTE'}</p><footer>Muchas gracias por tu visita, te esperamos pronto<br><small>Comprobante de consumo · No fiscal</small></footer><p><button onclick="window.print()">Imprimir / Guardar como PDF</button></p></html>`;
 }
-async function submitForm(form){const d=formObj(form);if(form.id.startsWith('table-edit-')){const id=Number(form.id.slice('table-edit-'.length));await api(`/tables/${id}`,'PUT',{name:d.name,area:d.area,capacity:Number(d.capacity),sort_order:Number(d.sort_order||0),active:d.active==='true'});toast('Configuración de mesa actualizada');await render();return}switch(form.id){
+async function submitForm(form){const d=formObj(form);
+if(form.id.startsWith('staff-pin-')){
+  const id=Number(form.id.slice('staff-pin-'.length));
+  if(!Number.isSafeInteger(id)||id<1)throw Error('Personal inválido');
+  const response=await api('/staff/'+id+'/pin','PATCH',{pin:d.pin});
+  if(response.owner_pin_changed){
+    logout('expired');
+    location.replace('/');
+    return;
+  }
+  toast('PIN actualizado. El empleado ya puede entrar con el teclado numérico.');
+  await render();return;
+}
+if(form.id.startsWith('table-edit-')){const id=Number(form.id.slice('table-edit-'.length));await api(`/tables/${id}`,'PUT',{name:d.name,area:d.area,capacity:Number(d.capacity),sort_order:Number(d.sort_order||0),active:d.active==='true'});toast('Configuración de mesa actualizada');await render();return}switch(form.id){
 case 'add-line':{
   const productId=Number(d.product_id);const p=state.products.find(x=>x.id===productId);if(!p)throw Error('Producto no encontrado');
   const fd=new FormData(form);const optionIds=fd.getAll('modifier_option_ids').map(Number);
@@ -474,7 +517,7 @@ case (form.id.startsWith('variant-add-')?form.id:'__no-variant__'):{const produc
 case (form.id.startsWith('modifier-group-add-')?form.id:'__no-group__'):{const productId=Number(form.id.slice('modifier-group-add-'.length));const min=Number(d.min_select||0),max=Number(d.max_select||1);if(min>max)throw Error('El mínimo no puede superar al máximo');await api(`/products/${productId}/modifier-groups`,'POST',{name:d.name,min_select:min,max_select:max,active:true,sort_order:0});toast('Grupo de modificadores creado');await render();break;}
 case (form.id.startsWith('modifier-option-add-')?form.id:'__no-option__'):{const groupId=Number(form.id.slice('modifier-option-add-'.length));await api(`/modifier-groups/${groupId}/options`,'POST',{name:d.name,price_delta:d.price_delta||'0',active:true,sort_order:0});toast('Opción agregada');await render();break;}
 case (form.id.startsWith('promotion-add-')?form.id:'__no-promotion__'):{const productId=Number(form.id.slice('promotion-add-'.length));if(Boolean(d.price)&&Boolean(d.discount_percent))throw Error('Indica precio o descuento, no ambos');if(!d.price&&!d.discount_percent)throw Error('Indica un precio promocional o un descuento');await api(`/products/${productId}/promotions`,'POST',{name:d.name,price:d.price||null,discount_percent:d.discount_percent?Number(d.discount_percent):null,weekdays:d.weekdays,start_time:d.start_time,end_time:d.end_time,start_date:d.start_date||null,end_date:d.end_date||null});toast('Promoción creada');await render();break;}
-case 'user-add':await api('/users','POST',d);toast('Usuario creado');await render();break;
+case 'staff-add':await api('/staff','POST',{name:d.name,role:d.role,pin:d.pin});toast('Personal registrado con PIN');await render();break;
  case 'tip-distribution-form':{
    const fd=new FormData(form);const user_ids=fd.getAll('user_ids').map(Number);
    if(!user_ids.length)throw Error('Selecciona al menos un empleado participante');
@@ -560,7 +603,70 @@ async function listenEvents(){while(state.user&&state.token){try{
   const reader=res.body.getReader();const decoder=new TextDecoder();let pending='';
   while(state.token===token&&state.user){const {done,value}=await reader.read();if(done)break;pending+=decoder.decode(value,{stream:true});const parts=pending.split('\n\n');pending=parts.pop();if(parts.some(x=>x.includes('data: refresh'))){if(Date.now()-state.lastRefresh>1400){state.lastRefresh=Date.now();const editing=document.activeElement?.matches('input,textarea,select');if(state.user?.role==='waiter'&&state.screen==='orders'){state.pendingRefresh=true;$('#refresh')?.classList.add('has-update')}else if(!editing)await render({preserveScroll:true})}}}
  }catch{}if(!state.user)break;await new Promise(r=>setTimeout(r,3500))}}
-$('#login-form').addEventListener('submit',async e=>{e.preventDefault();try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('#login-user').value,secret:$('#login-secret').value})});const d=await r.json();if(!r.ok)throw Error(d.detail||'Acceso incorrecto');state.token=d.token;localStorage.setItem('mitote-token',d.token);sessionStorage.removeItem('mitote-token');state.alarmArmed=true;await start()}catch(err){toast(err.message,true)}});
+// La pantalla principal solo muestra un teclado numérico. Los perfiles se obtienen del servidor.
+const recoveryMode=new URLSearchParams(location.search).get('recuperar')==='1';
+$('#login-pin-form').hidden=recoveryMode;
+$('#legacy-login-form').hidden=!recoveryMode;
+$('#login-recovery-link').hidden=recoveryMode;
+$('#login-back-link').hidden=!recoveryMode;
+const pinInput=$('#login-pin'),pinSubmit=$('#login-pin-submit');
+function loginError(message){
+  const node=$('#login-error');node.textContent=message;node.hidden=!message;
+}
+function pinEdit(action){
+  let value=pinInput.value;
+  if(action==='delete')value=value.slice(0,-1);
+  else if(action==='clear')value='';
+  else if(/^[0-9]$/.test(action)&&value.length<6)value+=action;
+  pinInput.value=value;
+  pinSubmit.disabled=value.length!==6;
+  loginError('');
+}
+$('#login-pin-form').addEventListener('click',e=>{
+  const b=e.target.closest('[data-pin-digit],[data-pin-clear],[data-pin-delete]');
+  if(!b)return;
+  e.preventDefault();
+  pinEdit(b.dataset.pinDigit??(b.hasAttribute('data-pin-delete')?'delete':'clear'));
+});
+document.addEventListener('keydown',e=>{
+  if($('#login').hidden||recoveryMode||e.ctrlKey||e.altKey||e.metaKey||e.repeat)return;
+  if(/^[0-9]$/.test(e.key)){e.preventDefault();pinEdit(e.key);}
+  else if(e.key==='Backspace'){e.preventDefault();pinEdit('delete');}
+  else if(e.key==='Escape'){e.preventDefault();pinEdit('clear');}
+  else if(e.key==='Enter'&&pinInput.value.length===6){e.preventDefault();$('#login-pin-form').requestSubmit();}
+});
+async function loginSession(path,payload){
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload),cache:'no-store'});
+  let d={};try{d=await r.json()}catch{}
+  if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:'Acceso incorrecto');
+  state.token=d.token;localStorage.setItem('mitote-token',d.token);
+  sessionStorage.removeItem('mitote-token');state.alarmArmed=true;
+  await start();
+}
+$('#login-pin-form').addEventListener('submit',async e=>{
+  e.preventDefault();loginError('');
+  const pin=pinInput.value;
+  if(!/^[0-9]{6}$/.test(pin)){loginError('Escribe un PIN de seis dígitos');return;}
+  pinSubmit.disabled=true;
+  try{await loginSession('/api/login/pin',{pin});pinInput.value='';}
+  catch(err){loginError(err.message);pinInput.value='';}
+  finally{pinSubmit.disabled=true;}
+});
+$('#legacy-login-form').addEventListener('submit',async e=>{
+  e.preventDefault();loginError('');
+  try{
+    const username=$('#login-user').value.trim(),secret=$('#login-secret').value;
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username,secret}),cache:'no-store'});
+    const d=await r.json();
+    if(!r.ok)throw Error(d.detail||'Acceso incorrecto');
+    if(d.user?.role!=='owner')throw Error('La activación inicial solo está permitida al Propietario');
+    state.token=d.token;localStorage.setItem('mitote-token',d.token);
+    sessionStorage.removeItem('mitote-token');state.alarmArmed=true;
+    await start();
+    if(state.user?.role==='owner'&&state.screen!=='users')await go('users');
+  }catch(err){loginError(err.message);}
+});
 $('#logout').onclick=()=>logout('manual');$('#back').onclick=goBack;$('#refresh').onclick=()=>render({preserveScroll:true});
 $('#nav').addEventListener('click',e=>{const b=e.target.closest('[data-nav]');if(b)go(b.dataset.nav)});
 $('#content').addEventListener('click',async e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.nav){go(b.dataset.nav);return}if(b.dataset.action){b.disabled=true;try{await act(b.dataset.action,b)}catch(err){toast(err.message,true)}finally{b.disabled=false}}});
