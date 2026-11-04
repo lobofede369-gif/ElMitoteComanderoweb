@@ -13,10 +13,21 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app import (
-    app, Product, ArchivedProduct, User, db_session, auth, allow, audit, notify,
+    app, Base, Product, ArchivedProduct, User, db_session, auth, allow, audit, notify, now,
+    Column, String, Integer, DateTime,
 )
 
 SOURCE = Path(__file__).resolve().parent / "data" / "menu_fotografias_2026_11.json"
+
+class MenuPhotoApplied(Base):
+    """Marca duradera para que un despliegue o reinicio no repita la importación."""
+    __tablename__ = "menu_photo_applied"
+    manifest_sha256 = Column(String(64), primary_key=True)
+    manifest_version = Column(String(100), nullable=False)
+    created_count = Column(Integer, nullable=False)
+    updated_count = Column(Integer, nullable=False)
+    applied_at = Column(DateTime(timezone=True), default=now, nullable=False)
+
 
 
 def norm(value):
@@ -83,6 +94,66 @@ def preview(db):
     }
     payload["preview_token"] = hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
     return payload
+
+
+def apply_approved_photo_menu_at_startup(db):
+    """Importación transaccional y única, solo por aprobación explícita de Render.
+
+    Se ejecuta antes de confirmar el arranque, en la misma transacción de bootstrap.
+    No se dispara por reiniciar el servidor sin la variable de aprobación.
+    """
+    import os
+    version = os.getenv("MENU_PHOTO_IMPORT_APPROVED_VERSION", "").strip()
+    if not version:
+        return None
+    manifest, sha256 = photo_manifest()
+    if version != manifest["version"]:
+        raise RuntimeError("La versión de menú aprobada no coincide con el catálogo desplegado")
+    from app import Setting
+    db.flush()
+    db.execute(select(Setting).where(Setting.id == 1).with_for_update()).scalar_one()
+    if db.get(MenuPhotoApplied, sha256):
+        return {"already_applied": True, "sha256": sha256}
+
+    data = preview(db)
+    if data["counts"]["ambiguous"] or data["counts"]["archived_conflict"]:
+        raise RuntimeError("Importación cancelada: hay coincidencias ambiguas o productos archivados")
+    expected_create = int(os.getenv("MENU_PHOTO_IMPORT_EXPECT_NEW", "-1"))
+    expected_existing = int(os.getenv("MENU_PHOTO_IMPORT_EXPECT_EXISTING", "-1"))
+    existing = data["counts"]["update"] + data["counts"]["unchanged"]
+    if data["counts"]["create"] != expected_create or existing != expected_existing:
+        raise RuntimeError(
+            f"Importación cancelada: se esperaban {expected_create} nuevos y "
+            f"{expected_existing} existentes; hay {data['counts']['create']} nuevos y {existing} existentes"
+        )
+
+    created = updated = unchanged = 0
+    for item, row in zip(manifest["entries"], data["rows"]):
+        if row["status"] == "unchanged":
+            unchanged += 1
+            continue
+        if row["status"] == "create":
+            db.add(Product(name=item["name"], category=item["category"], station=item["station"],
+                           price_cents=int(item["price"])*100, active=True, blocked=False,
+                           inventory_enabled=False, stock=0))
+            created += 1
+        elif row["status"] == "update":
+            product = db.get(Product, row["existing_id"])
+            if product is None or product.version != row["current_version"]:
+                raise RuntimeError("El producto cambió durante la importación; se canceló sin aplicar")
+            product.name = item["name"]
+            product.category = item["category"]
+            product.station = item["station"]
+            product.price_cents = int(item["price"])*100
+            product.version = (product.version or 1) + 1
+            updated += 1
+        else:
+            raise RuntimeError("Importación cancelada por conflicto inesperado")
+    db.add(MenuPhotoApplied(manifest_sha256=sha256, manifest_version=manifest["version"],
+                            created_count=created, updated_count=updated))
+    audit(db, None, "menu.photo_approved_import", version=manifest["version"],
+          created=created, updated=updated, unchanged=unchanged, manifest_sha256=sha256)
+    return {"already_applied": False, "created": created, "updated": updated, "unchanged": unchanged}
 
 
 @app.get("/api/menu/photo-preview")

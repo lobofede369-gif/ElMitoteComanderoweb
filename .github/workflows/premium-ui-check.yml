@@ -104,6 +104,7 @@ jobs:
           python -m scripts.test_cash_cut_archive
           python -m scripts.test_menu_photo
           python -m scripts.test_owner_one_time
+          python -m scripts.test_photo_menu_approved
 
 
   postgres-integration:
