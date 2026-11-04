@@ -400,7 +400,15 @@ def bootstrap():
 @asynccontextmanager
 async def lifespan(app):
     bootstrap()
-    yield
+    prep_worker=asyncio.create_task(mitote_extensions.prep_alert_worker())
+    try:
+        yield
+    finally:
+        prep_worker.cancel()
+        try:
+            await prep_worker
+        except asyncio.CancelledError:
+            pass
 
 app=FastAPI(title='El Mitote Comandas',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory='static'),name='static')
