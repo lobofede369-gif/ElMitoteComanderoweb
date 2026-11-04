@@ -1,4 +1,27 @@
-<!doctype html><html lang="es-MX"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101418"><meta name="description" content="El Mitote Comandas: operación interna de restaurante"><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/static/assets/logo.webp"><link rel="stylesheet" href="/static/style.css"><link rel="stylesheet" href="/static/pos-ui.css?v=3"><link rel="stylesheet" href="/static/pos-ui-v3.css?v=5"><link rel="stylesheet" href="/static/pos-adaptive.css?v=4"><link rel="stylesheet" href="/static/theme-obsidian-titanium.css?v=1"><link rel="stylesheet" href="/static/theme-obsidian-modules.css?v=2"><link rel="stylesheet" href="/static/theme-luxury-motion.css?v=1"><link rel="stylesheet" href="/static/theme-service-fast.css?v=1"><title>El Mitote Comandas</title></head><body>
-<div id="login" class="login-shell"><div class="login-card"><img class="brand" src="/static/assets/logo.webp" alt="El Mitote Restaurante"><h1>COMANDAS</h1><p>Acceso del personal</p><form id="login-form"><label>Usuario<input id="login-user" autocomplete="username" required placeholder="Tu usuario"></label><label>Contraseña o PIN<input id="login-secret" type="password" autocomplete="current-password" required placeholder="Tu clave de acceso"></label><button class="primary" type="submit">Entrar al sistema</button></form><small>Aplicación interna · Independiente del sitio público</small></div></div>
+<!doctype html><html lang="es-MX"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#101418"><meta name="description" content="El Mitote Comandas: operación interna de restaurante"><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/static/assets/logo.webp"><link rel="stylesheet" href="/static/style.css"><link rel="stylesheet" href="/static/pos-ui.css?v=3"><link rel="stylesheet" href="/static/pos-ui-v3.css?v=5"><link rel="stylesheet" href="/static/pos-adaptive.css?v=4"><link rel="stylesheet" href="/static/theme-obsidian-titanium.css?v=1"><link rel="stylesheet" href="/static/theme-obsidian-modules.css?v=2"><link rel="stylesheet" href="/static/theme-luxury-motion.css?v=1"><link rel="stylesheet" href="/static/theme-service-fast.css?v=1"><title>El Mitote Comandas</title><link rel="stylesheet" href="/static/theme-pin-login.css?v=1"></head><body>
+<div id="login" class="login-shell"><div class="login-card login-card-pin">
+  <img class="brand" src="/static/assets/logo.webp" alt="El Mitote Restaurante">
+  <h1>COMANDAS</h1><p>Ingresa tu PIN personal</p>
+  <form id="login-pin-form" autocomplete="off">
+    <label class="pin-label" for="login-pin">Código de acceso de 6 dígitos</label>
+    <input id="login-pin" class="pin-display" type="password" inputmode="none" maxlength="6" readonly required aria-label="PIN de seis dígitos" placeholder="••••••">
+    <div class="pin-pad" aria-label="Teclado numérico">
+      <button type="button" data-pin-digit="1">1</button><button type="button" data-pin-digit="2">2</button><button type="button" data-pin-digit="3">3</button>
+      <button type="button" data-pin-digit="4">4</button><button type="button" data-pin-digit="5">5</button><button type="button" data-pin-digit="6">6</button>
+      <button type="button" data-pin-digit="7">7</button><button type="button" data-pin-digit="8">8</button><button type="button" data-pin-digit="9">9</button>
+      <button type="button" data-pin-clear="1" aria-label="Borrar código completo">C</button><button type="button" data-pin-digit="0">0</button><button type="button" data-pin-delete="1" aria-label="Borrar último dígito">⌫</button>
+    </div>
+    <button id="login-pin-submit" class="primary" type="submit" disabled>Entrar</button>
+  </form>
+  <form id="legacy-login-form" hidden>
+    <p>Activación inicial del PIN — solo propietario</p>
+    <label>Usuario anterior<input id="login-user" autocomplete="username" placeholder="Usuario anterior"></label>
+    <label>Contraseña anterior<input id="login-secret" type="password" autocomplete="current-password" placeholder="Contraseña anterior"></label>
+    <button class="outline" type="submit">Activar PIN de propietario</button>
+  </form>
+  <small>El Mitote · Acceso exclusivo del personal</small>
+  <a id="login-recovery-link" class="pin-recovery" href="/?recuperar=1">Configurar primer PIN</a>
+  <a id="login-back-link" class="pin-recovery" href="/" hidden>Volver al teclado numérico</a>
+</div></div>
 <div id="app" hidden><header class="topbar"><div class="brandline"><img src="/static/assets/logo.webp" alt="El Mitote"><div><strong>COMANDAS</strong><small id="role-name"></small></div></div><div class="topright"><span id="connection" class="connection">● Conectado</span><button class="ghost small" id="logout">Salir</button></div></header><div class="app-layout"><nav id="nav" class="navigation"></nav><main><div class="heading"><div><p class="eyebrow">EL MITOTE · RESTAURANTE</p><h1 id="page-title">Inicio</h1></div><div class="heading-actions"><button class="outline small" id="back" type="button" hidden>← Regresar</button><button class="outline small" id="refresh" type="button">↻ Actualizar</button></div></div><div id="content"></div></main></div><div id="toast" role="status" aria-live="polite"></div></div>
-<script src="/static/app.js?v=15" defer></script><script src="/static/pos-ui-v3.js?v=6" defer></script></body></html>
+<script src="/static/app.js?v=16" defer></script><script src="/static/pos-ui-v3.js?v=7" defer></script></body></html>
