@@ -1,0 +1,248 @@
+/* El Mitote Comandas · Luxury Motion v1
+   Obsidian Gold × Titanium Pro: profundidad, brillo y microinteracciones.
+   Capa optativa 100% visual: no cambia API, sesiones ni acciones del POS.
+   Cada transición es breve; el flujo intensivo de captura queda sin animaciones de entrada. */
+
+:root{
+ --lux-gold:#e9c779;
+ --lux-glow:rgba(226,174,79,.22);
+ --lux-shade:rgba(5,7,10,.48);
+ --lux-edge:rgba(245,217,149,.23);
+ --lux-fast:145ms;
+ --lux-normal:230ms;
+ --lux-slow:450ms;
+ --lux-ease:cubic-bezier(.2,.75,.25,1);
+}
+
+/* Superficie premium: luz ambiental tenue, nunca brillo sobre los textos. */
+body{
+ background:
+   radial-gradient(ellipse 72% 52% at 92% -12%,rgba(234,185,94,.13),transparent 64%),
+   radial-gradient(ellipse 45% 45% at -10% 80%,rgba(112,126,143,.095),transparent 65%),
+   linear-gradient(160deg,#13181e 0%,#0d1116 42%,#101317 100%);
+}
+#app{isolation:isolate}
+.topbar{
+ background:linear-gradient(170deg,#21252c 0%,#14171c 72%);
+ border-image:none;
+ position:relative;
+}
+.topbar:after{
+ content:"";position:absolute;pointer-events:none;
+ left:0;bottom:-1px;height:1px;width:100%;
+ background:linear-gradient(90deg,transparent 0%,#b88946 28%,#f0d293 52%,#8d6736 82%,transparent 100%);
+ opacity:.8;
+}
+.brandline img{filter:drop-shadow(0 3px 9px #0007)}
+.brandline strong{color:#f4d38b;text-shadow:0 0 16px #e7bf6b26}
+.heading{position:relative}
+.heading h1{letter-spacing:-.035em;text-shadow:0 2px 12px #0005}
+
+/* Acceso cinematográfico suave: no interfiere con el formulario. */
+.login-shell{
+ position:relative;isolation:isolate;overflow:hidden;
+ background:
+  radial-gradient(ellipse 65% 44% at 50% 13%,rgba(220,178,94,.19),transparent 70%),
+  radial-gradient(ellipse 50% 38% at 102% 100%,rgba(87,102,119,.17),transparent 74%),
+  linear-gradient(160deg,#11161d 0%,#0a0d11 62%,#19160f 100%);
+}
+.login-shell:before{
+ content:"";position:absolute;z-index:0;pointer-events:none;
+ width:min(74vw,450px);height:min(74vw,450px);top:-130px;left:50%;
+ border:1px solid rgba(229,190,111,.10);border-radius:50%;
+ box-shadow:0 0 0 65px rgba(225,182,94,.025),0 0 0 140px rgba(225,182,94,.018);
+ transform:translateX(-50%);
+ animation:lux-orbit 12s ease-in-out infinite alternate;
+}
+.login-card{
+ z-index:1;
+ background:
+  linear-gradient(155deg,rgba(250,215,147,.08),transparent 24%),
+  linear-gradient(152deg,#292c32 0%,#1d2027 36%,#12151b 100%);
+ border-color:rgba(232,199,133,.37);
+ box-shadow:0 30px 80px #0009,0 1px 0 #ffecbb22 inset,0 0 48px #9b712321;
+ animation:lux-login-in .55s var(--lux-ease) both;
+}
+.login-card:before{
+ height:2px;
+ background:linear-gradient(90deg,transparent 2%,#99723d 18%,#f9e0a2 48%,#c29c58 77%,transparent 98%);
+ box-shadow:0 0 16px #e7c1775c;
+}
+.login-card .brand{
+ filter:drop-shadow(0 8px 18px #000b) drop-shadow(0 0 12px #e9bd562b);
+ animation:lux-brand-in .7s .09s var(--lux-ease) both;
+}
+.login-card h1{color:#f8d995;text-shadow:0 0 25px #e4ae4630}
+.login-card input{
+ background:linear-gradient(135deg,#14191f,#10151b);
+ border-color:#4e545d;
+ box-shadow:inset 0 2px 7px #0004;
+ transition:border-color var(--lux-fast),box-shadow var(--lux-normal),background-color var(--lux-normal);
+}
+.login-card input:focus{
+ border-color:#e8c477;
+ box-shadow:inset 0 2px 7px #0004,0 0 0 3px #e7c47d22;
+ outline:none;
+}
+.login-card .primary{min-height:54px;font-weight:850;letter-spacing:.02em}
+
+/* Botones: reflejo delicado + confirmación táctil instantánea. */
+button:not(:disabled){
+ transition:
+  transform var(--lux-fast) var(--lux-ease),
+  border-color var(--lux-fast) ease,
+  background-color var(--lux-fast) ease,
+  box-shadow var(--lux-normal) ease,
+  color var(--lux-fast) ease,
+  filter var(--lux-fast) ease;
+}
+button:disabled{transition:none}
+button.primary,.pos-tile-primary,.premium-shortcut{position:relative}
+button.primary{
+ background:linear-gradient(118deg,#f8dfaa 0%,#e9bd68 37%,#ce9c46 66%,#f4d695 100%);
+ border-color:#f3d48c;
+ box-shadow:0 5px 18px #07090d52,inset 0 1px 0 #fff7d19c;
+ color:#21180d;
+}
+button.primary:not(:disabled):active,
+button.outline:not(:disabled):active,
+button.ghost:not(:disabled):active,
+.pos-product:active,.pos-tile:active,.premium-shortcut:active{
+ transform:scale(.976);
+ box-shadow:inset 0 3px 10px #0003!important;
+ transition-duration:70ms;
+}
+button.primary:not(:disabled):hover{filter:brightness(1.05);box-shadow:0 8px 23px #05060972,0 0 0 1px #ffebbd55 inset}
+button.outline:not(:disabled):hover{border-color:#eacb89;background:#443b2a50}
+button.ghost:not(:disabled):hover{background:#39404a;border-color:#6c7783}
+
+/* Tarjetas: borde tallado, estructura física de titanio. */
+.card,.stat,.ticket,.pos-catalog,.pos-draft-card,.pos-account-picker,.pos-new-account-card{
+ border-color:#46515b;
+ background:
+  linear-gradient(145deg,#ffffff0a 0%,transparent 24%),
+  linear-gradient(153deg,#272d35 0%,#1b2026 76%);
+ box-shadow:0 9px 26px #06080a3d,inset 0 1px 0 #ffffff12;
+}
+.card{transition:border-color var(--lux-normal),box-shadow var(--lux-normal)}
+.card:focus-within{border-color:#bc9c67}
+.stat{
+ border-top:2px solid #dbb36d;
+ background:
+  radial-gradient(circle at 100% 0%,#e0b36217,transparent 48%),
+  linear-gradient(140deg,#2b3138,#1b2027);
+ box-shadow:0 8px 25px #0004,inset 0 1px 0 #ffffff15;
+}
+.stat b,.price,.total{color:#f5d690;text-shadow:0 0 19px #c6963719}
+.pill{font-weight:720;letter-spacing:.005em}
+.pill.open,.pill.ready,.pill.paid{box-shadow:inset 0 1px 0 #b8f5d122}
+
+/* Propietario: los once accesos aparecen escalonados al abrir el panel. */
+.premium-dashboard-heading h2{color:#f7f5ee}
+.premium-dashboard-live{
+ box-shadow:0 0 0 1px #66c48d1a,inset 0 1px 0 #a9fad31c;
+}
+.premium-shortcut{
+ overflow:hidden;
+ border:1px solid #48515b;
+ background:
+  radial-gradient(circle at 100% 0%,#ddbb6824,transparent 42%),
+  linear-gradient(146deg,#303740 0%,#222930 58%,#1b2027 100%);
+ box-shadow:0 8px 23px #0005,inset 0 1px 0 #ffebc617;
+ animation:lux-card-enter .32s var(--lux-ease) both;
+ transition:transform var(--lux-fast) var(--lux-ease),border-color var(--lux-normal),box-shadow var(--lux-normal),background-color var(--lux-normal);
+}
+.premium-shortcut:before{
+ content:"";position:absolute;pointer-events:none;
+ inset:0;border-radius:inherit;border:1px solid transparent;
+ background:linear-gradient(132deg,#ffeecb5c 0%,transparent 36%,transparent 75%,#e0ba6929 100%) border-box;
+ mask:linear-gradient(#fff 0 0) padding-box,linear-gradient(#fff 0 0);
+ mask-composite:exclude;opacity:.35;
+}
+.premium-shortcut:nth-child(2){animation-delay:25ms}
+.premium-shortcut:nth-child(3){animation-delay:50ms}
+.premium-shortcut:nth-child(4){animation-delay:75ms}
+.premium-shortcut:nth-child(5){animation-delay:100ms}
+.premium-shortcut:nth-child(6){animation-delay:125ms}
+.premium-shortcut:nth-child(n+7){animation-delay:145ms}
+.premium-shortcut-icon{
+ background:linear-gradient(140deg,#635338,#3b3428);
+ border-color:#8c7040;box-shadow:inset 0 1px 0 #e7cb8654,0 5px 14px #0004;
+}
+.premium-shortcut-arrow{transition:transform var(--lux-normal)}
+@media(hover:hover) and (pointer:fine){
+ .premium-shortcut:hover{
+   transform:translateY(-3px);
+   border-color:#d5b478;
+   box-shadow:0 14px 32px #0008,0 0 20px #a7801e1c,inset 0 1px 0 #ffe0a52b;
+ }
+ .premium-shortcut:hover .premium-shortcut-arrow{transform:translateX(3px)}
+ .card:has(>summary):hover,.pos-product:hover,.pos-tile:hover{
+  border-color:#ad9569;box-shadow:0 12px 26px #0006,inset 0 1px 0 #ffffff1d;
+ }
+ .pos-product:hover{transform:translateY(-2px)}
+ .pos-tile:hover{transform:translateY(-2px)}
+}
+
+/* Las estaciones conservan calma visual: nada debe parpadear sin necesidad. */
+.ticket.new{
+ border-left-color:#f0bf63!important;
+ box-shadow:0 7px 21px #0005,inset 3px 0 0 #e6b15a20;
+}
+.ticket.received{box-shadow:0 7px 21px #0005,inset 3px 0 0 #79bdff19}
+.ticket.preparing{box-shadow:0 7px 21px #0005,inset 3px 0 0 #f7af621a}
+.ticket.ready{box-shadow:0 7px 21px #0005,inset 3px 0 0 #7ee1b425}
+
+/* Navegación y overlays. */
+.navbtn.active{
+ background:linear-gradient(120deg,#554327,#282c31 76%);
+ box-shadow:inset 3px 0 #f4cb7a,0 4px 14px #0005,0 0 0 1px #d2ae6642;
+}
+.pos-more-panel:not([hidden]){
+ box-shadow:0 -24px 50px #000b,inset 0 1px 0 #f4ce7c3b;
+ animation:lux-drawer-enter .25s var(--lux-ease) both;
+}
+.pos-more-link:hover{background:#39404a;border-color:#bfa06a}
+#toast{backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+
+/* Entradas ligeras: solo en login/dashboard; NO en catálogo o comanda al teclear. */
+@keyframes lux-login-in{
+ from{opacity:0;transform:translate3d(0,14px,0) scale(.985)}
+ to{opacity:1;transform:translate3d(0,0,0) scale(1)}
+}
+@keyframes lux-brand-in{
+ from{opacity:.2;transform:translate3d(0,8px,0)}
+ to{opacity:1;transform:translate3d(0,0,0)}
+}
+@keyframes lux-card-enter{
+ from{opacity:0;transform:translate3d(0,9px,0)}
+ to{opacity:1;transform:translate3d(0,0,0)}
+}
+@keyframes lux-orbit{
+ from{opacity:.6;transform:translate3d(-51%,0,0) scale(.96)}
+ to{opacity:1;transform:translate3d(-49%,12px,0) scale(1.06)}
+}
+@keyframes lux-drawer-enter{
+ from{opacity:.75;transform:translate3d(0,14px,0)}
+ to{opacity:1;transform:translate3d(0,0,0)}
+}
+
+/* Pantallas táctiles: sin efectos hover pegajosos; entrada sin costoso blur. */
+@media(hover:none){
+ .premium-shortcut:hover,.pos-tile:hover,.pos-product:hover{transform:none}
+ button.primary:hover{filter:none}
+}
+@media(max-width:700px){
+ .topbar{background:linear-gradient(160deg,#20262d,#12171c)}
+ .card,.stat,.ticket,.pos-catalog,.pos-draft-card{box-shadow:0 3px 13px #0003,inset 0 1px 0 #ffffff0b}
+ .premium-shortcut{box-shadow:0 4px 13px #0004,inset 0 1px 0 #ffebc617}
+ .login-shell:before{width:290px;height:290px;top:-85px;box-shadow:0 0 0 40px #e1b65606,0 0 0 95px #e1b65604}
+}
+/* Batería, accesibilidad, preferencias de sistema: sin animaciones. */
+@media(prefers-reduced-motion:reduce){
+ .login-card,.login-card .brand,.login-shell:before,
+ .premium-shortcut,.pos-more-panel{animation:none!important}
+ button,.card,.pos-product,.pos-tile,.navbtn,.premium-shortcut,.premium-shortcut-arrow{
+  transition:none!important;
+ }
+}
