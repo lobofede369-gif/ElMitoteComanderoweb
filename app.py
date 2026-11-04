@@ -1669,12 +1669,13 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
                          'base_cents':promo_base,'modifier_cents':modifier_cents,'final_cents':final_price,
                          'promo_name':promo.name if promo else ''})
     batch=Batch(account_id=a.id,sent_by=user.id,client_key=data.client_key);db.add(batch);db.flush()
+    mitote_extensions.snapshot_batch_policy(db,batch.id)
     for row in prepared:
         line=row['line'];p=row['product'];variant=row['variant']
         item=OrderItem(batch_id=batch.id,product_id=p.id,name=p.name,station=p.station,price_cents=row['final_cents'],qty=line.qty,note=line.note.strip())
         db.add(item);db.flush()
         db.add(OrderItemMeta(order_item_id=item.id,variant_name=variant.name if variant else '',
-            modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=line.prep_minutes,
+            modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=mitote_extensions.product_prep_minutes(db,p.id,line.prep_minutes),
             release_after_minutes=line.release_after_minutes,promotion_name=row['promo_name'],
             base_price_cents=row['base_cents'],modifier_price_cents=row['modifier_cents']))
     for pid,qty in need.items():
@@ -1712,6 +1713,7 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
     if setting.inventory_on and product.inventory_enabled and product.stock<data.qty:raise HTTPException(409,'No hay existencias suficientes para repetir el producto')
     old_meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==item.id))
     batch=Batch(account_id=account.id,sent_by=user.id,client_key=data.client_key);db.add(batch);db.flush()
+    mitote_extensions.snapshot_batch_policy(db,batch.id)
     new_item=OrderItem(batch_id=batch.id,product_id=item.product_id,name=item.name,station=item.station,price_cents=item.price_cents,qty=data.qty,note=item.note)
     db.add(new_item);db.flush()
     if old_meta:
@@ -2034,6 +2036,7 @@ async def close_account(account_id:int,db:Session=Depends(db_session),user:User=
     if total<=0 or paid!=total:raise HTTPException(409,'La cuenta debe estar completamente pagada')
     a.status='paid';a.closed_at=now()
     release_table_for_account(db,a,user,'Cuenta pagada y cerrada')
+    mitote_extensions.close_reservation_for_account(db,a.id,user)
     audit(db,user,'account.close',id=a.id);db.commit();await notify();return {'ok':True}
 
 @app.get('/api/cash')
@@ -2417,3 +2420,5 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
     doc.build(story)
     return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
+# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
+import mitote_extensions  # noqa: E402
