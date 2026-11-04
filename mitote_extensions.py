@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app import (
     app, Base, Batch, Account, DiningTable, TableOccupancy, Product, OrderItem,
     OrderItemMeta, StationTicket, Payment, PaymentTip, Audit, User,
-    SessionLocal, db_session, auth, allow, audit, active_period, now, notify,
+    SessionLocal, db_session, auth, allow, audit, active_period, TipDistribution, now, notify,
     push_to, fcm_to, ticket_status, StatusIn, amount
 )
 
@@ -366,7 +366,9 @@ async def reservation_arrival(reservation_id: int, data: ReservationArrivalIn,
         return {"ok": True, "duplicate": True, "account_id": row.account_id}
     if row.status not in ("pending", "confirmed"):
         raise HTTPException(409, "La reservación no está activa")
-    active_period(db)
+    period = active_period(db)
+    if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id == period.id)):
+        raise HTTPException(409, "El reparto de propinas de este turno ya fue generado; abre otro turno antes de recibir clientes")
     waiter = db.get(User, data.waiter_id)
     if not waiter or not waiter.active or waiter.role != "waiter":
         raise HTTPException(400, "Selecciona un mesero activo")
