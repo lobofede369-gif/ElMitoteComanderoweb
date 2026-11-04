@@ -1,0 +1,30 @@
+
+/* Vista del corte como ticket térmico, visible incluso sin visor PDF externo. */
+.cash-receipt {
+  max-width:345px;
+  margin:14px auto;
+  padding:22px 16px;
+  background:#fff;
+  color:#181818;
+  font-family:ui-monospace,SFMono-Regular,Consolas,"Courier New",monospace;
+  font-variant-numeric:tabular-nums;
+  box-shadow:0 8px 30px rgba(0,0,0,.22);
+  border-radius:5px;
+  font-size:12px;
+  line-height:1.45;
+}
+.cash-receipt h3 {text-align:center;font-size:20px;letter-spacing:1px;color:#111;margin:0 0 4px}
+.cash-receipt p{margin:3px 0;color:#181818}
+.cash-receipt h4 {border-top:1px dashed #555;padding-top:10px;margin:15px 0 6px;font-size:12px;color:#111}
+.cash-receipt-center{text-align:center}
+.cash-receipt-row{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dotted #ddd}
+.cash-receipt-row span{min-width:0;overflow-wrap:anywhere}
+.cash-receipt-row b{flex:none;white-space:nowrap}
+.cash-receipt-note{font-size:10px;opacity:.8;line-height:1.4}
+.cash-receipt-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;padding:8px}
+@media print{
+  body * {visibility:hidden!important}
+  .cash-receipt,.cash-receipt *{visibility:visible!important}
+  .cash-receipt{position:absolute;left:0;top:0;max-width:80mm;box-shadow:none;padding:5mm}
+  .cash-receipt-actions{display:none!important}
+}
