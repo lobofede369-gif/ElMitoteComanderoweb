@@ -47,7 +47,7 @@ with TestClient(app.app) as client:
     assert client.get("/api/owner/analytics?start=2026-11-01&end=2026-11-04",
                       headers=header("admin")).status_code == 403
     assert client.get("/api/preparation/config",headers=header("waiter")).status_code == 403
-    assert post("cashier",f"/api/preparation/products/{pid}",{"minutes":10}).status_code == 403
+    assert client.put(f"/api/preparation/products/{pid}",json={"minutes":10},headers=header("cashier")).status_code == 403
 
     result=client.put("/api/preparation/config",json={"batch_minutes":30,"warning_percent":80},
                       headers=header("owner"))
