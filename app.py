@@ -2461,8 +2461,8 @@ def period_summary(db,p):
     if archived:
         detail=json.loads(archived.detail_json)
         result={k:v for k,v in detail.items() if k not in ('accounts','payments','tips','movements')}
-        result['tips']=detail.get('tips_total') or amount(sum(
-            float(detail.get(k) or 0) for k in ('tip_cash','tip_card','tip_transfer')))
+        result['tips']=detail.get('tips_total') or f"{sum(
+            Decimal(str(detail.get(k) or '0')) for k in ('tip_cash','tip_card','tip_transfer')):.2f}"
         return result
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
     totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
