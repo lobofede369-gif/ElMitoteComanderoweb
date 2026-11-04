@@ -482,14 +482,24 @@ def promotion_is_active(promo, at=None):
     if not promo.active:return False
     try:
         days={int(x) for x in (promo.weekdays or '').split(',') if x.strip()!=''}
-        if at.weekday() not in days:return False
-        today=at.date().isoformat()
-        if promo.start_date and today<promo.start_date:return False
-        if promo.end_date and today>promo.end_date:return False
         current=at.strftime('%H:%M')
         start=promo.start_time or '00:00';end=promo.end_time or '23:59'
-        if start<=end:return start<=current<=end
-        return current>=start or current<=end
+        # Promociones nocturnas pertenecen al día en que comenzaron.
+        # Ej.: lunes 22:00–martes 02:00 debe seguir activa el martes 01:00.
+        effective_date=at.date()
+        if start<=end:
+            if not start<=current<=end:return False
+        elif current>=start:
+            pass
+        elif current<=end:
+            effective_date-=timedelta(days=1)
+        else:
+            return False
+        if effective_date.weekday() not in days:return False
+        day=effective_date.isoformat()
+        if promo.start_date and day<promo.start_date:return False
+        if promo.end_date and day>promo.end_date:return False
+        return True
     except Exception:
         return False
 
@@ -574,7 +584,8 @@ def login_pin(data: PinLoginIn, request: Request, db: Session = Depends(db_sessi
 class LoginIn(BaseModel): username:str; secret:str
 @app.post('/api/login')
 def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
-    identifier=f"{request.client.host if request.client else 'unknown'}:{data.username.strip().lower()}"
+    # Un límite por IP evita saltar el bloqueo probando distintos usuarios.
+    identifier=f"password:{request.client.host if request.client else 'unknown'}"
     attempts=[t for t in login_failures.get(identifier,[]) if time.time()-t<900]
     if len(attempts)>=7:raise HTTPException(429,'Demasiados intentos. Espera 15 minutos')
     user=db.scalar(select(User).where(User.username==data.username.strip()))
@@ -583,9 +594,10 @@ def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
     if not valid:
         attempts.append(time.time());login_failures[identifier]=attempts
         raise HTTPException(401,'Credenciales incorrectas')
-    # Cuando ya se asignó PIN, los perfiles operativos usan solo el teclado numérico.
-    if user.role != 'owner' and db.get(UserPin, user.id):
-        raise HTTPException(403, 'Este empleado ya utiliza acceso mediante PIN')
+    # El acceso con contraseña antigua es solo recuperación del propietario.
+    # Incluso los perfiles antiguos sin PIN deben activarlo antes de operar.
+    if user.role != 'owner':
+        raise HTTPException(403, 'El acceso de empleados requiere PIN personal de seis dígitos')
     login_failures.pop(identifier,None)
     token=jwt.encode({'sub':str(user.id),'ver':user.session_version,'exp':now()+timedelta(hours=10)},SECRET_KEY,algorithm='HS256')
     return {'token':token,'user':{'id':user.id,'display':user.display,'username':user.username,'role':user.role}}
@@ -839,7 +851,11 @@ async def create_staff(data: StaffCreateIn, db: Session = Depends(db_session), u
     db.flush()
     _set_user_pin(db, target, data.pin)
     audit(db, user, 'staff.create', id=target.id, role=target.role, name=name)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, 'El PIN o el identificador del empleado ya está en uso')
     await notify()
     return {'id':target.id,'display':target.display,'role':target.role}
 
@@ -855,11 +871,15 @@ async def assign_staff_pin(user_id: int, data: StaffPinIn,
         raise HTTPException(404, 'Personal no encontrado')
     _set_user_pin(db, target, data.pin)
     audit(db,user,'staff.pin_set',id=target.id)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, 'El PIN ya pertenece a otra persona')
     await notify()
     return {'ok':True,'owner_pin_changed':target.id == user.id}
 
-class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:str=Field(min_length=2,max_length=100);role:Literal['admin','cashier','waiter','kitchen','bar'];secret:str=Field(min_length=4,max_length=120)
+class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:str=Field(min_length=2,max_length=100);role:Literal['admin','cashier','waiter','kitchen','bar'];secret:str=Field(min_length=6,max_length=6)
 @app.get('/api/users')
 def users(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
@@ -867,11 +887,21 @@ def users(db:Session=Depends(db_session),user:User=Depends(auth)):
 @app.post('/api/users')
 async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner')
-    if data.role=='waiter' and (len(data.secret)!=4 or not data.secret.isdigit()):raise HTTPException(400,'El PIN del mesero debe tener cuatro dígitos')
-    if data.role!='waiter' and len(data.secret)<8:raise HTTPException(400,'La contraseña debe tener al menos 8 caracteres')
-    if db.scalar(select(User).where(User.username==data.username.strip())):raise HTTPException(409,'Usuario ya registrado')
-    u=User(username=data.username.strip(),display=data.display.strip(),role=data.role,password_hash=ph.hash(data.secret))
-    db.add(u);audit(db,user,'user.create',username=u.username,role=u.role);db.commit();await notify()
+    # Compatibilidad con clientes anteriores: nunca crear empleados sin PIN.
+    if not _pin_format(data.secret):raise HTTPException(400,'El PIN debe tener exactamente seis números')
+    username=data.username.strip()
+    display=data.display.strip()
+    if not username or not display:raise HTTPException(400,'Nombre y usuario son obligatorios')
+    if db.scalar(select(User).where(User.username==username)):raise HTTPException(409,'Usuario ya registrado')
+    u=User(username=username,display=display,role=data.role,password_hash=ph.hash(secrets.token_urlsafe(32)))
+    db.add(u);db.flush()
+    _set_user_pin(db,u,data.secret)
+    audit(db,user,'user.create',username=u.username,role=u.role)
+    try:db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409,'Usuario o PIN ya registrado')
+    await notify()
     return {'id':u.id}
 
 class UserUpdateIn(BaseModel): active:Optional[bool]=None;secret:Optional[str]=None
@@ -883,11 +913,18 @@ async def update_user(user_id:int,data:UserUpdateIn,db:Session=Depends(db_sessio
     if target.id==user.id or target.role=='owner':raise HTTPException(403,'No se puede desactivar ni modificar al propietario desde aquí')
     if data.active is not None:target.active=data.active
     if data.secret is not None:
-        if target.role=='waiter' and (len(data.secret)!=4 or not data.secret.isdigit()):raise HTTPException(400,'PIN de 4 dígitos requerido')
-        if target.role!='waiter' and len(data.secret)<8:raise HTTPException(400,'Contraseña de 8 caracteres requerida')
-        target.password_hash=ph.hash(data.secret)
-    target.session_version+=1
-    audit(db,user,'user.update',id=target.id,active=target.active,reset=bool(data.secret));db.commit();await notify();return {'ok':True}
+        # La API anterior ya no debe habilitar credenciales sin PIN.
+        _set_user_pin(db,target,data.secret)
+        target.password_hash=ph.hash(secrets.token_urlsafe(32))
+    else:
+        target.session_version=(target.session_version or 1)+1
+    audit(db,user,'user.update',id=target.id,active=target.active,reset=bool(data.secret))
+    try:db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409,'El PIN ya pertenece a otra persona')
+    await notify()
+    return {'ok':True}
 
 @app.get('/api/settings')
 def settings(db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -915,6 +952,7 @@ class ProductIn(BaseModel):
     blocked:bool=False
     inventory_enabled:bool=False
     stock:int=Field(default=0,ge=0)
+    expected_version:Optional[int]=Field(default=None,ge=1)
 class ActiveToggleIn(BaseModel):
     active: bool
 
@@ -1017,6 +1055,8 @@ async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_sessi
     allow(user,'owner','admin')
     p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
     if not p:raise HTTPException(404,'Producto inexistente')
+    if data.expected_version is None or p.version != data.expected_version:
+        raise HTTPException(409,'El producto o sus existencias cambiaron. Actualiza la pantalla antes de guardar')
     before=product_dict(p,db.get(Setting,1),db)
     p.name=data.name.strip();p.category=data.category.strip()[:80];p.station=data.station;p.price_cents=cents(data.price);p.active=data.active;p.blocked=data.blocked;p.inventory_enabled=data.inventory_enabled;p.stock=data.stock;p.version+=1
     audit(db,user,'product.update',id=p.id,before=before,after=product_dict(p,db.get(Setting,1),db));db.commit();await notify();return {'ok':True}
@@ -1929,11 +1969,18 @@ class PaymentIn(BaseModel):client_key:str=Field(min_length=8,max_length=100);lin
 @app.post('/api/accounts/{account_id}/payments')
 async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier')
-    existing=db.scalar(select(Payment).where(Payment.client_key.like(data.client_key+'-%')))
+    # Comparación exacta: LIKE considera '%' y '_' comodines de SQL.
+    existing=db.scalar(select(Payment).where(Payment.client_key==f'{data.client_key}-0'))
     if existing:
         if existing.account_id!=account_id:raise HTTPException(409,'Clave de pago reutilizada')
         return {'ok':True,'duplicate':True}
-    a=owner_account(db,user,account_id,('pending',));total,paid=acc_totals(db,a)
+    a=owner_account(db,user,account_id,('pending',))
+    # Segunda lectura tras bloquear la cuenta para evitar reintentos simultáneos.
+    existing=db.scalar(select(Payment).where(Payment.client_key==f'{data.client_key}-0'))
+    if existing:
+        if existing.account_id!=account_id:raise HTTPException(409,'Clave de pago reutilizada')
+        return {'ok':True,'duplicate':True}
+    total,paid=acc_totals(db,a)
     payment_total=sum(cents(l.amount) for l in data.lines)
     if payment_total<=0 or payment_total>total-paid:raise HTTPException(409,'El pago excede el saldo o es inválido')
     normalized=[]
@@ -2364,7 +2411,8 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
             entries.append(('Reparto · '+share['employee_name'],'$'+share['share']+' · entregado $'+share['paid']))
     entries.extend([('Entradas y salidas netas','$'+amount(net)),('Efectivo esperado','$'+amount(expected)),('Efectivo contado','$'+amount(p.counted_cents)),('Diferencia','$'+amount(p.counted_cents-expected))])
     table=Table(entries,colWidths=[220,150]);table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.4,colors.lightgrey),('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),8)]))
-    story.append(table);story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+(p.note or 'Sin observaciones'),style['Normal']))
+    from xml.sax.saxutils import escape as xml_escape
+    story.append(table);story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+xml_escape(p.note or 'Sin observaciones'),style['Normal']))
     story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
     story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
     doc.build(story)
