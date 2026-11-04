@@ -22,6 +22,7 @@ jobs:
 
       - name: Validar sintaxis JavaScript
         run: |
+          node --check static/features.js
           node --check static/app.js
           node --check static/pos-ui-v3.js
           node --check static/sw.js
@@ -40,7 +41,9 @@ jobs:
           sw = Path('static/sw.js').read_text(encoding='utf-8')
           assert '/static/theme-obsidian-titanium.css?v=1' in html
           assert '/static/theme-obsidian-modules.css?v=2' in html
-          assert '/static/app.js?v=17' in html
+          assert '/static/app.js?v=18' in html
+          assert '/static/features.js?v=1' in html
+          assert '/static/features.css?v=1' in html
           assert '/static/pos-ui-v3.js?v=7' in html
           assert 'theme-obsidian-modules.css?v=2' in sw
           assert '/static/theme-luxury-motion.css?v=1' in html
@@ -50,7 +53,7 @@ jobs:
           waiter = Path('static/pos-ui-v3.js').read_text(encoding='utf-8')
           assert '/static/theme-service-fast.css?v=1' in html
           assert '/static/theme-service-fast.css?v=1' in sw
-          assert 'mitote-comandas-v20' in sw
+          assert 'mitote-comandas-v21' in sw
           assert 'pos-search' in waiter and 'applyCatalogFilter()' in waiter
           assert 'obs.observe(content,{childList:true});' in waiter
           assert 'subtree:true' not in waiter
@@ -97,3 +100,5 @@ jobs:
           python -m scripts.test_owner_permissions
           python -m scripts.test_pin_login
           python -m scripts.test_audit_regressions
+          python -m scripts.test_new_features
+
