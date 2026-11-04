@@ -528,7 +528,8 @@ def product_dict(p,settings,db=None):
     return {'id':p.id,'name':p.name,'category':p.category,'station':p.station,'price':amount(p.price_cents),
             'current_price':amount(current_cents),'promotion':({'id':active_promo.id,'name':active_promo.name,'price':amount(current_cents),'fixed_price':amount(active_promo.price_cents) if active_promo.price_cents is not None else None,'discount_percent':active_promo.discount_percent} if active_promo else None),
             'variants':variants,'modifier_groups':groups,'promotions':promotions,
-            'active':p.active,'blocked':p.blocked,'inventory_enabled':p.inventory_enabled,'stock':p.stock,'version':p.version,'status':status}
+            'active':p.active,'blocked':p.blocked,'inventory_enabled':p.inventory_enabled,'stock':p.stock,'version':p.version,'status':status,
+             'prep_default_minutes':prep.product_minutes(db,p.id) if db is not None else 15}
 
 def _pin_lookup(pin: str) -> str:
     return hmac.new(SECRET_KEY.encode('utf-8'),
@@ -1674,13 +1675,14 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         item=OrderItem(batch_id=batch.id,product_id=p.id,name=p.name,station=p.station,price_cents=row['final_cents'],qty=line.qty,note=line.note.strip())
         db.add(item);db.flush()
         db.add(OrderItemMeta(order_item_id=item.id,variant_name=variant.name if variant else '',
-            modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=line.prep_minutes,
+            modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=prep.product_minutes(db,p.id,line.prep_minutes),
             release_after_minutes=line.release_after_minutes,promotion_name=row['promo_name'],
             base_price_cents=row['base_cents'],modifier_price_cents=row['modifier_cents']))
     for pid,qty in need.items():
         p=products[pid]
         if setting.inventory_on and p.inventory_enabled:p.stock-=qty;p.version+=1
     for station in stations:db.add(StationTicket(batch_id=batch.id,station=station))
+    prep.snapshot_batch(db,batch)
     audit(db,user,'order.send',account_id=a.id,batch_id=batch.id,stations=sorted(stations),items=len(prepared))
     db.commit();await notify()
     for station in sorted(stations):
@@ -1722,6 +1724,7 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
         db.add(OrderItemMeta(order_item_id=new_item.id,variant_name='',modifiers_json='[]',prep_minutes=15,release_after_minutes=0,base_price_cents=item.price_cents,modifier_price_cents=0))
     if setting.inventory_on and product.inventory_enabled:product.stock-=data.qty;product.version+=1
     db.add(StationTicket(batch_id=batch.id,station=item.station))
+    prep.snapshot_batch(db,batch)
     audit(db,user,'order.repeat',account_id=account.id,source_item_id=item.id,new_item_id=new_item.id,qty=data.qty,batch_id=batch.id)
     db.commit();await notify()
     await push_to({'title':'El Mitote · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · {account.name}','url':'/?push=station','tag':f'mitote-order-{batch.id}-{item.station}'},role=item.station)
@@ -1791,12 +1794,12 @@ def tickets(db:Session=Depends(db_session),user:User=Depends(auth)):
             meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==x.id))
             try:modifiers=json.loads(meta.modifiers_json or '[]') if meta else []
             except Exception:modifiers=[]
-            ticket_items.append({'name':x.name,'qty':x.qty-x.cancelled_qty,'note':x.note,
+            ticket_items.append({'id':x.id,'name':x.name,'qty':x.qty-x.cancelled_qty,'note':x.note,
                 'variant_name':meta.variant_name if meta else '', 'modifiers':modifiers,
                 'prep_minutes':meta.prep_minutes if meta else 15,'release_after_minutes':meta.release_after_minutes if meta else 0,
                 'promotion_name':meta.promotion_name if meta else ''})
         out.append({'id':t.id,'batch_id':b.id,'account':a.name,'account_id':a.id,'waiter':db.get(User,b.sent_by).display,'station':t.station,'status':t.status,'created_at':t.created_at.isoformat() if t.created_at else '', 'items':ticket_items})
-    return out
+    return prep.enrich_tickets(db,out)
 class StatusIn(BaseModel):status:Literal['received','preparing','ready']
 @app.post('/api/tickets/{ticket_id}/status')
 async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -1808,7 +1811,9 @@ async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_sessio
     if allowed.get(t.status)!=data.status:raise HTTPException(409,'Transición de estado no permitida')
     t.status=data.status
     if data.status=='received':t.acknowledged_at=now()
-    if data.status=='ready':t.ready_at=now()
+    if data.status=='ready':
+        t.ready_at=now()
+        prep.mark_station_ready(db,t,user)
     audit(db,user,'ticket.status',ticket_id=t.id,status=t.status)
     batch=db.get(Batch,t.batch_id)
     account=db.get(Account,batch.account_id)
@@ -2417,3 +2422,7 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
     doc.build(story)
     return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
+# Extensión aislada: declarar nuevas tablas y rutas antes de ejecutar bootstrap().
+from prep_timers import register_prep
+prep = register_prep(app, Base, db_session, auth, allow, audit, notify, now,
+                     Product, Batch, OrderItem, StationTicket, Account, push_to, fcm_to)
