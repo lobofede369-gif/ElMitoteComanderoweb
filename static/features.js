@@ -83,18 +83,23 @@ async function showReservations(){
 }
 
 let analyticsDates=null;
+let analyticsScope='current';
 async function showAnalytics(){
   const today=new Date();
   const localDate=d=>new Intl.DateTimeFormat('en-CA',{timeZone:'America/Mexico_City',year:'numeric',month:'2-digit',day:'2-digit'}).format(d);
   if(!analyticsDates){const last=new Date(today.getTime()-6*86400000);analyticsDates={start:localDate(last),end:localDate(today)};}
-  const r=await api('/owner/analytics?start='+encodeURIComponent(analyticsDates.start)+'&end='+encodeURIComponent(analyticsDates.end));
+  const r=await api('/owner/analytics?start='+encodeURIComponent(analyticsDates.start)+'&end='+encodeURIComponent(analyticsDates.end)+'&scope='+analyticsScope);
   const bars=(rows,key)=>{const max=Math.max(1,...rows.map(x=>Number(x.amount)));return '<div class="prep-bars">'+rows.map(x=>
     '<div class="prep-bar-row"><span>'+esc(x[key])+'</span><div class="prep-bar-track"><div style="width:'+
     Math.round(Number(x.amount)/max*100)+'%"></div></div><b>'+money(x.amount)+'</b></div>').join('')+'</div>'};
   const hours=r.sales_by_hour.filter(x=>Number(x.amount)>0);
-  return '<div class="card"><form id="analytics-period" class="formrow"><div class="formgrid">'+
+  return '<div class="card"><div class="prep-actions"><button class="'+(analyticsScope==='current'?'primary':'outline')+' small" data-action="analytics-current">Turno activo</button>'+
+    '<button class="'+(analyticsScope==='history'?'primary':'outline')+' small" data-action="analytics-history">Consultar otros cortes</button></div>'+
+    (analyticsScope==='history'?'<form id="analytics-period" class="formrow"><div class="formgrid">'+
     '<label>Desde<input type="date" name="start" value="'+analyticsDates.start+'" required></label>'+
-    '<label>Hasta<input type="date" name="end" value="'+analyticsDates.end+'" required></label></div><button class="outline">Actualizar estadísticas</button></form></div>'+
+    '<label>Hasta<input type="date" name="end" value="'+analyticsDates.end+'" required></label></div><button class="outline">Consultar historial</button></form>':
+    '<p class="mini">'+(r.active_period_id?'Solo ventas y comandas del corte activo #'+r.active_period_id:
+      'No hay turno de caja abierto. Las ventas anteriores están en el historial de cortes.')+'</p>')+'</div>'+
     '<div class="statgrid">'+stat('Ventas cobradas',money(r.sales))+stat('Cuentas con cobros',r.paid_accounts)+
     stat('Ticket promedio',money(r.average_ticket))+stat('Preparación media',r.prep_avg_minutes===null?'Sin datos':r.prep_avg_minutes+' min')+'</div>'+
     '<h2 class="section">Ventas por día</h2><div class="card">'+bars(r.sales_by_day,'label')+'</div>'+
@@ -110,6 +115,10 @@ async function showAnalytics(){
 
 async function mitoteFeatureAction(action,btn){
   const id=Number(btn.dataset.id);
+  if(action==='analytics-current'||action==='analytics-history'){
+    analyticsScope=action==='analytics-current'?'current':'history';
+    await render();return true;
+  }
   if(action==='prep-item-ready'){
     await api('/preparation/items/'+id+'/ready','POST',{});toast('Producto marcado listo');await render();return true;
   }
@@ -151,6 +160,7 @@ async function mitoteFeatureForm(form){
   }
   if(form.id==='analytics-period'){
     analyticsDates={start:d.start,end:d.end};
+    analyticsScope='history';
     await render();return true;
   }
   return false;

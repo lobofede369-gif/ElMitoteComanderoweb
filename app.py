@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, Column, Integer, String, Boolean, ForeignKey,
-                        DateTime, Text, UniqueConstraint, select, func)
+                        DateTime, Text, LargeBinary, UniqueConstraint, select, func)
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as PDFImage
@@ -117,6 +117,15 @@ class Product(Base):
     inventory_enabled=Column(Boolean,default=False)
     stock=Column(Integer,default=0)
     version=Column(Integer,default=1)
+
+class ArchivedProduct(Base):
+    __tablename__='archived_products'
+    product_id=Column(Integer,ForeignKey('products.id'),primary_key=True)
+    archived_by=Column(Integer,ForeignKey('users.id'),nullable=False)
+    reason=Column(String(200),nullable=False)
+    original_active=Column(Boolean,nullable=False)
+    original_blocked=Column(Boolean,nullable=False)
+    archived_at=Column(DateTime(timezone=True),default=now,nullable=False)
 
 class Account(Base):
     __tablename__='accounts'
@@ -304,6 +313,14 @@ class CashPeriod(Base):
     counted_cents=Column(Integer,nullable=True)
     closed_by=Column(Integer,ForeignKey('users.id'))
     note=Column(String(400),default='')
+
+class CashCutArchive(Base):
+    """Instantánea inmutable del corte: detalle y PDF almacenados juntos."""
+    __tablename__='cash_cut_archives'
+    period_id=Column(Integer,ForeignKey('cash_periods.id'),primary_key=True)
+    detail_json=Column(Text,nullable=False)
+    pdf_blob=Column(LargeBinary,nullable=False)
+    archived_at=Column(DateTime(timezone=True),default=now,nullable=False)
 
 class CashMovement(Base):
     __tablename__='cash_movements'
@@ -950,7 +967,13 @@ async def set_settings(data:SettingsIn,db:Session=Depends(db_session),user:User=
 @app.get('/api/products')
 def products(db:Session=Depends(db_session),user:User=Depends(auth)):
     s=db.get(Setting,1)
-    return [product_dict(p,s,db) for p in db.scalars(select(Product).order_by(Product.category,Product.name))]
+    query=select(Product).outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id).where(
+        ArchivedProduct.product_id.is_(None)).order_by(Product.category,Product.name)
+    return [product_dict(p,s,db) for p in db.scalars(query)]
+class ProductArchiveIn(BaseModel):
+    expected_version:int=Field(ge=1)
+    reason:str=Field(min_length=3,max_length=200)
+
 class ProductIn(BaseModel):
     name:str=Field(min_length=1,max_length=160)
     category:str='General'
@@ -1058,6 +1081,45 @@ async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=De
     allow(user,'owner','admin')
     p=Product(name=data.name.strip(),category=data.category.strip()[:80],station=data.station,price_cents=cents(data.price),active=data.active,blocked=data.blocked,inventory_enabled=data.inventory_enabled,stock=data.stock)
     db.add(p);audit(db,user,'product.create',name=p.name);db.commit();await notify();return {'id':p.id}
+@app.get('/api/products/archived')
+def archived_products(db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    rows=db.execute(select(ArchivedProduct,Product).join(
+        Product,Product.id==ArchivedProduct.product_id).order_by(ArchivedProduct.archived_at.desc()).limit(150)).all()
+    return [{'id':p.id,'name':p.name,'station':p.station,'version':p.version,
+             'reason':a.reason,'archived_at':a.archived_at.isoformat() if a.archived_at else ''}
+            for a,p in rows]
+
+@app.post('/api/products/{product_id}/archive')
+async def archive_product(product_id:int,data:ProductArchiveIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
+    if not p:raise HTTPException(404,'Producto inexistente')
+    if db.get(ArchivedProduct,p.id):raise HTTPException(409,'Este producto ya está eliminado del menú')
+    if p.version!=data.expected_version:raise HTTPException(409,'El producto cambió; actualiza la pantalla antes de eliminar')
+    db.add(ArchivedProduct(product_id=p.id,archived_by=user.id,reason=data.reason.strip(),
+                           original_active=bool(p.active),original_blocked=bool(p.blocked)))
+    p.active=False;p.blocked=True;p.version+=1
+    audit(db,user,'product.archive',product_id=p.id,name=p.name,reason=data.reason.strip())
+    db.commit();await notify()
+    return {'ok':True,'archived':True}
+
+class ProductRestoreIn(BaseModel):
+    expected_version:int=Field(ge=1)
+
+@app.post('/api/products/{product_id}/restore')
+async def restore_product(product_id:int,data:ProductRestoreIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
+    a=db.get(ArchivedProduct,product_id)
+    if not p or not a:raise HTTPException(404,'Producto archivado inexistente')
+    if p.version!=data.expected_version:raise HTTPException(409,'El producto cambió; actualiza la pantalla')
+    p.active=bool(a.original_active);p.blocked=bool(a.original_blocked);p.version+=1
+    db.delete(a)
+    audit(db,user,'product.restore',product_id=p.id,name=p.name)
+    db.commit();await notify()
+    return {'ok':True,'restored':True}
+
 @app.put('/api/products/{product_id}')
 async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
@@ -1148,7 +1210,9 @@ async def update_dining_table(table_id:int,data:DiningTableIn,db:Session=Depends
 @app.get('/api/accounts')
 def accounts(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier','waiter')
-    q=select(Account).order_by(Account.id.desc())
+    p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    if not p:return []  # Los cierres anteriores se consultan solo desde el historial de caja.
+    q=select(Account).where(Account.created_at>=p.opened_at).order_by(Account.id.desc())
     if user.role=='waiter':q=q.where(Account.owner_id==user.id)
     else:q=q.limit(200)
     return [account_dict(db,a) for a in db.scalars(q)]
@@ -1789,7 +1853,10 @@ async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),u
 @app.get('/api/tickets')
 def tickets(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','kitchen','bar')
-    q=select(StationTicket).order_by(StationTicket.id.desc()).limit(150)
+    p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    if not p:return []
+    q=select(StationTicket).join(Batch,Batch.id==StationTicket.batch_id).where(
+        Batch.created_at>=p.opened_at).order_by(StationTicket.id.desc()).limit(150)
     if user.role in ('kitchen','bar'):q=q.where(StationTicket.station==user.role)
     out=[]
     for t in db.scalars(q):
@@ -2103,7 +2170,17 @@ async def close_cash(data:ClosePeriodIn,db:Session=Depends(db_session),user:User
     if tip_distribution and tip_distribution.total_cents!=tip_total:
         raise HTTPException(409,'El total de propinas cambió respecto al reparto. Solicita revisión de administración antes del corte')
     p.closed_at=now();p.counted_cents=cents(data.counted);p.closed_by=user.id;p.note=data.note
-    audit(db,user,'cash.close',period=p.id,counted=p.counted_cents,note=data.note);db.commit();await notify();return {'id':p.id,'closed':True}
+    db.flush()
+    # Cierre transaccional: sin el documento y la instantánea no se confirma el corte.
+    snapshot=cash_period_detail(p.id,db,user)
+    snapshot['archived']=True
+    pdf=cash_report(p.id,db,user)
+    db.add(CashCutArchive(period_id=p.id,
+                          detail_json=json.dumps(snapshot,ensure_ascii=False),
+                          pdf_blob=pdf.body))
+    audit(db,user,'cash.close',period=p.id,counted=p.counted_cents,note=data.note,archived=True)
+    db.commit();await notify()
+    return {'id':p.id,'closed':True,'archived':True}
 class OpenPeriodIn(BaseModel):opening:Decimal=Field(ge=0)
 @app.post('/api/cash/open')
 async def open_cash(data:OpenPeriodIn,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -2328,6 +2405,10 @@ def ticket_pdf(account_id:int,db:Session=Depends(db_session),user:User=Depends(a
         headers={'Content-Disposition':f'attachment; filename="ElMitote_Ticket_{account.id}.pdf"','Cache-Control':'no-store'})
 
 def period_summary(db,p):
+    archived=db.get(CashCutArchive,p.id)
+    if archived:
+        detail=json.loads(archived.detail_json)
+        return {k:v for k,v in detail.items() if k not in ('accounts','payments','tips','movements')}
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
     totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
     tips=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id)).all()
@@ -2369,6 +2450,8 @@ def cash_period_detail(period_id:int,db:Session=Depends(db_session),user:User=De
     allow(user,'owner','admin','cashier')
     p=db.get(CashPeriod,period_id)
     if not p or not p.closed_at:raise HTTPException(404,'Turno cerrado no encontrado')
+    archived=db.get(CashCutArchive,p.id)
+    if archived:return json.loads(archived.detail_json)
     summary=period_summary(db,p)
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id).order_by(Payment.id)).all()
     moves=db.scalars(select(CashMovement).where(CashMovement.period_id==p.id).order_by(CashMovement.id)).all()
@@ -2393,6 +2476,11 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     allow(user,'owner','admin','cashier')
     p=db.get(CashPeriod,period_id)
     if not p or not p.closed_at:raise HTTPException(404,'Corte no encontrado')
+    archived=db.get(CashCutArchive,p.id)
+    if archived:
+        return Response(content=archived.pdf_blob,media_type='application/pdf',
+            headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"',
+                     'Cache-Control':'no-store'})
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
     totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
     tips=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id)).all()
@@ -2423,7 +2511,42 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     entries.extend([('Entradas y salidas netas','$'+amount(net)),('Efectivo esperado','$'+amount(expected)),('Efectivo contado','$'+amount(p.counted_cents)),('Diferencia','$'+amount(p.counted_cents-expected))])
     table=Table(entries,colWidths=[220,150]);table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.4,colors.lightgrey),('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),8)]))
     from xml.sax.saxutils import escape as xml_escape
-    story.append(table);story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+xml_escape(p.note or 'Sin observaciones'),style['Normal']))
+    story.append(table);story.append(Spacer(1,14))
+    # Detalle inmutable de ventas y propinas del mismo turno.
+    sale_by_account={}
+    tip_by_payment={x.payment_id:x.cents for x in tips}
+    for payment in payments:
+        row=sale_by_account.setdefault(payment.account_id,{'sales':0,'tips':0})
+        row['sales']+=payment.cents
+        row['tips']+=tip_by_payment.get(payment.id,0)
+    story.append(Paragraph('Cuentas cobradas en este corte',style['Heading3']))
+    if sale_by_account:
+        sale_rows=[('Cuenta','Ventas','Propinas')]
+        for account_id in sorted(sale_by_account):
+            account=db.get(Account,account_id)
+            name=account.name if account else 'Cuenta'
+            row=sale_by_account[account_id]
+            sale_rows.append((Paragraph('#'+str(account_id)+' · '+xml_escape(name),style['Normal']),
+                              '$'+amount(row['sales']),'$'+amount(row['tips'])))
+        detail_table=Table(sale_rows,colWidths=[210,80,80],repeatRows=1)
+        detail_table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.3,colors.lightgrey),
+                                         ('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+        story.append(detail_table)
+    else:
+        story.append(Paragraph('Sin ventas registradas.',style['Normal']))
+    if moves:
+        story.append(Spacer(1,10))
+        story.append(Paragraph('Movimientos autorizados del corte',style['Heading3']))
+        move_rows=[('Tipo','Importe','Motivo')]
+        for movement in moves:
+            move_rows.append(('Entrada' if movement.kind=='in' else 'Salida',
+                ('$' if movement.kind=='in' else '-$')+amount(movement.cents),
+                Paragraph(xml_escape(movement.reason),style['Normal'])))
+        movements_table=Table(move_rows,colWidths=[75,75,220],repeatRows=1)
+        movements_table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.3,colors.lightgrey),
+                                            ('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+        story.append(movements_table)
+    story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+xml_escape(p.note or 'Sin observaciones'),style['Normal']))
     story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
     story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
     doc.build(story)

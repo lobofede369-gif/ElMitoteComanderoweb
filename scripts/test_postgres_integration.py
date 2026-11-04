@@ -112,4 +112,37 @@ with TestClient(app.app) as client:
     assert res.json()["paid_accounts"]==1
     assert client.get(f"/api/owner/analytics?start={today}&end={today}",
                       headers=bearer("admin")).status_code==403
-print("OK PostgreSQL 18: modelos, comandos, cronómetros, reservas, permisos y ventas sin propinas")
+
+    # Verificación PostgreSQL de archivado de productos y PDF inmutable por corte.
+    with app.SessionLocal() as db:
+        period_id=db.scalar(app.select(app.CashPeriod.id))
+        db.get(app.Account,account_id).status="paid"
+        db.get(app.Account,aid).status="paid"
+        pool=app.TipDistribution(period_id=period_id,created_by=users["admin"],
+            total_cents=2000,participant_count=1,base_share_cents=2000,remainder_cents=0)
+        db.add(pool);db.flush()
+        db.add(app.TipDistributionShare(distribution_id=pool.id,user_id=users["waiter"],
+            employee_name="Mesero prueba",employee_role="waiter",share_cents=2000))
+        prod=db.get(app.Product,product_id)
+        previous_version=prod.version
+        db.commit()
+    result=post("admin",f"/api/products/{product_id}/archive",
+                {"expected_version":previous_version,"reason":"Prueba de archivo segura"})
+    assert result.status_code==200,result.text
+    assert all(p["id"]!=product_id for p in client.get("/api/products",headers=bearer("owner")).json())
+    assert client.get("/api/products/archived",headers=bearer("cashier")).status_code==403
+    closure=post("admin","/api/cash/close",{"counted":"143.00","note":"Prueba PostgreSQL de corte archivado"})
+    assert closure.status_code==200,closure.text
+    assert closure.json()["archived"]
+    with app.SessionLocal() as db:
+        frozen=db.get(app.CashCutArchive,period_id)
+        assert frozen and frozen.pdf_blob.startswith(b"%PDF-")
+        assert db.get(app.OrderItem,iid).product_id==product_id
+    pdf=client.get(f"/api/cash/periods/{period_id}/report.pdf",headers=bearer("admin"))
+    assert pdf.status_code==200 and pdf.content.startswith(b"%PDF-")
+    assert client.get("/api/accounts",headers=bearer("admin")).json()==[]
+    assert client.get("/api/preparation/tickets",headers=bearer("kitchen")).json()["tickets"]==[]
+    history=client.get("/api/cash/history",headers=bearer("admin"))
+    assert history.status_code==200 and history.json()[0]["sales"]=="123.00"
+
+print("OK PostgreSQL 18: modelos, comandos, cronómetros, reservas, permisos y ventas y PDF por corte inmutable")
