@@ -2511,7 +2511,70 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     entries.extend([('Entradas y salidas netas','$'+amount(net)),('Efectivo esperado','$'+amount(expected)),('Efectivo contado','$'+amount(p.counted_cents)),('Diferencia','$'+amount(p.counted_cents-expected))])
     table=Table(entries,colWidths=[220,150]);table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.4,colors.lightgrey),('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),8)]))
     from xml.sax.saxutils import escape as xml_escape
-    story.append(table);story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+xml_escape(p.note or 'Sin observaciones'),style['Normal']))
+    story.append(table);story.append(Spacer(1,14))
+    # El PDF archivado lleva las ventas detalladas que desaparecen del tablero activo.
+    sale_by_account={}
+    tip_by_payment={x.payment_id:x.cents for x in tips}
+    for payment in payments:
+        row=sale_by_account.setdefault(payment.account_id,{'sales':0,'tips':0})
+        row['sales']+=payment.cents
+        row['tips']+=tip_by_payment.get(payment.id,0)
+    story.append(Paragraph('Cuentas cobradas en este corte',style['Heading3']))
+    if sale_by_account:
+        sale_rows=[('Cuenta','Ventas','Propinas')]
+        for account_id in sorted(sale_by_account):
+            account=db.get(Account,account_id)
+            name=account.name if account else 'Cuenta'
+            row=sale_by_account[account_id]
+            sale_rows.append((Paragraph('#'+str(account_id)+' · '+xml_escape(name),style['Normal']),
+                              '
+    story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
+    story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
+    doc.build(story)
+    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
+# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
+import mitote_extensions  # noqa: E402
++amount(row['sales']),'
+    story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
+    story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
+    doc.build(story)
+    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
+# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
+import mitote_extensions  # noqa: E402
++amount(row['tips'])))
+        detail_table=Table(sale_rows,colWidths=[210,80,80],repeatRows=1)
+        detail_table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.3,colors.lightgrey),
+                                         ('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+        story.append(detail_table)
+    else:
+        story.append(Paragraph('Sin ventas registradas.',style['Normal']))
+    if moves:
+        story.append(Spacer(1,10))
+        story.append(Paragraph('Movimientos autorizados del corte',style['Heading3']))
+        move_rows=[('Tipo','Importe','Motivo')]
+        for movement in moves:
+            move_rows.append(('Entrada' if movement.kind=='in' else 'Salida',
+                ('
+    story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
+    story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
+    doc.build(story)
+    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
+# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
+import mitote_extensions  # noqa: E402
+ if movement.kind=='in' else '-
+    story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
+    story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
+    doc.build(story)
+    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
+# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
+import mitote_extensions  # noqa: E402
+)+amount(movement.cents),
+                Paragraph(xml_escape(movement.reason),style['Normal'])))
+        movements_table=Table(move_rows,colWidths=[75,75,220],repeatRows=1)
+        movements_table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.3,colors.lightgrey),
+                                            ('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+        story.append(movements_table)
+    story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+xml_escape(p.note or 'Sin observaciones'),style['Normal']))
     story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
     story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
     doc.build(story)
