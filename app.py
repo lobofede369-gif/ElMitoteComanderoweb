@@ -2601,3 +2601,4 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
 # Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
 import mitote_extensions  # noqa: E402
+import menu_photo_import  # noqa: E402
