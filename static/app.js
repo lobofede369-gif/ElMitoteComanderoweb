@@ -160,12 +160,14 @@ function updateDraftUI(){
   if(bill)bill.disabled=state.draft.length>0;
 }
 async function showOrders(){
-  const arr=await api('/accounts');state.data.accounts=arr;
+  // Cargar cuentas y catálogo en paralelo, no uno detrás del otro.
+  // Cada respuesta mantiene el control de sesión existente en api().
+  const [arr,productResponse]=await Promise.all([api('/accounts'),api('/products')]);state.data.accounts=arr;
   const open=arr.filter(x=>x.status==='open');
   if(!open.length)return '<div class="empty">No tienes cuentas abiertas. Crea una para comenzar.</div><p><button class="primary" data-nav="new">Nueva cuenta</button></p>';
   if(!open.some(a=>a.id===state.account)){state.account=open[0].id;state.draft=[];persistWorkState()}
   const a=open.find(x=>x.id===state.account);
-  const prods=(await api('/products')).filter(x=>x.active&&!x.blocked&&x.status!=='Agotado');state.products=prods;
+  const prods=productResponse.filter(x=>x.active&&!x.blocked&&x.status!=='Agotado');state.products=prods;
   state.draft=(Array.isArray(state.draft)?state.draft:[]).filter(Boolean).map(x=>({...x,modifier_names:Array.isArray(x.modifier_names)?x.modifier_names:[]}));
   const first=prods[0];
   return `<div class="card"><label>Cuenta<select id="order-account">${open.map(x=>`<option value="${x.id}" ${x.id===state.account?'selected':''}>#${x.id} · ${esc(x.name)}</option>`).join('')}</select></label><div class="row" style="margin-top:12px"><b>${esc(a.name)}</b>${pill(a.status)}</div></div>
