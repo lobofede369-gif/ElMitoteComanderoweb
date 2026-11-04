@@ -160,12 +160,14 @@ function updateDraftUI(){
   if(bill)bill.disabled=state.draft.length>0;
 }
 async function showOrders(){
-  const arr=await api('/accounts');state.data.accounts=arr;
+  // Cargar cuentas y catálogo en paralelo, no uno detrás del otro.
+  // Cada respuesta mantiene el control de sesión existente en api().
+  const [arr,productResponse]=await Promise.all([api('/accounts'),api('/products')]);state.data.accounts=arr;
   const open=arr.filter(x=>x.status==='open');
   if(!open.length)return '<div class="empty">No tienes cuentas abiertas. Crea una para comenzar.</div><p><button class="primary" data-nav="new">Nueva cuenta</button></p>';
   if(!open.some(a=>a.id===state.account)){state.account=open[0].id;state.draft=[];persistWorkState()}
   const a=open.find(x=>x.id===state.account);
-  const prods=(await api('/products')).filter(x=>x.active&&!x.blocked&&x.status!=='Agotado');state.products=prods;
+  const prods=productResponse.filter(x=>x.active&&!x.blocked&&x.status!=='Agotado');state.products=prods;
   state.draft=(Array.isArray(state.draft)?state.draft:[]).filter(Boolean).map(x=>({...x,modifier_names:Array.isArray(x.modifier_names)?x.modifier_names:[]}));
   const first=prods[0];
   return `<div class="card"><label>Cuenta<select id="order-account">${open.map(x=>`<option value="${x.id}" ${x.id===state.account?'selected':''}>#${x.id} · ${esc(x.name)}</option>`).join('')}</select></label><div class="row" style="margin-top:12px"><b>${esc(a.name)}</b>${pill(a.status)}</div></div>
@@ -182,16 +184,18 @@ async function showOrders(){
 async function accountDetailHtml(id,admin=false){
   const a=await api('/accounts/'+id);
   const canManage=['owner','admin','waiter'].includes(state.user?.role);
+  // Conservar acciones operativas de meseros; reservar la edición avanzada al Propietario.
+  const canEditAccount=state.user?.role==='owner';
   const isAdmin=['owner','admin'].includes(state.user?.role);
   let tables=[],accounts=[],history=[];
-  if(canManage&&['open','pending'].includes(a.status)){
+  if(canEditAccount&&['open','pending'].includes(a.status)){
     [tables,accounts,history]=await Promise.all([
       api('/tables'),api('/accounts'),api(`/accounts/${id}/history`)
     ]);
   }else if(canManage){
     history=await api(`/accounts/${id}/history`);
   }
-  if(isAdmin&&!state.data.users)state.data.users=await api('/users');
+  if(canEditAccount&&!state.data.users)state.data.users=await api('/users');
   const availableTables=tables.filter(t=>t.active&&(t.status==='available'||t.id===a.table_id));
   const otherAccounts=accounts.filter(x=>x.id!==a.id&&['open','pending'].includes(x.status));
   const activeItems=a.items.filter(i=>i.qty>i.cancelled_qty);
@@ -208,7 +212,7 @@ async function accountDetailHtml(id,admin=false){
     'account.close':'Cuenta cerrada'
   };
   const historyHtml=history.length?`<div class="card"><h3>Historial de movimientos</h3>${history.slice(0,12).map(h=>`<div class="lineitem"><div class="row"><b>${esc(historyLabels[h.action]||h.action)}</b><span class="mini">${esc(h.date?new Date(h.date).toLocaleString('es-MX'):'')}</span></div><div class="mini">${esc(h.actor||'Sistema')} · ${esc(h.detail?.reason||h.detail?.product||'Movimiento registrado')}${h.detail?.target_account_id?` · Cuenta destino #${h.detail.target_account_id}`:''}${h.detail?.to_table?` · ${esc(h.detail.to_table)}`:''}</div></div>`).join('')}</div>`:'';
-  const actionsHtml=canManage&&['open','pending'].includes(a.status)?`
+  const actionsHtml=canEditAccount&&['open','pending'].includes(a.status)?`
     <div class="card"><h3>Modificar cuenta</h3>
       <form id="account-rename-form" class="formrow">
         <input type="hidden" name="account_id" value="${id}">
@@ -223,13 +227,13 @@ async function accountDetailHtml(id,admin=false){
         <label>Motivo<input name="reason" minlength="3" maxlength="400" required placeholder="Cambio de ubicación"></label>
         <button class="outline small">Actualizar mesa</button>
       </form>
-      ${isAdmin?`<div class="divider"></div><form id="reassign-form" class="formrow"><input type="hidden" name="account_id" value="${id}"><label>Nuevo mesero<select name="owner_id">${(state.data.users||[]).filter(u=>u.role==='waiter'&&u.active).map(u=>`<option value="${u.id}" ${u.id===a.owner_id?'selected':''}>${esc(u.display)}</option>`).join('')}</select></label><label>Motivo<input name="reason" required minlength="3" placeholder="Cambio de turno"></label><button class="outline small">Reasignar mesero</button></form>`:''}
+      ${canEditAccount?`<div class="divider"></div><form id="reassign-form" class="formrow"><input type="hidden" name="account_id" value="${id}"><label>Nuevo mesero<select name="owner_id">${(state.data.users||[]).filter(u=>u.role==='waiter'&&u.active).map(u=>`<option value="${u.id}" ${u.id===a.owner_id?'selected':''}>${esc(u.display)}</option>`).join('')}</select></label><label>Motivo<input name="reason" required minlength="3" placeholder="Cambio de turno"></label><button class="outline small">Reasignar mesero</button></form>`:''}
     </div>
     ${otherAccounts.length?`<div class="card"><h3>Unir esta cuenta con otra</h3><p class="mini">Esta cuenta se integrará en la cuenta destino. Sus comandas, pagos y asignaciones de productos se conservarán.</p><form id="account-merge-form" class="formrow"><input type="hidden" name="account_id" value="${id}"><label>Cuenta destino<select name="target_account_id" required>${otherAccounts.map(x=>`<option value="${x.id}">#${x.id} · ${esc(x.name)} · ${esc(x.owner)} · Saldo ${money(x.due)}</option>`).join('')}</select></label><label>Motivo de unión<input name="reason" minlength="3" maxlength="400" required placeholder="Misma mesa / solicitud del cliente"></label><button class="red small">Unir cuentas</button></form></div>`:''}
     ${activeItems.length?`<div class="card"><h3>Dividir productos de esta cuenta</h3><p class="mini">Solo se pueden trasladar unidades no asignadas a pagos y que cocina o barra ya hayan marcado como listas. La división no genera una nueva comanda.</p><form id="account-split-form" class="formrow"><input type="hidden" name="account_id" value="${id}"><label>Producto<select name="item_id" required>${activeItems.map(i=>`<option value="${i.id}">${i.qty-i.cancelled_qty} × ${esc(i.name)} · ${money(i.price)} · #${i.id}</option>`).join('')}</select></label><label>Cantidad a trasladar<input name="qty" type="number" min="1" max="${Math.max(...activeItems.map(i=>i.qty-i.cancelled_qty))}" value="1" required></label><label>Destino<select name="target_account_id"><option value="">Crear una cuenta nueva</option>${otherAccounts.map(x=>`<option value="${x.id}">Agregar a #${x.id} · ${esc(x.name)}</option>`).join('')}</select></label><label>Nombre de la nueva cuenta<input name="name" maxlength="120" placeholder="Dividida de #${id}"></label><label>Mesa para la nueva cuenta<select name="table_id"><option value="">Cuenta libre</option>${tables.filter(t=>t.active&&t.status==='available').map(t=>`<option value="${t.id}">${esc(t.name)} · ${esc(t.area)}</option>`).join('')}</select></label><label>Motivo<input name="reason" minlength="3" maxlength="400" required placeholder="División solicitada por el cliente"></label><button class="outline small">Dividir / trasladar producto</button></form></div>`:''}
   `:'';
-  const reopenHtml=isAdmin&&a.status==='paid'?`<div class="card"><h3>Reabrir cuenta cerrada</h3><p class="mini">Se conservarán los pagos anteriores. La cuenta volverá a estar abierta para registrar nuevos consumos.</p><button class="outline" data-action="reopen-closed" data-id="${id}">Reabrir cuenta #${id}</button></div>`:'';
-  return `<div class="card"><div class="row"><h3>${esc(a.name)} · #${a.id}</h3>${pill(a.status)}</div>${a.table_name?`<p class="mini">Mesa: ${esc(a.table_name)} · ${esc(a.table_area||'')}</p>`:''}<p>Total ${money(a.total)} · Pagado ${money(a.paid)} · <b>Saldo ${money(a.due)}</b></p>${a.items.map(i=>`<div class="lineitem"><div class="row"><b>${i.qty-i.cancelled_qty} × ${esc(i.name)}${i.variant_name?' · '+esc(i.variant_name):''}</b><span>${money(Number(i.price)*(i.qty-i.cancelled_qty))}</span></div><div class="mini">${i.station==='kitchen'?'Cocina':'Barra'}${i.promotion_name?' · '+esc(i.promotion_name):''}</div>${i.modifiers?.length?`<div class="mini">Extras: ${i.modifiers.map(m=>esc(m.name)+(Number(m.price_delta)>0?' (+'+money(m.price_delta)+')':'')).join(', ')}</div>`:''}${i.note?`<div class="note">${esc(i.note)}</div>`:''}<div class="mini">Preparación: ${Number(i.prep_minutes||15)} min${i.release_after_minutes?' · Salida +'+Number(i.release_after_minutes)+' min':''}</div>${canManage&&a.status==='open'&&i.qty>i.cancelled_qty?`<div class="inline"><button class="ghost small" data-action="repeat-item" data-account="${id}" data-id="${i.id}">Repetir producto</button>${!admin?`<button class="ghost small" data-action="cancel-request" data-account="${id}" data-id="${i.id}" data-qty="${i.qty-i.cancelled_qty}">Solicitar cancelación</button>`:''}</div>`:(!admin&&['open','pending'].includes(a.status)&&i.qty>i.cancelled_qty?`<button class="ghost small" data-action="cancel-request" data-account="${id}" data-id="${i.id}" data-qty="${i.qty-i.cancelled_qty}">Solicitar cancelación</button>`:'')}</div>`).join('')||'<p class="muted">Sin productos.</p>'}${!admin&&a.status==='pending'&&Number(a.paid)===0?`<button class="outline small" data-action="reopen-request" data-id="${id}">Solicitar reapertura</button>`:''}${admin&&['open','pending'].includes(a.status)&&Number(a.total)===0&&Number(a.paid)===0?`<div class="divider"></div><button class="red" data-action="void-account" data-id="${id}">Anular cuenta vacía (con motivo)</button>`:''}</div>${actionsHtml}${reopenHtml}${historyHtml}`;
+  const reopenHtml=canEditAccount&&a.status==='paid'?`<div class="card"><h3>Reabrir cuenta cerrada</h3><p class="mini">Se conservarán los pagos anteriores. La cuenta volverá a estar abierta para registrar nuevos consumos.</p><button class="outline" data-action="reopen-closed" data-id="${id}">Reabrir cuenta #${id}</button></div>`:'';
+  return `<div class="card"><div class="row"><h3>${esc(a.name)} · #${a.id}</h3>${pill(a.status)}</div>${a.table_name?`<p class="mini">Mesa: ${esc(a.table_name)} · ${esc(a.table_area||'')}</p>`:''}<p>Total ${money(a.total)} · Pagado ${money(a.paid)} · <b>Saldo ${money(a.due)}</b></p>${a.items.map(i=>`<div class="lineitem"><div class="row"><b>${i.qty-i.cancelled_qty} × ${esc(i.name)}${i.variant_name?' · '+esc(i.variant_name):''}</b><span>${money(Number(i.price)*(i.qty-i.cancelled_qty))}</span></div><div class="mini">${i.station==='kitchen'?'Cocina':'Barra'}${i.promotion_name?' · '+esc(i.promotion_name):''}</div>${i.modifiers?.length?`<div class="mini">Extras: ${i.modifiers.map(m=>esc(m.name)+(Number(m.price_delta)>0?' (+'+money(m.price_delta)+')':'')).join(', ')}</div>`:''}${i.note?`<div class="note">${esc(i.note)}</div>`:''}<div class="mini">Preparación: ${Number(i.prep_minutes||15)} min${i.release_after_minutes?' · Salida +'+Number(i.release_after_minutes)+' min':''}</div>${canManage&&a.status==='open'&&i.qty>i.cancelled_qty?`<div class="inline"><button class="ghost small" data-action="repeat-item" data-account="${id}" data-id="${i.id}">Repetir producto</button>${!admin?`<button class="ghost small" data-action="cancel-request" data-account="${id}" data-id="${i.id}" data-qty="${i.qty-i.cancelled_qty}">Solicitar cancelación</button>`:''}</div>`:(!admin&&['open','pending'].includes(a.status)&&i.qty>i.cancelled_qty?`<button class="ghost small" data-action="cancel-request" data-account="${id}" data-id="${i.id}" data-qty="${i.qty-i.cancelled_qty}">Solicitar cancelación</button>`:'')}</div>`).join('')||'<p class="muted">Sin productos.</p>'}${!admin&&a.status==='pending'&&Number(a.paid)===0?`<button class="outline small" data-action="reopen-request" data-id="${id}">Solicitar reapertura</button>`:''}${admin&&canEditAccount&&['open','pending'].includes(a.status)&&Number(a.total)===0&&Number(a.paid)===0?`<div class="divider"></div><button class="red" data-action="void-account" data-id="${id}">Anular cuenta vacía (con motivo)</button>`:''}</div>${actionsHtml}${reopenHtml}${historyHtml}`;
 }
 async function refreshAccountPanel(id,admin=false){
   if(admin){
@@ -356,7 +360,52 @@ async function showInventory(){const [s,ps]=await Promise.all([api('/settings'),
 async function showUsers(){const users=await api('/users');state.data.users=users;return `<div class="card"><h3>Registrar empleado o estación</h3><form id="user-add" class="formrow"><div class="formgrid"><label>Usuario<input name="username" required minlength="3"></label><label>Nombre para mostrar<input name="display" required minlength="2"></label><label>Rol<select name="role"><option value="waiter">Mesero (PIN de 4 dígitos)</option><option value="cashier">Cajero</option><option value="admin">Administrador</option><option value="kitchen">Celular de cocina</option><option value="bar">Celular de barra</option></select></label><label>PIN o contraseña<input name="secret" type="password" required minlength="4"></label></div><button class="primary">Crear acceso</button></form><p class="mini">Solo el propietario puede crear cuentas. Meseros: PIN de 4 dígitos. Otros: contraseña de 8 o más caracteres.</p></div><h2 class="section">Usuarios y estaciones</h2><div class="cards">${users.map(u=>`<div class="card"><h3>${esc(u.display)}</h3><p>${esc(u.username)} · ${esc(labels[u.role])}</p>${pill(u.active?'open':'rejected')}${state.user.role==='owner'&&u.role!=='owner'?`<div class="inline" style="margin-top:10px"><button class="outline small" data-action="reset-user" data-id="${u.id}" data-role="${u.role}">Cambiar clave</button><button class="ghost small" data-action="toggle-user" data-id="${u.id}" data-active="${!u.active}">${u.active?'Desactivar':'Activar'}</button></div>`:''}</div>`).join('')}</div>`}
 async function showApprovals(){const rs=await api('/requests');return `<div class="cards">${rs.map(r=>`<div class="card"><div class="row"><h3>${r.kind==='reopen'?'Reapertura':'Cancelación'} · #${r.account_id}</h3>${pill(r.status)}</div><p>${esc(r.account)} · ${esc(r.requester)}</p><p>${esc(r.reason)}</p>${r.kind==='cancel'?`<p class="mini">Producto #${r.item_id} · ${r.qty} unidad(es)</p>`:''}${r.status==='pending'?`<div class="inline"><button class="primary small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="true">Autorizar</button><button class="ghost small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="false">Rechazar</button></div>`:''}</div>`).join('')||'<div class="empty">No hay solicitudes.</div>'}</div>`}
 async function showAudit(){const rs=await api('/audit');return `<div class="card table-wrap"><table><thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Detalle</th></tr></thead><tbody>${rs.map(x=>`<tr><td>${esc(new Date(x.date).toLocaleString('es-MX'))}</td><td>${esc(x.actor)}</td><td>${esc(x.action)}</td><td class="mini">${esc(JSON.stringify(x.detail))}</td></tr>`).join('')}</tbody></table></div>`}
-async function showOverview(){const [as,ts,ps]=await Promise.all([api('/accounts'),api('/tickets'),api('/products')]);return `<div class="statgrid">${stat('Cuentas activas',as.filter(a=>a.status==='open'||a.status==='pending').length)}${stat('Por cobrar',as.filter(a=>a.status==='pending').length)}${stat('Comandas nuevas',ts.filter(t=>t.status==='new').length)}${stat('Productos',ps.length)}</div><div class="grid2"><div class="card"><h3>Operación en vivo</h3><p>Las cuentas se actualizan al recibir cambios del servidor.</p><button class="primary" data-nav="all">Supervisar cuentas</button></div><div class="card"><h3>Inventario inicial</h3><p>Desactivado por defecto. Se puede activar después del recuento.</p><button class="outline" data-nav="inventory">Abrir inventario</button></div></div>`}
+async function showOverview(){
+  const [as,ts,ps]=await Promise.all([api('/accounts'),api('/tickets'),api('/products')]);
+  // Los accesos solo navegan a módulos ya existentes, sin alterar API o permisos.
+  const drawings={
+    list:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h9M8 13h9M8 17h6"/>',
+    table:'<rect x="3" y="5" width="18" height="5" rx="1"/><path d="M6 10v10M18 10v10M3 16h18"/>',
+    food:'<path d="M4 3v9a3 3 0 0 0 6 0V3M7 3v18M18 3c-3 4-3 8 0 10h2V3M18 13v8"/>',
+    kitchen:'<path d="M6 14a4 4 0 0 1-2-7 5 5 0 0 1 8-2 5 5 0 0 1 8 2 4 4 0 0 1-2 7v6H6z"/><path d="M6 17h12"/>',
+    cash:'<rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M5 9h1M18 15h1"/>',
+    box:'<path d="m12 2 9 5-9 5-9-5zM3 7v10l9 5 9-5V7M12 12v10"/>',
+    people:'<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 5v1"/>',
+    tips:'<circle cx="12" cy="12" r="9"/><path d="M15 9c-1-2-6-2-6 1 0 3 6 1 6 4 0 3-5 3-6 1M12 6v12"/>',
+    shield:'<path d="M12 2 4 6v6c0 5 3 8 8 10 5-2 8-5 8-10V6z"/><path d="m9 12 2 2 4-4"/>',
+    audit:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h6"/>'
+  };
+  const icon=name=>'<svg viewBox="0 0 24 24" width="25" height="25" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+drawings[name]+'</svg>';
+  const shortcuts=[
+    ['all','Cuentas','Cuentas abiertas y seguimiento','list'],
+    ['tables','Mesas','Configuración y disponibilidad','table'],
+    ['tickets','Estaciones','Comandas de cocina y barra','kitchen'],
+    ['cashier','Cobros','Pagos pendientes y descuentos','cash'],
+    ['cash','Caja','Turnos, cortes y movimientos','cash'],
+    ['products','Menú','Productos, variantes y promociones','food'],
+    ['inventory','Inventario','Existencias y reposiciones','box'],
+    ['users','Personal','Empleados y permisos','people'],
+    ['tips','Propinas','Fondo común y repartos','tips'],
+    ['approvals','Autorizaciones','Solicitudes y cancelaciones','shield'],
+    ['audit','Auditoría','Registro de operaciones','audit']
+  ];
+  return `<div class="premium-dashboard">
+    <div class="premium-dashboard-heading">
+      <div><p class="premium-eyebrow">CENTRO DE CONTROL</p><h2>Operación del restaurante</h2>
+      <p>Revisa el servicio y entra directamente al módulo que necesitas.</p></div>
+      <span class="premium-dashboard-live">● Información actualizada</span>
+    </div>
+    <div class="statgrid">${stat('Cuentas activas',as.filter(a=>a.status==='open'||a.status==='pending').length)}${stat('Por cobrar',as.filter(a=>a.status==='pending').length)}${stat('Comandas nuevas',ts.filter(t=>t.status==='new').length)}${stat('Productos',ps.length)}</div>
+    <div class="premium-dashboard-heading premium-dashboard-second"><div><p class="premium-eyebrow">GESTIÓN Y ADMINISTRACIÓN</p><h2>Todos los módulos</h2></div></div>
+    <div class="premium-shortcut-grid">
+    ${shortcuts.map(([id,label,desc,drawing])=>`<button type="button" class="premium-shortcut" data-nav="${id}" aria-label="Abrir ${label}"><span class="premium-shortcut-icon">${icon(drawing)}</span><strong>${label}</strong><small>${desc}</small><span class="premium-shortcut-arrow" aria-hidden="true">›</span></button>`).join('')}
+    </div>
+    <div class="grid2 premium-dashboard-footer">
+      <div class="card"><h3>Operación en vivo</h3><p>Consulta cuentas abiertas y el estado de los pedidos.</p><button class="primary" data-nav="all">Supervisar cuentas</button></div>
+      <div class="card"><h3>Control de inventario</h3><p>Revisa existencias, productos bloqueados y reposiciones.</p><button class="outline" data-nav="inventory">Abrir inventario</button></div>
+    </div>
+  </div>`;
+}
 function formObj(form){return Object.fromEntries(new FormData(form).entries())}
 function ask(message){const v=prompt(message);return v&&v.trim()?v.trim():null}
 async function act(action,btn){const id=Number(btn.dataset.id);switch(action){case 'push-enable':await enablePush();await render();break;

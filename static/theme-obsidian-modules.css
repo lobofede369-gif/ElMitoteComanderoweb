@@ -1,0 +1,353 @@
+/* El Mitote Comandas · Obsidian + Titanium · Etapa 2: todos los módulos
+   Solo presentación. Los formularios, acciones y roles los define app.js.
+   Complemento de theme-obsidian-titanium.css, cargado al final. */
+
+:root{
+  --premium-gold:#e6bd69;--premium-gold-light:#f5d995;
+  --premium-titanium:#252b32;--premium-titanium-light:#343c45;
+  --premium-obsidian:#101418;--premium-muted:#bac1c9;
+  --premium-edge:#424b55;--premium-red:#e6717c;
+}
+
+/* Rejillas informativas y secciones densas: aire y orden sin perder opciones. */
+#content{min-width:0;overflow-wrap:anywhere}
+#content>.section,.section{
+  margin:clamp(19px,3vw,29px) 0 12px;
+  color:#f6f3ed;font-weight:800;letter-spacing:-.012em;
+  padding-left:12px;border-left:3px solid #b18a4e;
+  line-height:1.25;
+}
+#content>.section:first-child{margin-top:5px}
+.cards{gap:14px}
+.card{min-width:0}
+.card h3{line-height:1.32;letter-spacing:-.015em}
+.card:has(>form),.card:has(>h3+form){padding:clamp(16px,2.5vw,23px)}
+.card:has(>form)>h3{font-size:1.12rem;margin-bottom:7px}
+.formrow{display:grid;gap:14px}
+.formgrid{gap:12px}
+.formrow>label,.formgrid>label,.formrow label{color:#e3e5e7;line-height:1.4}
+.formrow label>span.mini{display:inline;color:#aeb6bd;font-weight:500}
+.formrow input,.formrow select,.formrow textarea{margin-top:3px}
+.formrow input[type=checkbox],.formrow input[type=radio]{
+  width:20px;height:20px;min-height:20px;margin:0;
+  accent-color:#e6bd69;flex:none;
+}
+.formrow label.inline{display:flex;flex-wrap:wrap;align-items:center;gap:9px}
+.formrow button.primary{
+  justify-self:start;min-height:46px;padding-inline:19px;
+}
+.formrow button.outline,.formrow button.ghost{
+  justify-self:start;min-height:44px;
+}
+.card>.row{gap:12px;min-width:0}
+.lineitem{border-color:#39424b;padding:12px 0}
+.inline{gap:9px}
+.inline button{min-height:44px}
+.note{line-height:1.5}
+.price,.total{font-variant-numeric:tabular-nums}
+a{color:#f0cc84}
+
+/* Propietario / Administrador: KPIs de aspecto financiero, lectura inmediata. */
+.statgrid{gap:12px}
+.stat{
+  position:relative;overflow:hidden;
+  background:linear-gradient(135deg,#282e36 0%,#1b2026 76%);
+  border:1px solid #474844;border-top:2px solid #ba9451;
+  padding:17px;border-radius:16px;box-shadow:0 8px 24px #0002;
+}
+.stat:after{
+  content:"";position:absolute;top:-22px;right:-30px;width:80px;height:80px;
+  background:radial-gradient(circle,#f0c9761a,transparent 67%);
+  pointer-events:none;
+}
+.stat b{color:#f6d891;font-size:clamp(1.4rem,4vw,1.85rem);letter-spacing:-.025em;font-weight:850}
+.stat span{display:block;color:#c6cbd0;line-height:1.35;margin-top:4px}
+#content>.grid2{gap:14px}
+#content>.grid2>.card{min-height:150px;display:flex;flex-direction:column;align-items:flex-start;gap:6px}
+#content>.grid2>.card button{margin-top:auto}
+
+/* Meseros: alta legibilidad y componentes ya existentes del catálogo. */
+.pos-section-title{gap:6px}
+.pos-tiles{gap:13px}
+.pos-tile{padding:17px;gap:10px}
+.pos-tile-title{font-size:1.1rem;letter-spacing:-.015em}
+.pos-tile-icon{border-radius:13px}
+.pos-catalog-fields label{font-size:.82rem}
+.pos-category{min-height:44px;font-weight:720}
+.pos-category:hover{border-color:#c4a169}
+.pos-product{gap:8px}
+.pos-product-name{font-weight:800}
+.pos-product-bottom strong{font-weight:850}
+.pos-draft-card .lineitem{border-color:#454b51}
+.pos-qty-controls button{background:#30363e!important;border:1px solid #616773!important;border-radius:11px!important}
+.pos-qty-controls span{color:#f5d995!important}
+body.pos-waiter .pos-draft-card [data-action="send-order"]{
+  background:linear-gradient(100deg,#f2d58f,#daa955 70%,#f3d58a)!important;
+  color:#22170b!important;border:1px solid #f1d18b;box-shadow:0 6px 20px #0003;
+}
+#draft-panel,.pos-draft-card{border-color:#645841!important}
+#bill-btn{width:100%;border-color:#987d54}
+
+/* Cuenta libre / mesa asignada — tarjetas táctiles, seleccionables. */
+.table-choice-grid,.table-admin-grid{gap:12px}
+.table-choice{
+  display:flex;align-items:center;gap:12px;
+  background:linear-gradient(145deg,#29313a,#20262d);
+  border:1px solid #4b555e;border-radius:16px;
+  min-height:76px;padding:12px 14px;color:#f6f2ea;
+}
+.table-choice.selected,.table-choice:has(input:checked){
+  border-color:#d0a95b;
+  background:linear-gradient(145deg,#413b2d,#282c30);
+  box-shadow:inset 0 0 0 1px #b78f43;
+}
+.table-choice input[type=radio]{accent-color:#e6bd69;flex:none}
+.table-choice b{font-size:.96rem;color:#f5f5f0}
+.table-choice small{color:#b7bec6}
+.table-choice em{color:#f0cb7c;font-size:.72rem;font-style:normal}
+.table-choice.occupied{opacity:.67;border-style:dashed;background:#24272d}
+.table-admin-card{border-top:2px solid #9d854e}
+.table-admin-card .row h3{margin:0}
+.table-admin-card form{margin-top:14px}
+.table-admin-card .mini{line-height:1.6}
+
+/* Cocina y barra: comandas por prioridad visual, estados comprensibles. */
+.ticket{
+  padding:18px;border:1px solid #464f59;
+  border-left:5px solid #d8b05b!important;
+  background:linear-gradient(140deg,#272e36,#1b2026);
+}
+.ticket.new{border-left-color:#e7bb57!important}
+.ticket.received{border-left-color:#65a5df!important}
+.ticket.preparing{border-left-color:#e5a359!important}
+.ticket.ready{border-left-color:#67d0a1!important}
+.ticket h3{font-size:1.1rem;margin:0;color:#fff}
+.ticket .mini{color:#c0c5cb;line-height:1.5;margin-top:7px}
+.ticket .lineitem{padding:12px 0;line-height:1.4}
+.ticket .lineitem>b{font-size:1.04rem;font-weight:820;color:#f8f7f3}
+.ticket .lineitem .note{
+  margin:9px 0 4px;font-size:.91rem;
+  background:#403521;border-left:3px solid #d8b05b;
+}
+.ticket .primary{width:100%;min-height:50px;margin-top:14px}
+.ticket.new .primary{background:linear-gradient(105deg,#f6da98,#dcb05e);color:#1d160c}
+.ticket.received .primary{background:#88bff1;color:#112538}
+.ticket.preparing .primary{background:#7bdbb3;color:#123528}
+.ticket.ready .primary{background:#455159;color:#f2f5f7}
+#content>.note+.cards{margin-top:14px}
+#content [data-action="enable-sound"]{min-height:46px}
+
+/* Caja y cobros: separar claramente importes, parciales y pagos. */
+#cashier-account{min-height:53px;font-weight:750}
+#content:has(#cashier-account)>.card:first-child{
+  border-top:2px solid #d4ac61;
+  background:linear-gradient(155deg,#293039,#1b2026);
+}
+#content:has(#cashier-account) .total{
+  font-size:clamp(1.4rem,5vw,2rem);letter-spacing:-.02em;
+  color:#f7d88f;font-variant-numeric:tabular-nums;
+}
+#content:has(#cashier-account) .divider{background:#3e454c}
+#content:has(#cashier-account) .formrow{gap:12px}
+#content:has(#cashier-account) .card{scroll-margin-top:84px}
+#content:has(#cashier-account) button.primary{min-height:48px}
+#content:has(#cashier-account) .note{margin-top:10px}
+.allocation-qty{width:90px;min-width:70px;text-align:center;font-weight:780}
+#discount-form{margin-top:16px;padding-top:16px;border-top:1px solid #495158}
+#discount-form h3{color:#f2d28a}
+#cash-open{max-width:630px;margin-block:16px}
+#cash-open .primary{width:100%}
+#cash-movement{padding-top:10px}
+#period-detail>.card{border-color:#68604b}
+#content:has(#cash-movement) .cards .card{border-top:2px solid #6e6754}
+
+/* Propinas: reparto equitativo muy fácil de interpretar. */
+#content [id^="tip-payout-"]{
+  padding:12px;margin-top:12px!important;
+  background:#222831;border:1px solid #444f5b;border-radius:14px;
+}
+#content [id^="tip-payout-"] button{min-height:45px}
+#content:has([id^="tip-payout-"]) .lineitem{
+  padding:13px 0;border-color:#43505b;
+}
+#content:has([id^="tip-payout-"]) .lineitem>.row b{font-size:1rem}
+#content:has([id^="tip-payout-"]) .lineitem>.mini{margin-top:4px}
+
+/* Menú, variantes, promociones y modificadores. */
+details.product-config-admin{
+  padding:0;overflow:hidden;border:1px solid #49515a;
+}
+details.product-config-admin>summary{
+  list-style:none;cursor:pointer;
+  padding:17px;min-height:72px;
+  background:linear-gradient(145deg,#2a3138,#222830);
+}
+details.product-config-admin>summary::-webkit-details-marker{display:none}
+details.product-config-admin>summary:after{
+  content:"Ver detalles";display:inline-block;color:#f2d291;
+  font-size:.72rem;font-weight:760;margin-top:7px;
+}
+details.product-config-admin[open]>summary{border-bottom:1px solid #535b64}
+details.product-config-admin[open]>summary:after{content:"Ocultar detalles"}
+.product-config-content{padding:16px;display:grid;gap:10px}
+.product-config-content h4{color:#edcc84;margin:13px 0 0;letter-spacing:-.01em}
+.product-config-content>.row{padding-block:5px}
+.product-config-content form{padding:11px 0}
+.modifier-admin-group{
+  padding:12px;border-radius:13px;
+  border:1px solid #4c5965;background:#222932;
+}
+.modifier-admin-group>.row>b{color:#f1cf89}
+.modifier-options{gap:8px}
+.modifier-option{
+  border:1px solid #4c5760;background:#283039;
+  border-radius:11px;padding:10px;
+}
+.order-config-block{display:grid;gap:12px}
+.order-config-block .price{font-size:1.22rem}
+.order-config-block .row{gap:10px}
+
+/* Inventario: alertas sin sacrificar lectura de existencias. */
+#content [data-action="restock"]{border-color:#6a6659;color:#f5d994}
+#content [data-action="toggle-inventory"]{min-height:49px}
+#content .card:has([data-action="restock"]){
+  border-top:2px solid #756d59;
+}
+#content .card:has([data-action="restock"]) p b{color:#f4d48b}
+#content .card:has([data-action="edit-product"]) .price{font-size:1.14rem}
+
+/* Personal, autorizaciones y auditoría. */
+#content [id="user-add"]{gap:15px}
+#content .card:has([data-action="reset-user"]){border-left:3px solid #8b784d}
+#content [data-action="approve"]{min-width:105px}
+#content .card:has([data-action="approve"]){border-left:3px solid #cfad69}
+#content .card.table-wrap{
+  padding:5px 12px 12px;background:#1a2027;
+}
+#content .table-wrap table{min-width:600px}
+#content .table-wrap th{
+  position:sticky;top:0;z-index:1;
+  padding:14px 10px;font-size:.76rem;letter-spacing:.025em;
+}
+#content .table-wrap td{padding:13px 10px;color:#dee1e4;vertical-align:top}
+#content .table-wrap td.mini{
+  color:#aeb7bf;font-size:.77rem;word-break:break-word;
+}
+#content .table-wrap tbody tr:nth-child(2n){background:#ffffff04}
+
+/* Modales, inventarios y cuentas: coherencia de controles. */
+.pos-more-backdrop{background:#000b}
+.pos-more-panel{border-top:2px solid #b58d4a;overscroll-behavior:contain}
+.pos-more-link{min-height:64px}
+.pos-more-link:focus-visible,.pos-more-link:hover{border-color:#e1bd73}
+.pos-more-head h2{font-size:1.22rem;letter-spacing:-.015em}
+#back,#refresh{white-space:nowrap}
+
+/* Móvil y tablet. No se cambia el comportamiento del grid landscape del comandero. */
+@media(max-width:700px){
+  #content>.section,.section{margin:19px 0 12px;font-size:1.08rem}
+  .cards{gap:11px}
+  .statgrid{gap:9px}
+  .stat{padding:14px}
+  .stat b{font-size:1.5rem}
+  .formgrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .formrow>label{min-width:0}
+  #content .card{padding:15px}
+  #content .ticket{padding:16px}
+  #content .ticket .primary{width:100%}
+  #content .card:has(>form)>.formrow{gap:12px}
+  .table-choice-grid,.table-admin-grid{grid-template-columns:1fr;gap:9px}
+  .table-choice{min-height:72px}
+  .inline{gap:8px}
+  .inline button{flex:0 1 auto}
+  #content .table-wrap table{min-width:570px}
+  #content .table-wrap{overflow-x:auto}
+  details.product-config-admin>summary{padding:15px}
+  .product-config-content{padding:14px}
+  #content:has(#cashier-account) .total{font-size:1.5rem}
+  .pos-more-panel{max-height:84dvh}
+}
+@media(max-width:370px){
+  .formgrid{grid-template-columns:minmax(0,1fr)}
+  .statgrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .heading-actions .small{font-size:.7rem}
+}
+@media(orientation:landscape) and (max-height:570px) and (min-width:560px){
+  /* Mantener dos paneles para comandas y condensar solo el espacio vertical. */
+  body.pos-waiter.pos-order-screen #content .pos-catalog{padding:8px}
+  body.pos-waiter.pos-order-screen #content .pos-product{padding:8px}
+  body.pos-waiter.pos-order-screen #content .pos-draft-card{padding:9px}
+  body.pos-waiter.pos-order-screen #content .pos-category{min-height:34px}
+  .ticket .lineitem{padding:8px 0}
+}
+@media(prefers-reduced-motion:reduce){
+  .pos-tile,.pos-product,button{transition:none!important}
+}
+
+/* Pantalla inicial del propietario y administrador: lanzador premium de 11 módulos. */
+.premium-dashboard{display:grid;gap:14px}
+.premium-dashboard-heading{
+  display:flex;align-items:flex-end;justify-content:space-between;
+  gap:18px;margin:0 0 2px;
+}
+.premium-dashboard-heading h2{
+  margin:5px 0 5px;color:#faf7ef;line-height:1.2;
+  letter-spacing:-.027em;font-size:clamp(1.35rem,3vw,1.8rem);
+}
+.premium-dashboard-heading p:not(.premium-eyebrow){
+  margin:0;color:#b5bec7;line-height:1.5;font-size:.87rem;
+}
+.premium-eyebrow{
+  margin:0;font-size:.67rem;font-weight:850;letter-spacing:.15em;color:#e9c784;
+}
+.premium-dashboard-live{
+  flex:none;white-space:nowrap;
+  background:#18342b;border:1px solid #2e654e;
+  padding:8px 11px;border-radius:99px;color:#a5e8bf;
+  font-size:.69rem;font-weight:760;
+}
+.premium-dashboard-second{margin-top:15px}
+.premium-shortcut-grid{
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
+  gap:12px;
+}
+.premium-shortcut{
+  position:relative;display:flex;flex-direction:column;align-items:flex-start;
+  gap:8px;padding:18px 15px 19px;min-width:0;min-height:160px;
+  text-align:left;color:#f4f3ef;border:1px solid #434c55;
+  border-radius:17px;background:linear-gradient(150deg,#2a3139,#1b2026);
+  box-shadow:0 8px 20px #0002;transition:border-color .12s ease,background-color .12s ease;
+}
+.premium-shortcut:hover,.premium-shortcut:focus-visible{
+  border-color:#d4ad66;background:linear-gradient(145deg,#37362f,#242b32);
+}
+.premium-shortcut:active{transform:scale(.99)}
+.premium-shortcut-icon{
+  display:grid;place-items:center;width:43px;height:43px;
+  background:linear-gradient(145deg,#554529,#34332f);
+  color:#f3d492;border:1px solid #6f5b38;border-radius:12px;
+}
+.premium-shortcut>strong{font-size:.98rem;line-height:1.3}
+.premium-shortcut>small{font-size:.75rem;line-height:1.35;color:#b9c0c7;font-weight:450}
+.premium-shortcut-arrow{
+  position:absolute;right:14px;top:17px;font-size:1.35rem;
+  color:#cdb17c;font-weight:500;
+}
+.premium-dashboard-footer{margin-top:12px}
+@media(max-width:1000px){
+  .premium-shortcut-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+@media(max-width:700px){
+  .premium-dashboard{gap:12px}
+  .premium-dashboard-heading{align-items:flex-start;flex-direction:column;gap:8px}
+  .premium-dashboard-live{font-size:.66rem;padding:6px 9px}
+  .premium-shortcut-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+  .premium-shortcut{min-height:144px;padding:13px 12px;gap:7px}
+  .premium-shortcut-icon{width:38px;height:38px}
+  .premium-shortcut>strong{font-size:.91rem}
+  .premium-shortcut>small{font-size:.7rem}
+}
+@media(max-width:335px){
+  .premium-shortcut-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .premium-shortcut{padding:12px 10px;min-height:138px}
+}
