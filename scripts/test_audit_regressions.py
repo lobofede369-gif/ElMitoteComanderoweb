@@ -92,10 +92,32 @@ with TestClient(app.app) as client:
     repeated=client.post(f"/api/accounts/{b}/payments",headers=headers,json={
         "client_key":"________","lines":[{"method":"cash","amount":"10.00"}]})
     assert repeated.status_code==200 and repeated.json()["duplicate"],repeated.text
+    # Los horarios que cruzan medianoche deben usar el día de inicio.
+    from types import SimpleNamespace
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    promo=SimpleNamespace(active=True,weekdays="0",start_time="22:00",end_time="02:00",
+                          start_date="2026-11-02",end_date="2026-11-02")
+    tz=ZoneInfo("America/Mexico_City")
+    assert app.promotion_is_active(promo,datetime(2026,11,2,23,0,tzinfo=tz))
+    assert app.promotion_is_active(promo,datetime(2026,11,3,1,0,tzinfo=tz))
+    assert not app.promotion_is_active(promo,datetime(2026,11,3,2,1,tzinfo=tz))
+    assert not app.promotion_is_active(promo,datetime(2026,11,3,23,0,tzinfo=tz))
+
+    # El reporte PDF debe manejar observaciones con caracteres HTML especiales.
+    for aid in (a,b):
+        closed_account=client.post(f"/api/accounts/{aid}/close",headers=headers,json={})
+        assert closed_account.status_code==200,closed_account.text
+    shift=client.post("/api/cash/close",headers=headers,json={
+        "counted":"120.00","note":"Turno <detalle & información> validado"})
+    assert shift.status_code==200,shift.text
+    report=client.get(f"/api/cash/periods/{shift.json()['id']}/report.pdf",headers=headers)
+    assert report.status_code==200 and report.content.startswith(b"%PDF"),report.text[:200]
+
     with app.SessionLocal() as db:
         assert db.scalar(app.select(app.func.count(app.Payment.id)))==2
         p=db.get(app.Product,pid)
         assert p.stock==1, f"Stock incorrecto tras dos comandas y un reintento: {p.stock}"
 
-print("OK: PIN legacy, usuarios, stock concurrente, clave exacta de pagos y no duplicación")
+print("OK: PIN, pagos, inventario, promociones nocturnas y PDF de corte")
 dbfile.unlink(missing_ok=True)
