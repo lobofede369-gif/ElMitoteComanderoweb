@@ -3,7 +3,8 @@ Prueba autónoma sobre SQLite efímera; nunca utiliza el servidor real.
 """
 import os
 import tempfile
-from datetime import timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from uuid import uuid4
 
@@ -93,6 +94,11 @@ with TestClient(app.app) as client:
     assert get("kitchen","/api/tickets").json()==[]
     assert get("kitchen","/api/preparation/tickets").json()["tickets"]==[]
     assert get("cashier","/api/cash").json()["open"] is False
+    current_date=datetime.now(ZoneInfo("America/Mexico_City")).date().isoformat()
+    current=get("owner",f"/api/owner/analytics?start={current_date}&end={current_date}").json()
+    history_analytics=get("owner",f"/api/owner/analytics?start={current_date}&end={current_date}&scope=history").json()
+    assert current["scope"]=="current" and current["sales"]=="0.00"
+    assert history_analytics["scope"]=="history" and history_analytics["sales"]=="250.00"
 
     detail=get("admin",f"/api/cash/periods/{period_id}").json()
     assert detail["archived"] is True
