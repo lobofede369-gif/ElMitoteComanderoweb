@@ -3,7 +3,7 @@
 Run: ADMIN_PASSWORD='strong secret' SECRET_KEY='long random string' uvicorn app:app --reload
 Do not deploy without PostgreSQL, HTTPS and changing bootstrap credentials.
 """
-import os, json, asyncio, secrets, io, time, logging
+import os, json, asyncio, secrets, io, time, logging, hashlib, hmac, unicodedata, re
 from urllib.parse import urlparse
 from pywebpush import webpush, WebPushException
 from firebase_admin import credentials, messaging, initialize_app, get_app
@@ -89,6 +89,15 @@ class User(Base):
     password_hash=Column(String(255),nullable=False)
     active=Column(Boolean,default=True,nullable=False)
     session_version=Column(Integer,default=1,nullable=False)
+
+class UserPin(Base):
+    """Pin de acceso: índice HMAC para búsqueda O(1), y verificador Argon2.
+    No guardar PIN en texto ni modificar los secretos antiguos durante migración.
+    """
+    __tablename__ = 'user_pins'
+    user_id = Column(Integer, ForeignKey('users.id'), primary_key=True)
+    lookup = Column(String(64), nullable=False, unique=True)
+    pin_hash = Column(String(255), nullable=False)
 
 class Setting(Base):
     __tablename__='settings'
@@ -511,6 +520,57 @@ def product_dict(p,settings,db=None):
             'variants':variants,'modifier_groups':groups,'promotions':promotions,
             'active':p.active,'blocked':p.blocked,'inventory_enabled':p.inventory_enabled,'stock':p.stock,'version':p.version,'status':status}
 
+def _pin_lookup(pin: str) -> str:
+    return hmac.new(SECRET_KEY.encode('utf-8'),
+                    ('el-mitote/pin-v1/' + pin).encode('ascii'),
+                    hashlib.sha256).hexdigest()
+
+def _pin_format(pin: str) -> bool:
+    return isinstance(pin, str) and bool(re.fullmatch(r'[0-9]{6}', pin))
+
+def _set_user_pin(db: Session, target: User, pin: str):
+    if not _pin_format(pin):
+        raise HTTPException(400, 'El PIN debe tener exactamente 6 números')
+    digest = _pin_lookup(pin)
+    duplicate = db.scalar(select(UserPin).where(UserPin.lookup == digest))
+    if duplicate and duplicate.user_id != target.id:
+        raise HTTPException(409, 'Este PIN ya pertenece a otra persona. Elige uno distinto.')
+    row = db.get(UserPin, target.id)
+    if row is None:
+        db.add(UserPin(user_id=target.id, lookup=digest, pin_hash=ph.hash(pin)))
+    else:
+        row.lookup = digest
+        row.pin_hash = ph.hash(pin)
+    target.session_version = (target.session_version or 1) + 1
+
+class PinLoginIn(BaseModel):
+    pin: str = Field(min_length=6, max_length=6, pattern=r'^[0-9]{6}$')
+
+@app.post('/api/login/pin')
+def login_pin(data: PinLoginIn, request: Request, db: Session = Depends(db_session)):
+    # Protección contra fuerza bruta por IP sin revelar si existe el PIN.
+    addr = request.client.host if request.client else 'unknown'
+    identifier = 'pin:' + addr
+    attempts = [t for t in login_failures.get(identifier, []) if time.time() - t < 600]
+    if len(attempts) >= 15:
+        raise HTTPException(429, 'Demasiados intentos. Espera 10 minutos.')
+    rec = db.scalar(select(UserPin).where(UserPin.lookup == _pin_lookup(data.pin)))
+    user = db.get(User, rec.user_id) if rec else None
+    try:
+        valid = bool(user and user.active and ph.verify(rec.pin_hash, data.pin))
+    except (VerifyMismatchError, VerificationError):
+        valid = False
+    if not valid:
+        attempts.append(time.time())
+        login_failures[identifier] = attempts
+        raise HTTPException(401, 'PIN incorrecto')
+    login_failures.pop(identifier, None)
+    token = jwt.encode({'sub':str(user.id),'ver':user.session_version,
+                        'exp':now()+timedelta(hours=10)}, SECRET_KEY, algorithm='HS256')
+    return {'token':token,
+            'user':{'id':user.id,'display':user.display,
+                    'username':user.username,'role':user.role}}
+
 class LoginIn(BaseModel): username:str; secret:str
 @app.post('/api/login')
 def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
@@ -523,6 +583,9 @@ def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
     if not valid:
         attempts.append(time.time());login_failures[identifier]=attempts
         raise HTTPException(401,'Credenciales incorrectas')
+    # Cuando ya se asignó PIN, los perfiles operativos usan solo el teclado numérico.
+    if user.role != 'owner' and db.get(UserPin, user.id):
+        raise HTTPException(403, 'Este empleado ya utiliza acceso mediante PIN')
     login_failures.pop(identifier,None)
     token=jwt.encode({'sub':str(user.id),'ver':user.session_version,'exp':now()+timedelta(hours=10)},SECRET_KEY,algorithm='HS256')
     return {'token':token,'user':{'id':user.id,'display':user.display,'username':user.username,'role':user.role}}
@@ -752,11 +815,55 @@ async def events(request:Request,authorization:Optional[str]=Header(None)):
         finally: listeners.discard(q)
     return StreamingResponse(stream(),media_type='text/event-stream',headers={'Cache-Control':'no-store','X-Accel-Buffering':'no'})
 
+class StaffCreateIn(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    role: Literal['admin','cashier','waiter','kitchen','bar']
+    pin: str = Field(min_length=6, max_length=6, pattern=r'^[0-9]{6}$')
+
+@app.post('/api/staff')
+async def create_staff(data: StaffCreateIn, db: Session = Depends(db_session), user: User = Depends(auth)):
+    allow(user, 'owner')
+    name = data.name.strip()
+    if len(name) < 2:
+        raise HTTPException(400, 'Escribe el nombre del empleado')
+    slug = unicodedata.normalize('NFKD', name).encode('ascii','ignore').decode('ascii').lower()
+    base = re.sub(r'[^a-z0-9]+','-',slug).strip('-')[:65] or 'empleado'
+    username = base
+    num = 2
+    while db.scalar(select(User.id).where(User.username == username)):
+        username = f'{base}-{num}'
+        num += 1
+    target = User(username=username,display=name,role=data.role,
+                  password_hash=ph.hash(secrets.token_urlsafe(32)),active=True)
+    db.add(target)
+    db.flush()
+    _set_user_pin(db, target, data.pin)
+    audit(db, user, 'staff.create', id=target.id, role=target.role, name=name)
+    db.commit()
+    await notify()
+    return {'id':target.id,'display':target.display,'role':target.role}
+
+class StaffPinIn(BaseModel):
+    pin: str = Field(min_length=6, max_length=6, pattern=r'^[0-9]{6}$')
+
+@app.patch('/api/staff/{user_id}/pin')
+async def assign_staff_pin(user_id: int, data: StaffPinIn,
+                           db: Session = Depends(db_session), user: User = Depends(auth)):
+    allow(user, 'owner')
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, 'Personal no encontrado')
+    _set_user_pin(db, target, data.pin)
+    audit(db,user,'staff.pin_set',id=target.id)
+    db.commit()
+    await notify()
+    return {'ok':True,'owner_pin_changed':target.id == user.id}
+
 class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:str=Field(min_length=2,max_length=100);role:Literal['admin','cashier','waiter','kitchen','bar'];secret:str=Field(min_length=4,max_length=120)
 @app.get('/api/users')
 def users(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
-    return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,'active':u.active} for u in db.scalars(select(User).order_by(User.id))]
+    return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,'active':u.active,'has_pin':db.get(UserPin,u.id) is not None} for u in db.scalars(select(User).order_by(User.id))]
 @app.post('/api/users')
 async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner')
