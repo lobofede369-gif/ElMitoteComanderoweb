@@ -1,0 +1,18 @@
+/* El Mitote: módulos adicionales. Se apoya en estilos existentes. */
+.prep-ticket{border-left:3px solid #d6a134}
+.prep-product{border-top:1px solid rgba(255,255,255,.12);padding:12px 0}
+.prep-product .row,.prep-total .row{gap:10px;flex-wrap:wrap}
+.prep-total{padding:12px;margin:12px 0;border-radius:12px;background:rgba(210,168,64,.07)}
+.prep-flag{display:inline-block;white-space:nowrap;border:1px solid rgba(255,255,255,.24);border-radius:20px;font-size:.76rem;padding:4px 9px}
+.prep-ok,.prep-ready{border-color:#2f9e6d;color:#6bdaa3}
+.prep-warning{border-color:#c99420;color:#f5cd66}
+.prep-late{border-color:#de4a4a;color:#ff9494}
+.prep-clock{font-variant-numeric:tabular-nums;font-weight:650}
+.prep-clock-late{color:#ff9494}
+.prep-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.prep-bars{display:grid;gap:9px;max-width:100%}
+.prep-bar-row{display:grid;grid-template-columns:minmax(45px,110px) minmax(30px,1fr) minmax(65px,100px);align-items:center;gap:8px;font-size:.85rem}
+.prep-bar-track{height:12px;overflow:hidden;border-radius:8px;background:rgba(255,255,255,.10)}
+.prep-bar-track>div{height:100%;border-radius:8px;background:linear-gradient(90deg,#c08b29,#f5d675)}
+.prep-bar-row b{text-align:right;font-variant-numeric:tabular-nums}
+@media(max-width:460px){.prep-bar-row{grid-template-columns:65px minmax(10px,1fr) 82px;font-size:.74rem}}
