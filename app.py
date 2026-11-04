@@ -991,6 +991,33 @@ def products(db:Session=Depends(db_session),user:User=Depends(auth)):
     query=select(Product).outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id).where(
         ArchivedProduct.product_id.is_(None)).order_by(Product.category,Product.name)
     return [product_dict(p,s,db) for p in db.scalars(query)]
+class RemoveCategoryIn(BaseModel):
+    name:str=Field(min_length=1,max_length=80)
+    destination:str=Field(min_length=1,max_length=80)
+    expected_visible_count:int=Field(ge=1)
+
+@app.post('/api/categories/remove')
+async def remove_category(data:RemoveCategoryIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    source=data.name.strip()
+    destination=data.destination.strip()
+    if not source or not destination or source.casefold()==destination.casefold():
+        raise HTTPException(400,'Indica una categoría destino diferente')
+    rows=db.scalars(select(Product).where(Product.category==source).with_for_update()).all()
+    if not rows:raise HTTPException(404,'La categoría ya no existe')
+    hidden=set(db.scalars(select(ArchivedProduct.product_id).where(
+        ArchivedProduct.product_id.in_([p.id for p in rows]))))
+    visible_count=sum(p.id not in hidden for p in rows)
+    if visible_count!=data.expected_visible_count:
+        raise HTTPException(409,'El contenido de la categoría cambió; actualiza antes de borrarla')
+    for p in rows:
+        p.category=destination
+        p.version=(p.version or 1)+1
+    audit(db,user,'category.remove',source=source,destination=destination,
+          active_products=visible_count,all_products=len(rows))
+    db.commit();await notify()
+    return {'ok':True,'moved':visible_count,'new_category':destination}
+
 class ProductArchiveIn(BaseModel):
     expected_version:int=Field(ge=1)
     reason:str=Field(min_length=3,max_length=200)
