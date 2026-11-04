@@ -1033,7 +1033,7 @@ class VoidAccountIn(BaseModel):
 
 @app.post('/api/accounts/{account_id}/void')
 async def void_account(account_id:int,data:VoidAccountIn,db:Session=Depends(db_session),user:User=Depends(auth)):
-    allow(user,'owner','admin')
+    allow(user,'owner')
     active_period(db)
     a=owner_account(db,user,account_id,('open','pending'))
     total,paid=acc_totals(db,a)
@@ -1078,7 +1078,7 @@ def account_detail(account_id:int,db:Session=Depends(db_session),user:User=Depen
 class ReassignIn(BaseModel): owner_id:int;reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/accounts/{account_id}/reassign')
 async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session),user:User=Depends(auth)):
-    allow(user,'owner','admin');a=owner_account(db,user,account_id)
+    allow(user,'owner');a=owner_account(db,user,account_id)
     dest=db.get(User,data.owner_id)
     if not dest or not dest.active or dest.role!='waiter':raise HTTPException(400,'El destino debe ser un mesero activo')
     old=a.owner_id;a.owner_id=dest.id;audit(db,user,'account.reassign',id=a.id,old=old,new=dest.id,reason=data.reason);db.commit();await notify();return {'ok':True}
@@ -1110,11 +1110,10 @@ class AccountReopenClosedIn(BaseModel):
     table_id: Optional[int] = None
 
 def account_manager_access(user, account):
-    if user.role in ('owner', 'admin'):
+    # La edición avanzada pertenece exclusivamente al propietario, incluso por API.
+    if user.role == 'owner':
         return
-    if user.role == 'waiter' and account.owner_id == user.id:
-        return
-    raise HTTPException(403, 'No tienes permiso para modificar esta cuenta')
+    raise HTTPException(403, 'Solo el propietario puede modificar, unir o dividir cuentas')
 
 def account_table_occupancy(db, account_id):
     return db.execute(
@@ -1152,7 +1151,7 @@ def account_history(account_id: int, db: Session = Depends(db_session), user: Us
 @app.post('/api/accounts/{account_id}/rename')
 async def rename_account(account_id: int, data: AccountRenameIn,
                          db: Session = Depends(db_session), user: User = Depends(auth)):
-    allow(user, 'owner', 'admin', 'waiter')
+    allow(user, 'owner')
     account = owner_account(db, user, account_id, ('open', 'pending'))
     account_manager_access(user, account)
     name = data.name.strip()
@@ -1171,7 +1170,7 @@ async def rename_account(account_id: int, data: AccountRenameIn,
 @app.post('/api/accounts/{account_id}/transfer-table')
 async def transfer_account_table(account_id: int, data: AccountTableTransferIn,
                                  db: Session = Depends(db_session), user: User = Depends(auth)):
-    allow(user, 'owner', 'admin', 'waiter')
+    allow(user, 'owner')
     account = owner_account(db, user, account_id, ('open', 'pending'))
     account_manager_access(user, account)
     current = account_table_occupancy(db, account.id)
@@ -1208,7 +1207,7 @@ async def transfer_account_table(account_id: int, data: AccountTableTransferIn,
 @app.post('/api/accounts/{account_id}/merge')
 async def merge_accounts(account_id: int, data: AccountMergeIn,
                          db: Session = Depends(db_session), user: User = Depends(auth)):
-    allow(user, 'owner', 'admin', 'waiter')
+    allow(user, 'owner')
     if data.target_account_id == account_id:
         raise HTTPException(400, 'Selecciona otra cuenta como destino')
     locked = db.scalars(
@@ -1288,7 +1287,7 @@ async def merge_accounts(account_id: int, data: AccountMergeIn,
 @app.post('/api/accounts/{account_id}/split')
 async def split_account(account_id: int, data: AccountSplitIn,
                         db: Session = Depends(db_session), user: User = Depends(auth)):
-    allow(user, 'owner', 'admin', 'waiter')
+    allow(user, 'owner')
     source = owner_account(db, user, account_id, ('open', 'pending'))
     account_manager_access(user, source)
     if db.scalar(select(AccountDiscount.id).where(AccountDiscount.account_id==source.id,AccountDiscount.status=='applied').limit(1)):
@@ -1411,7 +1410,7 @@ async def split_account(account_id: int, data: AccountSplitIn,
 @app.post('/api/accounts/{account_id}/reopen-closed')
 async def reopen_closed_account(account_id: int, data: AccountReopenClosedIn,
                                 db: Session = Depends(db_session), user: User = Depends(auth)):
-    allow(user, 'owner', 'admin')
+    allow(user, 'owner')
     account = db.execute(
         select(Account).where(Account.id == account_id).with_for_update()
     ).scalar_one_or_none()
