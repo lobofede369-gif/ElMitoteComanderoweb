@@ -1,0 +1,70 @@
+/* El Mitote · PIN de acceso, sin selección manual de rol */
+#legacy-login-form[hidden],#login-pin-form[hidden],#login-back-link[hidden],#login-recovery-link[hidden]{display:none!important}
+.login-card-pin{
+  width:min(398px,100%);
+  padding:clamp(19px,4.5vw,28px) clamp(18px,5vw,30px);
+  border:1px solid #8e7549;
+  box-shadow:0 15px 52px #000a,0 0 20px #ab84451b;
+}
+.login-card-pin .brand{height:83px;max-width:140px;margin-bottom:0}
+.login-card-pin h1{font-size:1.5rem;letter-spacing:.16em;margin:0;color:#ffe1a1}
+.login-card-pin>p{margin:4px 0 0;color:#cbd2d7;font-size:.87rem}
+#login-pin-form{display:grid;gap:10px;margin:18px 0 12px;text-align:center}
+#login-pin-form .pin-label{
+  font-size:.75rem;text-align:center;color:#d5dade;letter-spacing:.035em
+}
+#login-pin-form .pin-display{
+  height:56px;min-height:56px;
+  border:1px solid #b3945c;border-radius:12px;
+  background:#12181f;color:#ffdfa2;
+  text-align:center;font-size:1.75rem;letter-spacing:.34em;
+  padding:9px 10px;font-weight:850;
+  -webkit-text-security:disc;
+}
+#login-pin-form .pin-display::placeholder{color:#67727c;letter-spacing:.23em}
+.pin-pad{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+#login-pin-form .pin-pad button{
+  display:grid;place-items:center;
+  width:100%;height:62px;min-height:62px;
+  border:1px solid #414d5a;border-radius:12px;
+  background:linear-gradient(160deg,#313943,#222a33);
+  color:#fff6e9;font-size:1.5rem;font-weight:760;
+  box-shadow:inset 0 1px 0 #ffffff19;
+  transition:transform 80ms ease,background-color 90ms;
+  touch-action:manipulation;
+}
+#login-pin-form .pin-pad button:active{transform:scale(.96);background:#56523f}
+#login-pin-form .pin-pad button[data-pin-clear],
+#login-pin-form .pin-pad button[data-pin-delete]{
+  color:#f0ce85;background:#282d32;font-size:1.24rem
+}
+#login-pin-submit{width:100%;height:50px;min-height:50px;border-radius:11px;margin-top:5px}
+#login-pin-submit:disabled{opacity:.43}
+.login-card-pin small{display:block;color:#909aa4;font-size:.69rem}
+.pin-recovery{
+  display:inline-block;margin-top:10px;
+  font-size:.71rem;color:#d5bb8a;
+  text-decoration:underline;text-underline-offset:3px
+}
+#legacy-login-form{display:grid;gap:14px;margin:20px 0 14px;text-align:left}
+#legacy-login-form>p{font-size:.86rem;color:#ead3a5;text-align:center}
+#legacy-login-form label{font-size:.78rem;color:#d4dbe1}
+#legacy-login-form input{min-height:49px;background:#131b22}
+#legacy-login-form button{min-height:50px}
+#content .staff-pin-setup{
+  background:#252d34;border-left:3px solid #e3b760;
+}
+.staff-pin-status{font-size:.73rem;color:#bde5c5}
+.staff-pin-status.pending{color:#f7b7a9}
+.staff-pin-form{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:end}
+.staff-pin-form input{font-size:16px;min-width:0}
+.staff-pin-form button{white-space:nowrap}
+@media(max-width:370px){
+ .login-card-pin{padding:19px 17px}
+ .pin-pad{gap:7px}
+ #login-pin-form .pin-pad button{height:57px;min-height:57px}
+ .staff-pin-form{grid-template-columns:1fr}
+}
+@media(prefers-reduced-motion:reduce){
+ .login-card-pin,.pin-pad button{animation:none!important;transition:none!important}
+}

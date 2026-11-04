@@ -151,8 +151,8 @@
     if (!gallery) return;
     const q = catalogSearch.trim().toLocaleLowerCase('es-MX');
     let shown = 0;
-    $('.pos-category',gallery).forEach(b => b.classList.toggle('active', b.dataset.posCategory === selectedCategory));
-    $('.pos-product',gallery).forEach(b => {
+    $$('.pos-category',gallery).forEach(b => b.classList.toggle('active', b.dataset.posCategory === selectedCategory));
+    $$('.pos-product',gallery).forEach(b => {
       const categoryOK = selectedCategory === '*' || b.dataset.posCat === selectedCategory;
       const text = (b.querySelector('.pos-product-name')?.textContent || '').toLocaleLowerCase('es-MX');
       const visible = categoryOK && (!q || text.includes(q));
