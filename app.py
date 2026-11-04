@@ -99,6 +99,11 @@ class UserPin(Base):
     lookup = Column(String(64), nullable=False, unique=True)
     pin_hash = Column(String(255), nullable=False)
 
+class OwnerRecoveryEvent(Base):
+    __tablename__='owner_recovery_events'
+    fingerprint=Column(String(64),primary_key=True)
+    consumed_at=Column(DateTime(timezone=True),default=now,nullable=False)
+
 class Setting(Base):
     __tablename__='settings'
     id=Column(Integer,primary_key=True)
@@ -412,6 +417,22 @@ def bootstrap():
         if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False))
         if not db.scalar(select(User).where(User.role=='owner')):
             db.add(User(username=ADMIN_USERNAME,display='Propietario',role='owner',password_hash=ph.hash(ADMIN_PASSWORD)))
+            db.flush()
+        # Recuperación excepcional autorizada mediante variables PRIVADAS de Render.
+        # El token solo puede consumirse una vez, aun si Render reinicia.
+        token=os.getenv('OWNER_RECOVERY_TOKEN','').strip()
+        if token:
+            new_password=os.getenv('OWNER_RECOVERY_PASSWORD','')
+            new_pin=os.getenv('OWNER_RECOVERY_PIN','')
+            if len(token)<32 or len(new_password)<14 or not re.fullmatch(r'[0-9]{6}',new_pin):
+                raise RuntimeError('Datos de recuperación del propietario incompletos')
+            fingerprint=hashlib.sha256(token.encode('utf-8')).hexdigest()
+            if not db.get(OwnerRecoveryEvent,fingerprint):
+                owner=db.execute(select(User).where(User.role=='owner').with_for_update()).scalar_one()
+                owner.password_hash=ph.hash(new_password)
+                _set_user_pin(db,owner,new_pin)
+                db.add(OwnerRecoveryEvent(fingerprint=fingerprint))
+                audit(db,None,'owner.recovery',owner_id=owner.id)
         db.commit()
 
 @asynccontextmanager
