@@ -140,8 +140,30 @@
       content.prepend(area);
     }
   }
+  // Formato de moneda precompilado para evitar reconstruirlo en cada toque.
+  const pesoFormat = new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN'});
   let selectedCategory = '*';
+  let catalogSearch = '';
   let catalogScroll = 0;
+
+  function applyCatalogFilter() {
+    const gallery = $('#pos-catalog');
+    if (!gallery) return;
+    const q = catalogSearch.trim().toLocaleLowerCase('es-MX');
+    let shown = 0;
+    $('.pos-category',gallery).forEach(b => b.classList.toggle('active', b.dataset.posCategory === selectedCategory));
+    $('.pos-product',gallery).forEach(b => {
+      const categoryOK = selectedCategory === '*' || b.dataset.posCat === selectedCategory;
+      const text = (b.querySelector('.pos-product-name')?.textContent || '').toLocaleLowerCase('es-MX');
+      const visible = categoryOK && (!q || text.includes(q));
+      b.hidden = !visible;
+      if (visible) shown++;
+    });
+    const indicator = $('.pos-product-count',gallery);
+    if (indicator) indicator.textContent = shown + ' productos';
+    const empty = $('.pos-search-empty',gallery);
+    if (empty) empty.hidden = shown !== 0;
+  }
 
   function decorateDraftPanel() {
     const content = $('#content');
@@ -157,9 +179,11 @@
       return sum + Number(item.qty || 0) * price;
     }, 0);
     const count = state.draft.reduce((sum, item) => sum + Number(item.qty || 0), 0);
+    const countLabel = $('#pos-draft-count');
+    if(countLabel) countLabel.textContent = String(count);
     const info = document.createElement('div');
     info.className = 'pos-draft-total';
-    info.innerHTML = `<span>${count} artículo${count === 1 ? '' : 's'} · Subtotal estimado</span><strong>${subtotal.toLocaleString('es-MX',{style:'currency',currency:'MXN'})}</strong>`;
+    info.innerHTML = `<span>${count} artículo${count === 1 ? '' : 's'} · Subtotal estimado</span><strong>${pesoFormat.format(subtotal)}</strong>`;
 
     const send = draftCard.querySelector('[data-action="send-order"]');
     if (send) {
@@ -202,7 +226,7 @@
     const gallery = document.createElement('section');
     gallery.id = 'pos-catalog';
     gallery.className = 'pos-catalog';
-    gallery.innerHTML = `<div class="pos-catalog-top"><div><span class="pos-kicker">TOMA DE COMANDA</span><h3>Elige los productos</h3></div><span class="pos-product-count">${products.length} disponibles</span></div><div class="pos-catalog-fields"><label>Cantidad<input id="pos-qty" type="number" min="1" max="100" inputmode="numeric" value="1" aria-label="Cantidad"></label><label>Indicaciones (opcional)<input id="pos-note" maxlength="300" placeholder="Ej. sin cebolla" aria-label="Indicaciones del producto"></label></div><div class="pos-categories" role="group" aria-label="Filtrar categorías"><button type="button" class="pos-category active" data-pos-category="*">Todos</button>${categories.map((c,i)=>`<button type="button" class="pos-category" data-pos-category="${i}">${escapeHtml(c)}</button>`).join('')}</div><div class="pos-product-grid">${products.map((p,i)=>`<button type="button" class="pos-product" data-pos-add="${i}" data-pos-cat="${categories.indexOf(String(p.category||'General'))}"><span class="pos-product-name">${escapeHtml(p.name)}</span><span class="pos-product-meta">${p.station === 'kitchen' ? 'Cocina' : 'Barra'}</span><span class="pos-product-bottom"><strong>${Number(p.price||0).toLocaleString('es-MX',{style:'currency',currency:'MXN'})}</strong><span class="pos-product-plus">+</span></span></button>`).join('')}</div><p class="pos-catalog-help">Toca un producto para agregarlo a la comanda. Después pulsa «Enviar comanda».</p>`;
+    gallery.innerHTML = `<div class="pos-catalog-top"><div><span class="pos-kicker">TOMA DE COMANDA</span><h3>Elige los productos</h3></div><div class="pos-catalog-toolbar"><span class="pos-product-count">${products.length} disponibles</span><button class="pos-open-draft" type="button" data-pos-view-draft="1">Ver comanda <b id="pos-draft-count">${state.draft.reduce((s,i)=>s+Number(i.qty||0),0)}</b></button></div></div><div class="pos-catalog-fields"><label>Cantidad<input id="pos-qty" type="number" min="1" max="100" inputmode="numeric" value="1" aria-label="Cantidad"></label><label>Indicaciones (opcional)<input id="pos-note" maxlength="300" placeholder="Ej. sin cebolla" aria-label="Indicaciones del producto"></label></div><label class="pos-search-wrap" for="pos-search"><span class="pos-search-icon" aria-hidden="true">⌕</span><input id="pos-search" inputmode="search" type="search" autocomplete="off" placeholder="Buscar platillo o bebida" value="${escapeHtml(catalogSearch)}" aria-label="Buscar productos"></label><div class="pos-categories" role="group" aria-label="Filtrar categorías"><button type="button" class="pos-category active" data-pos-category="*">Todos</button>${categories.map((c,i)=>`<button type="button" class="pos-category" data-pos-category="${i}">${escapeHtml(c)}</button>`).join('')}</div><div class="pos-product-grid">${products.map((p,i)=>`<button type="button" class="pos-product" data-pos-add="${i}" data-pos-cat="${categories.indexOf(String(p.category||'General'))}"><span class="pos-product-name">${escapeHtml(p.name)}</span><span class="pos-product-meta">${p.station === 'kitchen' ? 'Cocina' : 'Barra'}</span><span class="pos-product-bottom"><strong>${pesoFormat.format(Number(p.current_price??p.price??0))}</strong><span class="pos-product-plus">+</span></span></button>`).join('')}</div><p class="pos-search-empty" hidden>No encontramos ese producto. Prueba otra búsqueda o categoría.</p><p class="pos-catalog-help">Toca un producto para agregarlo a la comanda. Después pulsa «Enviar comanda».</p>`;
     const legacy = form.closest('.card');
     const title = legacy?.previousElementSibling;
     if (title?.classList.contains('section')) title.textContent = 'Selección de productos';
@@ -236,11 +260,8 @@
     const billCard = draftCard?.nextElementSibling;
     if (billCard?.classList.contains('card')) billCard.classList.add('pos-bill-card');
     // Preserve category choice between taps, even though app.js re-renders the screen.
-    const activeCategory = $$('.pos-category', gallery).find(b => b.dataset.posCategory === selectedCategory);
-    if (activeCategory) {
-      $$('.pos-category', gallery).forEach(b => b.classList.toggle('active', b === activeCategory));
-      $$('.pos-product', gallery).forEach(p => { p.hidden = selectedCategory !== '*' && p.dataset.posCat !== selectedCategory; });
-    }
+    if(selectedCategory !== '*' && !$('[data-pos-category="'+selectedCategory+'"]',gallery)) selectedCategory='*';
+    applyCatalogFilter();
     gallery.scrollTop = catalogScroll;
   }
   function enhanceTickets() {
@@ -278,7 +299,7 @@
     });
   }
   document.addEventListener('click', event => {
-    const btn = event.target.closest('[data-pos-go],[data-pos-add],[data-pos-adjust],[data-pos-category],[data-pos-more-button],[data-pos-close]');
+    const btn = event.target.closest('[data-pos-go],[data-pos-add],[data-pos-adjust],[data-pos-category],[data-pos-more-button],[data-pos-close],[data-pos-view-draft]');
     if (!btn) return;
     if (btn.hasAttribute('data-pos-go')) {
       event.preventDefault(); navTo(btn.dataset.posGo);
@@ -288,10 +309,11 @@
       event.preventDefault(); closeMore();
     } else if (btn.hasAttribute('data-pos-category')) {
       event.preventDefault();
-      const category = btn.dataset.posCategory;
-      selectedCategory = category;
-      $$('.pos-category').forEach(b => b.classList.toggle('active', b === btn));
-      $$('.pos-product').forEach(p => { p.hidden = category !== '*' && p.dataset.posCat !== category; });
+      selectedCategory = btn.dataset.posCategory;
+      applyCatalogFilter(); // No consulta servidor ni redibuja la comanda.
+    } else if (btn.hasAttribute('data-pos-view-draft')) {
+      event.preventDefault();
+      $('.pos-draft-card')?.scrollIntoView({behavior:'instant',block:'nearest'});
     } else if (btn.hasAttribute('data-pos-adjust')) {
       event.preventDefault();
       if (!available() || state.screen !== 'orders') return;
@@ -359,6 +381,12 @@
       if (typeof toast === 'function') toast(`${qty} × ${p.name} agregado a la comanda`);
     }
   }, true);
+  // Búsqueda inmediata: filtra tarjetas ya cargadas sin peticiones a la API.
+  document.addEventListener('input', event => {
+    if (event.target?.id !== 'pos-search') return;
+    catalogSearch = event.target.value;
+    applyCatalogFilter();
+  });
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') closeMore();
   });
@@ -366,8 +394,10 @@
     const nav = $('#nav'), content = $('#content');
     if (!nav || !content) return;
     const obs = new MutationObserver(scheduleEnhance);
-    obs.observe(nav,{childList:true,subtree:true});
-    obs.observe(content,{childList:true,subtree:true});
+    // El render sustituye los hijos directos; no observar subtree.
+    // Así cambios de cantidades, notas y búsqueda NO disparan escaneos completos.
+    obs.observe(nav,{childList:true});
+    obs.observe(content,{childList:true});
     scheduleEnhance();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded',init,{once:true});
