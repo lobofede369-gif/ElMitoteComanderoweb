@@ -2224,10 +2224,12 @@ async def close_cash(data:ClosePeriodIn,db:Session=Depends(db_session),user:User
     # Cierre transaccional: sin el documento y la instantánea no se confirma el corte.
     snapshot=cash_period_detail(p.id,db,user)
     snapshot['archived']=True
-    pdf=cash_report(p.id,db,user)
+    snapshot['tips_total']=snapshot.get('tips_total') or amount(sum(period_tip_totals(db,p.id).values()))
+    snapshot['product_breakdown']=cash_cut_receipt.cut_product_breakdown(db,p)
+    pdf_blob=cash_cut_receipt.build_cut_ticket_pdf(snapshot)
     db.add(CashCutArchive(period_id=p.id,
                           detail_json=json.dumps(snapshot,ensure_ascii=False),
-                          pdf_blob=pdf.body))
+                          pdf_blob=pdf_blob))
     audit(db,user,'cash.close',period=p.id,counted=p.counted_cents,note=data.note,archived=True)
     db.commit();await notify()
     return {'id':p.id,'closed':True,'archived':True}
@@ -2458,7 +2460,10 @@ def period_summary(db,p):
     archived=db.get(CashCutArchive,p.id)
     if archived:
         detail=json.loads(archived.detail_json)
-        return {k:v for k,v in detail.items() if k not in ('accounts','payments','tips','movements')}
+        result={k:v for k,v in detail.items() if k not in ('accounts','payments','tips','movements')}
+        result['tips']=detail.get('tips_total') or amount(sum(
+            float(detail.get(k) or 0) for k in ('tip_cash','tip_card','tip_transfer')))
+        return result
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
     totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
     tips=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id)).all()
@@ -2512,6 +2517,7 @@ def cash_period_detail(period_id:int,db:Session=Depends(db_session),user:User=De
                           'method':x.method,'amount':amount(x.cents),
                           'tip':amount(db.scalar(select(PaymentTip.cents).where(PaymentTip.payment_id==x.id)) or 0),
                           'date':x.created_at.isoformat()} for x in payments]
+    summary['tips_total']=summary['tips']
     summary['tips']=[{'id':x.id,'payment_id':x.payment_id,'account_id':x.account_id,
                       'account':db.get(Account,x.account_id).name if db.get(Account,x.account_id) else '?',
                       'cashier':db.get(User,x.cashier_id).display if db.get(User,x.cashier_id) else '?',
@@ -2604,3 +2610,4 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
 # Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
 import mitote_extensions  # noqa: E402
 import menu_photo_import  # noqa: E402
+import cash_cut_receipt  # noqa: E402
