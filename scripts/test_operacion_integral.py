@@ -45,6 +45,9 @@ with TestClient(app.app) as client:
         setting.inventory_reviewed=True
         ids["product"]=product.id
         period_id=period.id
+        db.add(app.InventoryMovement(movement_key="initial:operacion-test",product_id=product.id,
+            period_id=period.id,actor_id=ids["owner"],kind="initial",delta=20,
+            before_stock=0,after_stock=20,reason="Existencia inicial de prueba"))
         db.commit()
 
     def headers(role):
@@ -109,7 +112,6 @@ with TestClient(app.app) as client:
     assert item_view["started_at"]>ticket["created_at"]
 
     # La merma exige inventario activo, control de versión y existencias suficientes.
-    version=18 and 2
     with app.SessionLocal() as db:
         version=db.get(app.Product,pid).version
     waste=post("owner","/inventory/waste",{"product_id":pid,"quantity":1,
@@ -172,7 +174,7 @@ with TestClient(app.app) as client:
     with app.SessionLocal() as db:
         assert db.get(app.ProductCost,pid) is None
         assert db.scalar(app.select(app.OrderItemCost).where(
-            app.OrderItemCost.order_item_id==items[0].id)).unit_cost_cents==4000
+            app.OrderItemCost.order_item_id==item_ids[0])).unit_cost_cents==4000
 
     # Los cambios de inventario no deben producir cantidades negativas.
     with app.SessionLocal() as db:
