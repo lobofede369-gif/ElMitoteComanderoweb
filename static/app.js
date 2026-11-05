@@ -1056,6 +1056,8 @@ function pinEdit(action){
   loginError('');
 }
 $('#login-pin-form').addEventListener('click',e=>{
+  const demo=e.target.closest('[data-demo-pin]');
+  if(demo){e.preventDefault();pinInput.value=demo.dataset.demoPin;pinSubmit.disabled=false;$('#login-pin-form').requestSubmit();return;}
   const b=e.target.closest('[data-pin-digit],[data-pin-clear],[data-pin-delete]');
   if(!b)return;
   e.preventDefault();
