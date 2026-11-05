@@ -338,7 +338,14 @@ async function accountDetailHtml(id,admin=false){
 }
 async function refreshAccountPanel(id,admin=false){
   if(admin){
-    state.data.users=await api('/users');
+    if(state.user?.role==='owner'){
+      const [users,accounts,tables]=await Promise.all([
+        api('/users'),api('/accounts'),api('/tables')
+      ]);
+      state.data.users=users;state.data.accounts=accounts;state.data.tables=tables;
+    }else{
+      state.data.accounts=await api('/accounts');
+    }
     $('#content').innerHTML=`<button class="outline small" data-nav="all">← Volver a todas las cuentas</button><h2 class="section">Cuenta #${id}</h2>${await accountDetailHtml(id,true)}`;
   }else{
     await render();
