@@ -193,11 +193,16 @@ async function start(authenticatedUser=null){try{
     history.replaceState({mitoteScreen:state.screen,mitoteStack:[]},'',location.pathname+location.search+'#'+state.screen);
     localStorage.setItem('mitote-screen',state.screen);
     refreshNav();
-    // Mostrar primero la pantalla operativa; sincronizaciones secundarias no bloquean el acceso.
-    await render({preserveScroll:false});
+    // Limpiar cualquier contenido de la sesión anterior y pintar el esqueleto sin bloquear.
+    $('#content').innerHTML='';
+    const initialRender=render({preserveScroll:false});
+    // La conexión de eventos se inicia mientras se consultan los primeros datos.
     listenEvents();
-    if(state.user.role==='waiter')syncWaiterReadyAlerts(true).catch(()=>{});
-    syncPushOnLogin().catch(()=>{});
+    initialRender.then(()=>{
+      if(!state.user)return;
+      if(state.user.role==='waiter')syncWaiterReadyAlerts(true).catch(()=>{});
+      syncPushOnLogin().catch(()=>{});
+    });
   }catch(e){logout('expired');toast(e.message,true)}}
 async function go(screen,options={}){
   if(!state.user)return;
@@ -220,6 +225,23 @@ window.addEventListener('popstate',event=>{
 });
 function stat(label,val){return `<div class="stat"><b>${esc(val)}</b><span>${esc(label)}</span></div>`}
 function accountCard(a,action='open-account'){return `<div class="card"><div class="row"><div><h3>${esc(a.name)}</h3><div class="mini">Folio #${a.id} · ${esc(a.owner)}${a.table_name?` · ${esc(a.table_name)}`:''}</div></div>${pill(a.status)}</div><div class="divider"></div><div class="row"><span class="muted">Total ${money(a.total)} · Saldo ${money(a.due)}</span><button class="outline small" data-action="${action}" data-id="${a.id}">Abrir</button></div></div>`}
+function loadingScreenHtml(screen){
+  const labels={accounts:'Mis cuentas',all:'Cuentas',tables:'Mesas',new:'Nueva cuenta',
+    orders:'Comandas',station:'Cocina / barra',history:'Historial de preparación',
+    notifications:'Avisos',tickets:'Estaciones',cashier:'Cobros',cash:'Caja',
+    tips:'Propinas',products:'Menú',inventory:'Inventario',users:'Personal',
+    approvals:'Autorizaciones',audit:'Auditoría',reservations:'Reservaciones',
+    prepconfig:'Tiempos de preparación',analytics:'Estadísticas',overview:'Resumen'};
+  const label=labels[screen]||'la aplicación';
+  return `<div class="loading-screen" role="status" aria-live="polite">
+    <div class="loading-screen-heading"><span class="loading-screen-indicator"></span>
+      <div><strong>Abriendo ${esc(label)}</strong><p>Conectando y preparando tus datos…</p></div>
+    </div>
+    <div class="loading-screen-grid"><div class="loading-skeleton"></div>
+      <div class="loading-skeleton"></div><div class="loading-skeleton"></div></div>
+    <div class="loading-skeleton loading-screen-wide"></div>
+  </div>`;
+}
 async function render(options={}){
   if(!state.user)return;
   const area=$('#content');
@@ -231,20 +253,20 @@ async function render(options={}){
   const preserveScroll=options.preserveScroll!==false;
   const scrollY=window.scrollY||0;
   persistWorkState();
-  // No vaciar la pantalla durante una actualización: el contenido anterior permanece
-  // visible mientras llegan los datos nuevos. Solo mostramos carga en la primera entrada.
-  if(!area.childElementCount)area.innerHTML='<div class="empty">Cargando información…</div>';
+  // En el primer acceso se pinta una estructura ligera antes de esperar a la API.
+  if(!area.childElementCount)area.innerHTML=loadingScreenHtml(screen);
   area.setAttribute('aria-busy','true');
   try{
     let html='';
     switch(screen){case 'accounts':html=await showAccounts(false);break;case 'all':html=await showAccounts(true);break;case 'tables':html=await showTables();break;case 'new':html=await showNew();break;case 'orders':html=await showOrders();break;case 'station':html=await showPrepStation(false);break;case 'history':html=await showPrepStation(true);break;case 'notifications':html=await showNotifications();break;case 'tickets':html=await showPrepStation(false,true);break;case 'cashier':html=await showCashier();break;case 'cash':html=await showCash();break;case 'tips':html=await showTips();break;case 'products':html=await showProducts();break;case 'inventory':html=await showInventory();break;case 'users':html=await showUsers();break;case 'approvals':html=await showApprovals();break;case 'audit':html=await showAudit();break;case 'reservations':html=await showReservations();break;case 'prepconfig':html=await showPrepConfig();break;case 'analytics':html=await showAnalytics();break;case 'overview':html=await showOverview();break;default:html='<div class="empty">Sin pantalla</div>'}
-    // Evita que una consulta lenta de la pantalla anterior reemplace la pantalla actual.
     if(seq!==state.renderSeq||screen!==state.screen)return;
     area.innerHTML=html;area.removeAttribute('aria-busy');
     if(preserveScroll)window.scrollTo(0,scrollY);else window.scrollTo(0,0);
     $('#refresh')?.classList.remove('has-update');
     state.pendingRefresh=false;
     checkAlarm();
+    // El historial es secundario: se consulta después de mostrar el panel de caja.
+    if(screen==='cash')loadCashHistory(seq).catch(()=>{});
   }catch(e){
     if(seq!==state.renderSeq||screen!==state.screen)return;
     area.removeAttribute('aria-busy');
@@ -424,11 +446,17 @@ async function refreshAccountPanel(id,admin=false){
 async function showStation(history=false,all=false){const tickets=await api('/tickets');state.data.tickets=tickets;const shown=tickets.filter(t=>history?t.status==='ready':t.status!=='ready');const newCount=tickets.filter(t=>t.status==='new'&&(all?true:t.station===state.user.role)).length;return `<div class="statgrid">${stat('Comandas nuevas',newCount)}${stat('En proceso',shown.filter(t=>t.status==='received'||t.status==='preparing').length)}</div>${!history?'<div class="note">Las comandas nuevas requieren confirmar recepción. Los tiempos de preparación y salida se muestran por producto.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':''}<div class="cards" style="margin-top:15px">${shown.map(t=>`<div class="card ticket ${t.status}"><div class="row"><h3>${esc(t.account)} · #${t.account_id}</h3>${pill(t.status)}</div><div class="mini">${t.station==='kitchen'?'🍳 Cocina':'🥤 Barra'} · Mesero: ${esc(t.waiter)} · Comanda #${t.batch_id} · ${t.created_at?new Date(t.created_at).toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'}):''}</div><div class="divider"></div>${t.items.map(i=>`<div class="lineitem"><b>${i.qty} × ${esc(i.name)}${i.variant_name?' · '+esc(i.variant_name):''}</b>${i.modifiers?.length?`<div class="mini">Extras: ${i.modifiers.map(m=>esc(m.name)).join(', ')}</div>`:''}${i.note?`<div class="note">${esc(i.note)}</div>`:''}<div class="mini">Preparación estimada: ${Number(i.prep_minutes||15)} min${i.release_after_minutes?' · Salida programada +'+Number(i.release_after_minutes)+' min desde el envío':''}</div></div>`).join('')}${!history?`<button class="primary" data-action="ticket-status" data-id="${t.id}" data-status="${t.status==='new'?'received':t.status==='received'?'preparing':'ready'}">${t.status==='new'?'Confirmar recepción':t.status==='received'?'Iniciar preparación':'Marcar como listo'}</button>`:''}</div>`).join('')||'<div class="empty">No hay comandas en esta sección.</div>'}</div>`}
 
 async function showCashier(){
-  const accounts=(await api('/accounts')).filter(x=>x.status==='pending');
+  const query=state.account?'?account_id='+encodeURIComponent(state.account):'';
+  const data=await api('/cashier/overview'+query);
+  const accounts=data.accounts||[];
   state.data.accounts=accounts;
-  if(!accounts.length)return '<div class="empty">No hay cuentas pendientes de cobro.</div>'+ticketLookupHtml();
-  if(!accounts.some(x=>x.id===state.account))state.account=accounts[0].id;
-  const a=await api('/accounts/'+state.account);state.data.currentAccount=a;
+  if(!accounts.length){
+    state.account=null;state.data.currentAccount=null;
+    return '<div class="empty">No hay cuentas pendientes de cobro.</div>'+ticketLookupHtml();
+  }
+  const a=data.selected;
+  if(!a)throw Error('No se pudo cargar el detalle de la cuenta seleccionada. Actualiza e inténtalo de nuevo.');
+  state.account=a.id;state.data.currentAccount=a;
   const admin=['owner','admin'].includes(state.user.role);
   const activeDiscounts=(a.discounts||[]).filter(d=>d.status==='applied');
   const hasPayments=(a.payments||[]).length>0;
@@ -442,11 +470,29 @@ async function showCashier(){
   <h2 class="section">Registrar pago parcial o mixto</h2><div class="card"><form id="pay-form" class="formrow"><label>Forma de división<select id="split-mode" name="split_mode"><option value="amount">Por importe</option><option value="products" ${activeDiscounts.length?'disabled':''}>Por productos completos ${activeDiscounts.length?'(deshabilitado con descuentos)':''}</option></select></label><div id="split-products" hidden><p class="mini">Indica cuántas unidades paga esta persona. La suma se calculará automáticamente.</p>${a.items.filter(i=>i.qty>i.cancelled_qty).map(i=>`<label>${esc(i.name)} · ${money(i.price)} por unidad<input class="allocation-qty" type="number" min="0" max="${i.qty-i.cancelled_qty}" value="0" data-item="${i.id}" data-price="${i.price}"></label>`).join('')}</div><div class="formgrid"><label>Consumo en efectivo ($)<input type="number" step="0.01" min="0" name="cash" value="0"></label><label>Consumo con tarjeta ($)<input type="number" step="0.01" min="0" name="card" value="0"></label><label>Consumo por transferencia ($)<input type="number" step="0.01" min="0" name="transfer" value="0"></label><label>Efectivo recibido (incluye propina) ($)<input type="number" step="0.01" min="0" name="received" value="0"></label></div><h3>Propinas (separadas del consumo)</h3><div class="formgrid"><label>Propina en efectivo ($)<input type="number" step="0.01" min="0" name="cash_tip" value="0"></label><label>Propina con tarjeta ($)<input type="number" step="0.01" min="0" name="card_tip" value="0"></label><label>Propina por transferencia ($)<input type="number" step="0.01" min="0" name="transfer_tip" value="0"></label></div><div class="note">Las propinas no reducen el saldo de consumo; se registran por separado y se incluyen en el corte de caja. Si se recibe efectivo, indica el total entregado incluyendo la propina.</div><button class="primary" ${Number(a.due)<=0?'disabled':''}>Confirmar pago</button></form></div>
   <h2 class="section">Pagos registrados</h2><div class="card">${(a.payments||[]).map(p=>`<div class="lineitem row"><span>${esc(p.method)} · ${money(p.amount)}${Number(p.tip)>0?` · Propina ${money(p.tip)}`:''}</span><span class="mini">#${p.id}</span></div>`).join('')||'<p class="muted">Sin pagos.</p>'}<div class="row"><span>Propinas acumuladas</span><b>${money((a.tips||[]).reduce((s,t)=>s+Number(t.amount||0),0))}</b></div>${Number(a.due)===0?`<button class="primary" data-action="close-account" data-id="${a.id}">Cerrar cuenta pagada</button>`:''}<div class="inline"><button class="outline" data-action="print-prebill" data-id="${a.id}">Pre-cuenta</button><button class="outline" data-action="download-prebill" data-id="${a.id}">Descargar pre-cuenta PDF</button><button class="outline" data-action="print-ticket" data-id="${a.id}">Ver ticket</button><button class="outline" data-action="download-ticket" data-id="${a.id}">Descargar PDF</button><button class="outline" data-action="share-ticket" data-id="${a.id}">Compartir por WhatsApp</button></div></div>${ticketLookupHtml()}`;
 }
+function cashHistoryMarkup(history){
+  return `<h2 class="section">Historial de turnos cerrados</h2><div class="cards">${history.map(p=>`<div class="card"><div class="row"><h3>Turno #${p.id}</h3>${pill('paid')}</div><p>${esc(new Date(p.closed_at).toLocaleString('es-MX'))} · ${esc(p.closed_by)}</p><p><b>Ventas ${money(p.sales)}</b> · Propinas ${money(p.tips||0)} · ${p.account_count} cuentas · Diferencia ${money(p.difference)} · ${p.tip_distribution?'Reparto de propinas generado':'Sin reparto de propinas'}</p><div class="inline"><button class="primary small" data-action="view-report" data-id="${p.id}">Ver corte tipo ticket</button><button class="outline small" data-action="download-report" data-id="${p.id}">Descargar PDF</button><button class="outline small" data-action="period-detail" data-id="${p.id}">Detalles</button></div></div>`).join('')||'<div class="empty">Aún no hay turnos cerrados.</div>'}</div><div id="period-detail" style="margin-top:14px"></div>`;
+}
+async function loadCashHistory(seq=state.renderSeq){
+  const target=$('#cash-history');
+  if(!target||state.screen!=='cash')return;
+  target.innerHTML='<div class="empty">Cargando historial de turnos…</div>';
+  try{
+    const history=await api('/cash/history');
+    if(seq!==state.renderSeq||state.screen!=='cash')return;
+    const current=$('#cash-history');
+    if(current)current.innerHTML=cashHistoryMarkup(history);
+  }catch(error){
+    if(seq!==state.renderSeq||state.screen!=='cash')return;
+    const current=$('#cash-history');
+    if(current)current.innerHTML='<div class="note danger-note">No se pudo cargar el historial. Usa Actualizar para volver a intentarlo.</div>';
+  }
+}
 async function showCash(){
-  const [c,history]=await Promise.all([api('/cash'),api('/cash/history')]);
+  const c=await api('/cash');
   state.data.cash=c;
   const admin=['owner','admin'].includes(state.user.role);
-  const historyHtml=`<h2 class="section">Historial de turnos cerrados</h2><div class="cards">${history.map(p=>`<div class="card"><div class="row"><h3>Turno #${p.id}</h3>${pill('paid')}</div><p>${esc(new Date(p.closed_at).toLocaleString('es-MX'))} · ${esc(p.closed_by)}</p><p><b>Ventas ${money(p.sales)}</b> · Propinas ${money(p.tips||0)} · ${p.account_count} cuentas · Diferencia ${money(p.difference)} · ${p.tip_distribution?'Reparto de propinas generado':'Sin reparto de propinas'}</p><div class="inline"><button class="primary small" data-action="view-report" data-id="${p.id}">Ver corte tipo ticket</button><button class="outline small" data-action="download-report" data-id="${p.id}">Descargar PDF</button><button class="outline small" data-action="period-detail" data-id="${p.id}">Detalles</button></div></div>`).join('')||'<div class="empty">Aún no hay turnos cerrados.</div>'}</div><div id="period-detail" style="margin-top:14px"></div>`;
+  const historyHtml='<div id="cash-history"><div class="empty">Preparando historial de turnos…</div></div>';
   if(!c.open)return `<div class="note danger-note">Turno cerrado y archivado. La actividad del turno anterior quedó en Historial con su PDF. Abre un turno nuevo para empezar con las vistas activas limpias.</div>${admin?'<form id="cash-open" class="card formrow"><label>Fondo inicial ($)<input name="opening" type="number" min="0" step="0.01" required value="0"></label><button class="primary">Abrir turno nuevo</button></form>':''}${historyHtml}`;
   const blockers=c.blocking_accounts||[];
   const blockersHtml=`<div class="card" style="margin-top:14px"><h3>Control de cierre de turno</h3>${c.blocking_count>0?`<div class="note danger-note"><b>Cierre bloqueado:</b> hay ${c.blocking_count} cuenta(s) sin finalizar. Deben quedar pagadas y cerradas o anuladas con autorización.</div><div class="stack" style="margin-top:12px">${blockers.map(a=>`<div class="row lineitem"><div><b>#${a.id} · ${esc(a.name)}</b><div class="mini">${esc(a.status==='pending'?'Por cobrar':'Abierta')} · Saldo ${money(a.due)}</div></div>${admin?`<button class="outline small" data-action="admin-account" data-id="${a.id}">Revisar</button>`:''}</div>`).join('')}</div>`:'<div class="note">Todas las cuentas están finalizadas. El turno puede cerrarse cuando no existan movimientos pendientes.</div>'}</div>`;
@@ -577,7 +623,8 @@ async function showUsers(){
 async function showApprovals(){const rs=await api('/requests');return `<div class="cards">${rs.map(r=>`<div class="card"><div class="row"><h3>${r.kind==='reopen'?'Reapertura':'Cancelación'} · #${r.account_id}</h3>${pill(r.status)}</div><p>${esc(r.account)} · ${esc(r.requester)}</p><p>${esc(r.reason)}</p>${r.kind==='cancel'?`<p class="mini">Producto #${r.item_id} · ${r.qty} unidad(es)</p>`:''}${r.status==='pending'?`<div class="inline"><button class="primary small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="true">Autorizar</button><button class="ghost small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="false">Rechazar</button></div>`:''}</div>`).join('')||'<div class="empty">No hay solicitudes.</div>'}</div>`}
 async function showAudit(){const rs=await api('/audit');return `<div class="card table-wrap"><table><thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Detalle</th></tr></thead><tbody>${rs.map(x=>`<tr><td>${esc(new Date(x.date).toLocaleString('es-MX'))}</td><td>${esc(x.actor)}</td><td>${esc(x.action)}</td><td class="mini">${esc(JSON.stringify(x.detail))}</td></tr>`).join('')}</tbody></table></div>`}
 async function showOverview(){
-  const [as,ts,ps]=await Promise.all([api('/accounts'),api('/tickets'),api('/products')]);
+  const data=await api('/overview');
+  // El panel utiliza métricas agregadas; los listados completos se cargan al abrir cada módulo.
   // Los accesos solo navegan a módulos ya existentes, sin alterar API o permisos.
   const drawings={
     list:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h9M8 13h9M8 17h6"/>',
@@ -613,7 +660,7 @@ async function showOverview(){
       <p>Revisa el servicio y entra directamente al módulo que necesitas.</p></div>
       <span class="premium-dashboard-live">● Información actualizada</span>
     </div>
-    <div class="statgrid">${stat('Cuentas activas',as.filter(a=>a.status==='open'||a.status==='pending').length)}${stat('Por cobrar',as.filter(a=>a.status==='pending').length)}${stat('Comandas nuevas',ts.filter(t=>t.status==='new').length)}${stat('Productos',ps.length)}</div>
+    <div class="statgrid">${stat('Cuentas activas',data.active_accounts)}${stat('Por cobrar',data.pending_accounts)}${stat('Comandas nuevas',data.new_tickets)}${stat('Productos',data.products)}</div>
     <div class="premium-dashboard-heading premium-dashboard-second"><div><p class="premium-eyebrow">GESTIÓN Y ADMINISTRACIÓN</p><h2>Todos los módulos</h2></div></div>
     <div class="premium-shortcut-grid">
     ${shortcuts.map(([id,label,desc,drawing])=>`<button type="button" class="premium-shortcut" data-nav="${id}" aria-label="Abrir ${label}"><span class="premium-shortcut-icon">${icon(drawing)}</span><strong>${label}</strong><small>${desc}</small><span class="premium-shortcut-arrow" aria-hidden="true">›</span></button>`).join('')}
