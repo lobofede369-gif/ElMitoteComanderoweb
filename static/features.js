@@ -1,7 +1,7 @@
 /* El Mitote · módulos de preparación, reservaciones y analítica.
    Reutiliza la sesión y el sistema de navegación del cliente existente. */
 function prepDuration(seconds){const value=Math.max(0,Math.floor(Number(seconds)||0));return Math.floor(value/60)+'m '+String(value%60).padStart(2,'0')+'s'}
-function prepBadge(status){return '<span class="prep-flag prep-'+esc(status)+'">'+({ready:'Listo',warning:'Por vencer',late:'Retrasado',ok:'En tiempo'}[status]||'En tiempo')+'</span>'}
+function prepBadge(status){return '<span class="prep-flag prep-'+esc(status)+'">'+({ready:'Listo',warning:'Por vencer',late:'Retrasado',scheduled:'Programado',ok:'En tiempo'}[status]||'En tiempo')+'</span>'}
 function clockNode(start,ready,limit){return '<span class="prep-clock" data-prep-start="'+esc(start||'')+'" data-prep-stop="'+esc(ready||'')+'" data-prep-limit="'+Number(limit||15)+'">—</span>'}
 let prepOffset=0;
 function tickPrepClocks(){
@@ -10,10 +10,13 @@ function tickPrepClocks(){
   document.querySelectorAll('.prep-clock').forEach(el=>{
     const start=Date.parse(el.dataset.prepStart||''),stop=Date.parse(el.dataset.prepStop||'');
     if(!Number.isFinite(start))return;
+    const limit=Math.max(1,Number(el.dataset.prepLimit)||15);
+    const queued=!Number.isFinite(stop)&&start>instant;
+    el.classList.toggle('prep-clock-queued',queued);
+    el.classList.toggle('prep-clock-late',!Number.isFinite(stop)&&!queued&&(instant-start)/1000>limit*60);
+    if(queued){el.textContent='Inicia en '+prepDuration((start-instant)/1000);return;}
     const seconds=Math.max(0,Math.floor(((Number.isFinite(stop)?stop:instant)-start)/1000));
     el.textContent=prepDuration(seconds);
-    const limit=Math.max(1,Number(el.dataset.prepLimit)||15);
-    el.classList.toggle('prep-clock-late',!Number.isFinite(stop)&&seconds>limit*60);
   });
 }
 setInterval(tickPrepClocks,1000);
@@ -24,12 +27,17 @@ async function showPrepStation(history=false,all=false){
   prepOffset=Date.parse(response.server_time)-Date.now();
   state.data.tickets=tickets;
   const shown=tickets.filter(t=>history?t.status==='ready':t.status!=='ready');
+  const urgency={late:0,warning:1,ok:2,scheduled:3,ready:4};
+  const rank=t=>Math.min(urgency[t.batch_timing]??2,...(t.items||[]).map(i=>urgency[i.timing]??2));
+  shown.sort((a,b)=>rank(a)-rank(b)||Date.parse(a.created_at)-Date.parse(b.created_at)||a.id-b.id);
   const newCount=tickets.filter(t=>t.status==='new'&&(all||t.station===state.user.role)).length;
   const cards=shown.map(t=>{
-    const products=t.items.map(i=>'<div class="prep-product"><div class="row"><b>'+i.qty+' × '+esc(i.name)+(i.variant_name?' · '+esc(i.variant_name):'')+'</b>'+prepBadge(i.timing)+'</div>'+
+    const orderedItems=[...(t.items||[])].sort((a,b)=>(urgency[a.timing]??2)-(urgency[b.timing]??2)||Number(b.elapsed_seconds||0)-Number(a.elapsed_seconds||0));
+    const products=orderedItems.map(i=>'<div class="prep-product"><div class="row"><b>'+i.qty+' × '+esc(i.name)+(i.variant_name?' · '+esc(i.variant_name):'')+'</b>'+prepBadge(i.timing)+'</div>'+
       (i.note?'<div class="mini">Nota: '+esc(i.note)+'</div>':'')+
       (i.modifiers?.length?'<div class="mini">Extras: '+i.modifiers.map(m=>esc(m.name)).join(', ')+'</div>':'')+
-      '<div class="row mini"><span>Producto: '+clockNode(t.created_at,i.ready_at,i.prep_minutes)+'</span><span>Límite: '+Number(i.prep_minutes)+' min</span></div>'+
+      (i.release_after_minutes?'<div class="mini">Salida programada: +'+Number(i.release_after_minutes)+' min desde el envío</div>':'')+
+      '<div class="row mini"><span>Producto: '+clockNode(i.started_at||t.created_at,i.ready_at,i.prep_minutes)+'</span><span>Límite: '+Number(i.prep_minutes)+' min</span></div>'+
       (!history&&t.status==='preparing'&&!i.ready?'<button class="outline small" data-action="prep-item-ready" data-id="'+Number(i.id)+'">✓ Producto listo</button>':'')+'</div>').join('');
     return '<div class="card prep-ticket"><div class="row"><h3>'+esc(t.account)+' · #'+t.account_id+'</h3>'+pill(t.status)+'</div>'+
       '<div class="mini">'+(t.station==='kitchen'?'🍳 Cocina':'🥤 Barra')+' · '+esc(t.waiter)+' · Envío #'+t.batch_id+'</div>'+
@@ -38,9 +46,10 @@ async function showPrepStation(history=false,all=false){
       products+(!history?'<div class="prep-actions"><button class="primary" data-action="ticket-status" data-id="'+t.id+'" data-status="'+(t.status==='new'?'received':t.status==='received'?'preparing':'ready')+'">'+
       (t.status==='new'?'Confirmar recepción':t.status==='received'?'Iniciar preparación':'Marcar toda la estación como lista')+'</button></div>':'')+'</div>';
   }).join('');
+  const delayed=shown.filter(t=>t.batch_timing==='late'||(t.items||[]).some(i=>i.timing==='late')).length;
   const html='<div class="statgrid">'+stat('Comandas nuevas',newCount)+stat('En proceso',shown.filter(t=>t.status==='received'||t.status==='preparing').length)+
-    stat('Con demora',shown.filter(t=>t.batch_timing==='late').length)+'</div>'+
-    (!history?'<div class="note">Cronómetros simultáneos por producto y por envío. Las nuevas adiciones a la cuenta comienzan un nuevo envío.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':'')+
+    stat('Con demora',delayed)+'</div>'+
+    (!history?'<div class="note">Prioridad automática: retrasadas primero, después las próximas a vencer y finalmente las programadas. Cada producto inicia su cronómetro según su hora de salida.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':'')+
     '<div class="cards">'+(cards||'<div class="empty">No hay comandas en esta sección.</div>')+'</div>';
   requestAnimationFrame(tickPrepClocks);
   return html;
