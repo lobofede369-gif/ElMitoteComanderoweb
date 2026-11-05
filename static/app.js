@@ -130,7 +130,7 @@ async function showCashTicket(id){
   const time=s=>s?new Date(s).toLocaleString('es-MX',{timeZone:'America/Mexico_City'}):'No registrado';
   const tips=['tip_cash','tip_card','tip_transfer'].reduce((sum,k)=>sum+Number(p[k]||0),0);
   const groups=p.product_breakdown||[];
-  let html='<section class="cash-receipt"><h3>EL MITOTE</h3><p class="cash-receipt-center">RESTAURANTE · CORTE DE CAJA</p>'+
+  let html='<section class="cash-receipt"><h3>PERSEO POS</h3><p class="cash-receipt-center">PUNTO DE VENTA · CORTE DE CAJA</p>'+
     '<p class="cash-receipt-center">CORTE #'+Number(p.id)+' · CAJA GENERAL</p>'+
     '<p>Inicio: '+esc(time(p.opened_at))+'</p><p>Cierre: '+esc(time(p.closed_at))+'</p>'+
     '<p>Responsable: '+esc(p.closed_by||'No registrado')+'</p>'+
@@ -723,12 +723,12 @@ case 'send-order':{
   const path=cut?'/api/cash/periods/'+id+'/'+(original?'report.pdf':'ticket.pdf'):
     '/api/accounts/'+id+'/'+(prebill?'prebill':'ticket')+'.pdf';
   const blob=await fetchProtectedPdf(path);
-  const filename=cut?'ElMitote_Corte_'+id+(original?'_Original':'_Ticket')+'.pdf':
-    'ElMitote_'+(prebill?'PreCuenta_':'Ticket_')+id+'.pdf';
+  const filename=cut?'PerseoPOS_Corte_'+id+(original?'_Original':'_Ticket')+'.pdf':
+    'PerseoPOS_'+(prebill?'PreCuenta_':'Ticket_')+id+'.pdf';
   if(action==='share-ticket'&&typeof File==='function'&&navigator.canShare){
     const file=new File([blob],filename,{type:'application/pdf'});
     if(navigator.canShare({files:[file]})){
-      await navigator.share({files:[file],title:'Ticket El Mitote #'+id});
+      await navigator.share({files:[file],title:'Ticket PERSEO POS #'+id});
       break;
     }
   }
@@ -809,7 +809,7 @@ case 'edit-product':{const p=state.products.find(x=>x.id===id);const name=ask('N
 function ticketHtml(a){
   const discountRows=(a.discounts||[]).filter(d=>d.status==='applied').map(d=>`<tr><td>Descuento ${d.scope==='account'?'general':'por producto'+(d.item_name?' · '+esc(d.item_name):'')} · ${esc(d.reason)}</td><td style="text-align:right">-${money(d.amount)}</td></tr>`).join('');
   const tipTotal=(a.tips||[]).reduce((s,t)=>s+Number(t.amount||0),0);
-  return `<!doctype html><html lang="es"><meta charset="utf-8"><title>Ticket #${a.id}</title><style>body{font:14px Arial,sans-serif;color:#111;max-width:350px;margin:20px auto;padding:12px}h2{text-align:center}img{display:block;margin:auto;max-width:140px}table{width:100%;border-collapse:collapse}td{padding:6px 0;border-bottom:1px dotted #bbb}footer{text-align:center;margin-top:20px}@media print{button{display:none}}</style><img src="/static/assets/logo.webp"><h2>EL MITOTE RESTAURANTE</h2><p style="text-align:center">Carretera Progreso Ixmiquilpan, Xochitlán, Hidalgo, C. P. 42740<br>Tel. 772 200 3943</p><hr><p><b>Cuenta #${a.id}</b> · ${esc(a.name)}<br>Mesero: ${esc(a.owner)}<br>Fecha de consulta: ${new Date().toLocaleString('es-MX')}</p><table>${a.items.map(i=>`<tr><td>${i.qty-i.cancelled_qty} × ${esc(i.name)}${i.variant_name?' · '+esc(i.variant_name):''}${i.modifiers?.length?`<br><small>Extras: ${i.modifiers.map(m=>esc(m.name)).join(', ')}</small>`:''}${i.note?`<br><small>Nota: ${esc(i.note)}</small>`:''}</td><td style="text-align:right">${money(Number(i.price)*(i.qty-i.cancelled_qty))}</td></tr>`).join('')}${discountRows}</table><p>Subtotal ${money(a.gross_total??a.total)}<br>Descuentos -${money(a.discount_total||0)}<br><b>Total ${money(a.total)}</b><br>Pagado ${money(a.paid)}<br><b>Saldo ${money(a.due)}</b></p><p>Pagos: ${a.payments.map(p=>`${esc(p.method)} ${money(p.amount)}${Number(p.tip)>0?` + propina ${money(p.tip)}`:''}`).join(' · ')||'Sin pagos'}</p><p>Propinas registradas: ${money(tipTotal)}</p><p>${a.status==='paid'?'PAGADO':'PENDIENTE'}</p><footer>Muchas gracias por tu visita, te esperamos pronto<br><small>Comprobante de consumo · No fiscal</small></footer><p><button onclick="window.print()">Imprimir / Guardar como PDF</button></p></html>`;
+  return `<!doctype html><html lang="es"><meta charset="utf-8"><title>Ticket #${a.id}</title><style>body{font:14px Arial,sans-serif;color:#111;max-width:350px;margin:20px auto;padding:12px}h2{text-align:center}img{display:block;margin:auto;max-width:140px}table{width:100%;border-collapse:collapse}td{padding:6px 0;border-bottom:1px dotted #bbb}footer{text-align:center;margin-top:20px}@media print{button{display:none}}</style><h2>PERSEO POS</h2><p style="text-align:center">Restaurante Demo · Datos ficticios</p><hr><p><b>Cuenta #${a.id}</b> · ${esc(a.name)}<br>Mesero: ${esc(a.owner)}<br>Fecha de consulta: ${new Date().toLocaleString('es-MX')}</p><table>${a.items.map(i=>`<tr><td>${i.qty-i.cancelled_qty} × ${esc(i.name)}${i.variant_name?' · '+esc(i.variant_name):''}${i.modifiers?.length?`<br><small>Extras: ${i.modifiers.map(m=>esc(m.name)).join(', ')}</small>`:''}${i.note?`<br><small>Nota: ${esc(i.note)}</small>`:''}</td><td style="text-align:right">${money(Number(i.price)*(i.qty-i.cancelled_qty))}</td></tr>`).join('')}${discountRows}</table><p>Subtotal ${money(a.gross_total??a.total)}<br>Descuentos -${money(a.discount_total||0)}<br><b>Total ${money(a.total)}</b><br>Pagado ${money(a.paid)}<br><b>Saldo ${money(a.due)}</b></p><p>Pagos: ${a.payments.map(p=>`${esc(p.method)} ${money(p.amount)}${Number(p.tip)>0?` + propina ${money(p.tip)}`:''}`).join(' · ')||'Sin pagos'}</p><p>Propinas registradas: ${money(tipTotal)}</p><p>${a.status==='paid'?'PAGADO':'PENDIENTE'}</p><footer>Muchas gracias por tu visita, te esperamos pronto<br><small>Comprobante de consumo · No fiscal</small></footer><p><button onclick="window.print()">Imprimir / Guardar como PDF</button></p></html>`;
 }
 async function submitForm(form){if(await mitoteFeatureForm(form))return;const d=formObj(form);
 if(form.id.startsWith('staff-pin-')){
