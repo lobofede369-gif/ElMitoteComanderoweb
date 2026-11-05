@@ -2373,14 +2373,18 @@ def waiter_ready_alerts(db:Session=Depends(db_session),user:User=Depends(auth)):
 @app.post('/api/waiter/ready-alerts/{event_id}/ack')
 async def acknowledge_ready_alert(event_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'waiter')
+    candidate=db.get(ReadyNotificationEvent,event_id)
+    if not candidate:raise HTTPException(404,'Aviso no encontrado')
+    # Mantener el mismo orden de bloqueo que dispatch/reassign: cuenta, evento y entregas.
+    account=db.execute(select(Account).where(
+        Account.id==candidate.account_id).with_for_update()).scalar_one_or_none()
     row=db.execute(select(ReadyNotificationEvent).where(
         ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
     if not row:raise HTTPException(404,'Aviso no encontrado')
-    account=db.get(Account,row.account_id)
     if row.waiter_id!=user.id or not account or account.owner_id!=user.id:
         raise HTTPException(403,'Aviso no asignado a este mesero')
     deliveries=db.scalars(select(ReadyNotificationDelivery).where(
-        ReadyNotificationDelivery.event_id==row.id)).all()
+        ReadyNotificationDelivery.event_id==row.id).with_for_update()).all()
     if row.acknowledged_at is not None:
         for delivery in deliveries:
             delivery.resolved_at=delivery.resolved_at or now()
