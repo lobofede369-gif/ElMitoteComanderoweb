@@ -35,6 +35,10 @@ if DATABASE_URL.startswith('postgres://'):
 SECRET_KEY = os.getenv('SECRET_KEY', '')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '')
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'propietario')
+DEMO_MODE = os.getenv('DEMO_MODE', '0').strip().lower() in ('1','true','yes','on')
+DEMO_SEED_VERSION = 1
+if DEMO_MODE and DATABASE_URL.startswith('sqlite:'):
+    raise RuntimeError('DEMO_MODE requiere una base PostgreSQL independiente.')
 VAPID_PUBLIC_KEY = os.getenv('VAPID_PUBLIC_KEY', '').strip()
 VAPID_PRIVATE_KEY = os.getenv('VAPID_PRIVATE_KEY', '').strip()
 VAPID_SUBJECT = os.getenv('VAPID_SUBJECT', '').strip()
@@ -450,6 +454,175 @@ async def notify():
 def audit(db,user,action,**data):
     db.add(Audit(actor_id=user.id if user else None,action=action,detail=json.dumps(data,ensure_ascii=False)))
 
+def _seed_demo_data(db: Session):
+    """Crea datos ficticios una sola vez; solo se ejecuta en la base aislada de demo."""
+    marker = 'demo.seed.v1'
+    if db.scalar(select(Audit.id).where(Audit.action == marker).limit(1)):
+        return
+
+    owner = db.scalar(select(User).where(User.role == 'owner').order_by(User.id).limit(1))
+    if owner is None:
+        raise RuntimeError('La demo requiere el usuario propietario inicial.')
+    if owner.username != 'demo_propietario':
+        duplicate = db.scalar(select(User).where(User.username == 'demo_propietario'))
+        if duplicate and duplicate.id != owner.id:
+            raise RuntimeError('El usuario propietario de demostración ya existe.')
+        owner.username = 'demo_propietario'
+    owner.display = 'Propietario Demo'
+    owner.active = True
+
+    user_specs = (
+        ('demo_propietario', 'Propietario Demo', 'owner', '111111'),
+        ('demo_mesero', 'Mesero Demo', 'waiter', '222222'),
+        ('demo_cocina', 'Cocina Demo', 'kitchen', '333333'),
+        ('demo_barra', 'Barra Demo', 'bar', '444444'),
+        ('demo_caja', 'Caja Demo', 'cashier', '555555'),
+    )
+    demo_users = {'owner': owner}
+    for username, display, role, pin in user_specs:
+        user = owner if role == 'owner' else db.scalar(select(User).where(User.username == username))
+        if user is None:
+            user = User(username=username, display=display, role=role,
+                        password_hash=ph.hash(secrets.token_urlsafe(32)), active=True)
+            db.add(user)
+            db.flush()
+        else:
+            user.username = username
+            user.display = display
+            user.role = role
+            user.active = True
+        _set_user_pin(db, user, pin)
+        demo_users[role] = user
+
+    setting = db.get(Setting, 1)
+    if setting is None:
+        setting = Setting(id=1, inventory_on=True, inventory_reviewed=True)
+        db.add(setting)
+    else:
+        setting.inventory_on = True
+        setting.inventory_reviewed = True
+
+    product_specs = (
+        ('Birria de res', 'Platos fuertes', 'kitchen', 16500, 24),
+        ('Tacos de birria', 'Tacos', 'kitchen', 8500, 36),
+        ('Quesabirria', 'Tacos', 'kitchen', 10500, 28),
+        ('Consomé', 'Complementos', 'kitchen', 5000, 30),
+        ('Agua fresca', 'Bebidas', 'bar', 3500, 40),
+        ('Limonada', 'Bebidas', 'bar', 4000, 25),
+        ('Refresco', 'Bebidas', 'bar', 3000, 32),
+        ('Flan casero', 'Postres', 'kitchen', 4500, 16),
+    )
+    products = {}
+    for name, category, station, price, stock in product_specs:
+        product = db.scalar(select(Product).where(Product.name == name))
+        if product is None:
+            product = Product(name=name, category=category, station=station,
+                              price_cents=price, active=True, blocked=False,
+                              inventory_enabled=True, stock=stock, version=1)
+            db.add(product)
+            db.flush()
+        products[name] = product
+
+    tacos = products['Tacos de birria']
+    if not db.scalar(select(ProductVariant.id).where(ProductVariant.product_id == tacos.id).limit(1)):
+        db.add_all([
+            ProductVariant(product_id=tacos.id, name='Orden de 3', price_cents=24000, active=True, sort_order=1),
+            ProductVariant(product_id=tacos.id, name='Orden de 5', price_cents=38000, active=True, sort_order=2),
+        ])
+    if not db.scalar(select(ProductModifierGroup.id).where(
+            ProductModifierGroup.product_id == tacos.id,
+            ProductModifierGroup.name == 'Extras').limit(1)):
+        group = ProductModifierGroup(product_id=tacos.id, name='Extras',
+                                     min_select=0, max_select=2, active=True, sort_order=1)
+        db.add(group)
+        db.flush()
+        db.add_all([
+            ProductModifierOption(group_id=group.id, name='Queso extra',
+                                  price_delta_cents=2000, active=True, sort_order=1),
+            ProductModifierOption(group_id=group.id, name='Aguacate',
+                                  price_delta_cents=1500, active=True, sort_order=2),
+            ProductModifierOption(group_id=group.id, name='Salsa extra',
+                                  price_delta_cents=500, active=True, sort_order=3),
+        ])
+
+    tables = {}
+    for number in range(1, 9):
+        name = f'Mesa {number}'
+        table = db.scalar(select(DiningTable).where(DiningTable.name_key == f'mesa-{number}'))
+        if table is None:
+            table = DiningTable(name=name, name_key=f'mesa-{number}', area='Salón',
+                                capacity=4, active=True, sort_order=number)
+            db.add(table)
+            db.flush()
+        tables[number] = table
+
+    period = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None))
+                       .order_by(CashPeriod.id.desc()).limit(1))
+    if period is None:
+        period = CashPeriod(opening_cents=50000, note='Turno de caja de demostración')
+        db.add(period)
+        db.flush()
+
+    def add_batch(account, sender, client_key, lines, ticket_status='new'):
+        batch = Batch(account_id=account.id, sent_by=sender.id, client_key=client_key)
+        db.add(batch)
+        db.flush()
+        stations = set()
+        for product_name, qty, note, variant_name, prep_minutes in lines:
+            product = products[product_name]
+            item = OrderItem(batch_id=batch.id, product_id=product.id,
+                             name=product.name, station=product.station,
+                             price_cents=product.price_cents, qty=qty,
+                             cancelled_qty=0, note=note)
+            db.add(item)
+            db.flush()
+            db.add(OrderItemMeta(order_item_id=item.id, variant_name=variant_name,
+                                 modifiers_json='[]', prep_minutes=prep_minutes,
+                                 release_after_minutes=0, promotion_name='',
+                                 base_price_cents=product.price_cents,
+                                 modifier_price_cents=0))
+            stations.add(product.station)
+        for station in stations:
+            db.add(StationTicket(batch_id=batch.id, station=station, status=ticket_status))
+        return batch
+
+    waiter = demo_users['waiter']
+    cashier = demo_users['cashier']
+
+    open_account = Account(name='Mesa 2 · 3 personas', owner_id=waiter.id, status='open')
+    db.add(open_account)
+    db.flush()
+    db.add(TableOccupancy(table_id=tables[2].id, account_id=open_account.id,
+                          assigned_by=waiter.id))
+    add_batch(open_account, waiter, 'demo-seed-open-batch-v1', [
+        ('Tacos de birria', 2, 'Salsa aparte', 'Orden de 3', 12),
+        ('Agua fresca', 2, 'Sin hielo', '', 3),
+    ])
+
+    takeaway = Account(name='Para llevar · Demo 02', owner_id=waiter.id, status='pending')
+    db.add(takeaway)
+    db.flush()
+    add_batch(takeaway, waiter, 'demo-seed-takeaway-batch-v1', [
+        ('Quesabirria', 1, 'Bien dorada', '', 14),
+        ('Consomé', 1, 'Con cebolla', '', 5),
+    ], ticket_status='preparing')
+
+    paid_account = Account(name='Mesa 1 · Cuenta de ejemplo', owner_id=waiter.id,
+                           status='paid', closed_at=now())
+    db.add(paid_account)
+    db.flush()
+    add_batch(paid_account, waiter, 'demo-seed-paid-batch-v1', [
+        ('Birria de res', 1, '', '', 15),
+        ('Agua fresca', 1, '', '', 3),
+    ], ticket_status='ready')
+    db.add(Payment(account_id=paid_account.id, cashier_id=cashier.id,
+                   period_id=period.id, client_key='demo-seed-payment-v1',
+                   method='cash', cents=20000, received_cents=20000))
+
+    audit(db, owner, marker, seed_version=DEMO_SEED_VERSION,
+          note='Datos ficticios; entorno independiente de producción.')
+
+
 def bootstrap():
     Base.metadata.create_all(engine)
     # create_all no agrega índices a tablas ya creadas; checkfirst permite
@@ -461,6 +634,8 @@ def bootstrap():
         if not db.scalar(select(User).where(User.role=='owner')):
             db.add(User(username=ADMIN_USERNAME,display='Propietario',role='owner',password_hash=ph.hash(ADMIN_PASSWORD)))
             db.flush()
+        if DEMO_MODE:
+            _seed_demo_data(db)
         # Recuperación excepcional autorizada mediante variables PRIVADAS de Render.
         # El token solo puede consumirse una vez, aun si Render reinicia.
         token=os.getenv('OWNER_RECOVERY_TOKEN','').strip()
@@ -565,6 +740,14 @@ async def lifespan(app):
 
 app=FastAPI(title='El Mitote Comandas',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory='static'),name='static')
+
+@app.get('/api/demo/info')
+def demo_info():
+    if not DEMO_MODE:
+        raise HTTPException(404, 'No disponible')
+    return {'demo': True, 'seed_version': DEMO_SEED_VERSION,
+            'restaurant': 'Restaurante Demo', 'shared': True,
+            'notice': 'Datos ficticios. No registrar ventas ni datos reales.'}
 
 http_log=logging.getLogger('mitote.http')
 
