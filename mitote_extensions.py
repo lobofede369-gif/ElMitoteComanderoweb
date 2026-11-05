@@ -172,34 +172,79 @@ async def put_product_prep(product_id: int, data: ProductPrepIn, db: Session = D
 @app.get("/api/preparation/tickets")
 def preparation_tickets(db: Session = Depends(db_session), user: User = Depends(auth)):
     allow(user, "owner", "admin", "kitchen", "bar")
-    stamp = now()
     active = db.scalar(select(CashPeriod).where(
         CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    stamp = now()
     if not active:
         return {"server_time": stamp.isoformat(), "tickets": []}
+
     query = select(StationTicket).join(Batch, Batch.id == StationTicket.batch_id).where(
         Batch.created_at >= active.opened_at).order_by(StationTicket.id.desc()).limit(150)
     if user.role in ("kitchen", "bar"):
         query = query.where(StationTicket.station == user.role)
     tickets = db.scalars(query).all()
-    output = []
+    if not tickets:
+        return {"server_time": stamp.isoformat(), "tickets": []}
+
+    # Precargar todas las relaciones en lotes. El número de consultas permanece
+    # prácticamente constante aunque el turno tenga decenas o cientos de comandas.
+    batch_ids = {ticket.batch_id for ticket in tickets}
+    batches = db.scalars(select(Batch).where(Batch.id.in_(batch_ids))).all()
+    batch_by_id = {row.id: row for row in batches}
+    account_ids = {row.account_id for row in batches}
+    waiter_ids = {row.sent_by for row in batches}
+    accounts = db.scalars(select(Account).where(Account.id.in_(account_ids))).all() if account_ids else []
+    account_by_id = {row.id: row for row in accounts}
+    waiters = db.scalars(select(User).where(User.id.in_(waiter_ids))).all() if waiter_ids else []
+    waiter_by_id = {row.id: row for row in waiters}
+
+    item_rows = db.scalars(
+        select(OrderItem).where(OrderItem.batch_id.in_(batch_ids))
+        .order_by(OrderItem.batch_id, OrderItem.id)
+    ).all()
+    item_ids = {row.id for row in item_rows}
+    items_by_batch_station = {}
+    for row in item_rows:
+        items_by_batch_station.setdefault((row.batch_id, row.station), []).append(row)
+
+    metas = db.scalars(select(OrderItemMeta).where(
+        OrderItemMeta.order_item_id.in_(item_ids))).all() if item_ids else []
+    meta_by_item = {row.order_item_id: row for row in metas}
+    completions = db.scalars(select(ItemPrep).where(
+        ItemPrep.order_item_id.in_(item_ids))).all() if item_ids else []
+    completion_by_item = {row.order_item_id: row for row in completions}
+
+    sibling_rows = db.scalars(select(StationTicket).where(
+        StationTicket.batch_id.in_(batch_ids))).all()
+    tickets_by_batch = {}
+    for row in sibling_rows:
+        tickets_by_batch.setdefault(row.batch_id, []).append(row)
+
+    batch_prep_rows = db.scalars(select(BatchPrep).where(
+        BatchPrep.batch_id.in_(batch_ids))).all()
+    batch_prep_by_id = {row.batch_id: row for row in batch_prep_rows}
     config = policy(db)
     warning_pct = config.warning_percent if config else 80
-    stamp = now()
+    default_batch_minutes = config.batch_minutes if config else 25
+
+    output = []
     for ticket in tickets:
-        batch = db.get(Batch, ticket.batch_id)
-        account = db.get(Account, batch.account_id)
-        waiter = db.get(User, batch.sent_by)
-        rows = db.scalars(select(OrderItem).where(OrderItem.batch_id == batch.id,
-                                                   OrderItem.station == ticket.station)).all()
+        batch = batch_by_id.get(ticket.batch_id)
+        if not batch:
+            continue
+        account = account_by_id.get(batch.account_id)
+        waiter = waiter_by_id.get(batch.sent_by)
+        rows = items_by_batch_station.get((batch.id, ticket.station), [])
         items = []
         for item in rows:
             qty = item.qty - item.cancelled_qty
             if qty <= 0:
                 continue
-            meta = db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id == item.id))
+            meta = meta_by_item.get(item.id)
+            completion_row = completion_by_item.get(item.id)
+            completion = (completion_row.ready_at if completion_row else
+                          ticket.ready_at if ticket.status == "ready" else None)
             limit = meta.prep_minutes if meta else 15
-            completion = get_item_completion(db, item.id, ticket)
             elapsed = elapsed_seconds(batch.created_at, completion or stamp)
             items.append({
                 "id": item.id, "name": item.name, "qty": qty, "note": item.note,
@@ -211,15 +256,23 @@ def preparation_tickets(db: Session = Depends(db_session), user: User = Depends(
                 "timing": "ready" if completion else "late" if elapsed > limit * 60
                            else "warning" if elapsed >= limit * 60 * warning_pct / 100 else "ok",
             })
-        other_tickets = db.scalars(select(StationTicket).where(StationTicket.batch_id == batch.id)).all()
-        batch_ready = all(t.status == "ready" for t in other_tickets)
-        finished = max((aware(t.ready_at) for t in other_tickets if t.ready_at), default=None) if batch_ready else None
+
+        siblings = tickets_by_batch.get(batch.id, [])
+        batch_ready = all(row.status == "ready" for row in siblings)
+        finished = max(
+            (aware(row.ready_at) for row in siblings if row.ready_at),
+            default=None,
+        ) if batch_ready else None
         batch_seconds = elapsed_seconds(batch.created_at, finished or stamp)
-        limit = batch_limit(db, batch.id)
+        snapshot = batch_prep_by_id.get(batch.id)
+        limit = snapshot.minutes if snapshot else default_batch_minutes
         output.append({
-            "id": ticket.id, "batch_id": batch.id, "account_id": account.id, "account": account.name,
+            "id": ticket.id, "batch_id": batch.id,
+            "account_id": account.id if account else None,
+            "account": account.name if account else "Cuenta no disponible",
             "station": ticket.station, "status": ticket.status,
-            "created_at": aware(batch.created_at).isoformat(), "waiter": waiter.display if waiter else "?",
+            "created_at": aware(batch.created_at).isoformat(),
+            "waiter": waiter.display if waiter else "?",
             "items": items, "batch_minutes": limit, "batch_ready": batch_ready,
             "batch_elapsed_seconds": batch_seconds,
             "batch_timing": "ready" if batch_ready else "late" if batch_seconds > limit * 60
