@@ -238,6 +238,7 @@ try:
                 table_id=table.id, account_id=accounts[1].id,
                 assigned_by=owner_id, assigned_at=app.now(),
             ))
+            accounts[0].status = "pending"
             db.commit()
             first_account_id = accounts[0].id
             second_account_id = accounts[1].id
@@ -267,6 +268,65 @@ try:
             + str(len(statements))
         )
         print(f"OK: 12 cuentas con {len(statements)} consultas SELECT; totales y mesa correctos.")
+
+        # Resumen administrativo: métricas agregadas sin descargar los tres listados.
+        statements.clear()
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get("/api/overview", headers=headers)
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+        assert response.status_code == 200, response.text
+        overview = response.json()
+        assert overview["active_accounts"] == 12, overview
+        assert overview["pending_accounts"] == 1, overview
+        assert overview["new_tickets"] == 12, overview
+        assert overview["products"] >= 1, overview
+        assert len(statements) <= 6, (
+            "GET /api/overview debe usar agregados, no descargar listados: "
+            + str(len(statements))
+        )
+        print(f"OK: resumen administrativo con {len(statements)} consultas SELECT.")
+
+        # Caja: una sola petición entrega lista pendiente y detalle seleccionado.
+        statements.clear()
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get(
+                f"/api/cashier/overview?account_id={first_account_id}", headers=headers
+            )
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+        assert response.status_code == 200, response.text
+        cashier = response.json()
+        assert len(cashier["accounts"]) == 1, cashier["accounts"]
+        assert cashier["accounts"][0]["id"] == first_account_id, cashier
+        assert cashier["selected"]["id"] == first_account_id, cashier
+        assert cashier["selected"]["items"][0]["name"] == "Producto perf", cashier
+        assert len(statements) <= 24, (
+            "GET /api/cashier/overview debe evitar el viaje secuencial lista+detalle: "
+            + str(len(statements))
+        )
+        print(f"OK: panel de cobros y detalle inicial con {len(statements)} consultas SELECT.")
+
+        # Caja: agregados SQL para pagos/propinas y serialización en lote de cuentas bloqueantes.
+        statements.clear()
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get("/api/cash", headers=headers)
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+        assert response.status_code == 200, response.text
+        cash = response.json()
+        assert cash["cash"] == "10.00", cash
+        assert cash["tips"] == "2.00", cash
+        assert cash["blocking_count"] == 12, cash
+        assert len(cash["blocking_accounts"]) == 12, cash
+        assert len(statements) <= 20, (
+            "GET /api/cash debe agrupar cobros y cuentas bloqueantes: "
+            + str(len(statements))
+        )
+        print(f"OK: resumen de caja con {len(statements)} consultas SELECT.")
 
         # Reintentar la creación tras una respuesta perdida no debe duplicar la cuenta.
         create_payload = {"name": "Cuenta idempotente", "table_id": None}
@@ -369,10 +429,15 @@ try:
         )[0]
         assert "await start(d.user)" in login_flow
         assert "state.user=validUser||await api('/me')" in start_flow
+        assert "const initialRender=render({preserveScroll:false})" in start_flow
         assert "await syncWaiterReadyAlerts" not in start_flow
-        assert start_flow.index("await render({preserveScroll:false})") < start_flow.index(
-            "syncWaiterReadyAlerts(true).catch"
-        )
+        assert start_flow.index("const initialRender=render({preserveScroll:false})") < start_flow.index(
+            "listenEvents()"
+        ) < start_flow.index("initialRender.then(()=>")
+        assert "function loadingScreenHtml(screen)" in js
+        assert "api('/cashier/overview'+query)" in js
+        assert "api('/overview')" in js
+        assert "function loadCashHistory(seq=state.renderSeq)" in js
         assert "function waiterReadyAlertsHtml()" in js
         app_source = (root / "app.py").read_text(encoding="utf-8")
         assert ".join(User, User.id == UserPin.user_id)" in app_source
