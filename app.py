@@ -571,7 +571,9 @@ http_log=logging.getLogger('mitote.http')
 @app.middleware("http")
 async def observe_request_performance(request:Request,call_next):
     """Expose server time and log only slow/failed requests without customer data."""
-    request_id=request.headers.get('x-request-id') or secrets.token_hex(8)
+    request_id=request.headers.get('x-request-id','')
+    if not request_id or len(request_id)>64 or not re.fullmatch(r'[A-Za-z0-9._-]+',request_id):
+        request_id=secrets.token_hex(8)
     started=time.perf_counter()
     try:
         response=await call_next(request)
