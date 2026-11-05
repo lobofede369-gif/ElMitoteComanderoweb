@@ -226,6 +226,7 @@ def preparation_tickets(db: Session = Depends(db_session), user: User = Depends(
     config = policy(db)
     warning_pct = config.warning_percent if config else 80
     default_batch_minutes = config.batch_minutes if config else 25
+    stamp = now()
 
     output = []
     for ticket in tickets:
