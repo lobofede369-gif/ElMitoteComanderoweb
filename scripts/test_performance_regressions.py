@@ -164,7 +164,7 @@ try:
             event.remove(app.engine, "before_cursor_execute", count_selects)
         assert response.status_code == 200, response.text
         user_rows = response.json()
-        assert len(user_rows) == 13, len(user_rows)
+        assert len(user_rows) == 14, len(user_rows)
         assert all(next(row for row in user_rows if row["id"] == staff_id)["has_pin"]
                    for staff_id in staff_ids)
         assert len(statements) <= 4, (
