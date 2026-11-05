@@ -2,7 +2,7 @@
 const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
 const savedToken=localStorage.getItem('mitote-token')||sessionStorage.getItem('mitote-token')||'';
 if(savedToken)localStorage.setItem('mitote-token',savedToken);
-const state={token:savedToken,user:null,screen:'',account:null,draft:[],products:[],data:{},lastRefresh:0,alarmTimer:null,audio:null,alarmArmed:false,navStack:[],renderSeq:0,pendingRefresh:false,waiterReadyInitialized:false,waiterReadySeen:new Set(),waiterReadyBusy:false,waiterReadyPending:false};
+const state={token:savedToken,user:null,screen:'',account:null,draft:[],products:[],data:{},apiInflight:new Map(),lastRefresh:0,alarmTimer:null,audio:null,alarmArmed:false,navStack:[],renderSeq:0,pendingRefresh:false,waiterReadyInitialized:false,waiterReadySeen:new Set(),waiterReadyBusy:false,waiterReadyPending:false};
 const workKey=()=>state.user?`mitote-work-${state.user.id}`:'';
 function persistWorkState(){if(!state.user)return;try{localStorage.setItem(workKey(),JSON.stringify({account:state.account,draft:state.draft}));}catch{}}
 function restoreWorkState(){if(!state.user)return;try{const saved=JSON.parse(localStorage.getItem(workKey())||'{}');state.account=Number(saved.account)||null;state.draft=Array.isArray(saved.draft)?saved.draft.filter(x=>x&&Number.isInteger(Number(x.product_id))&&Number(x.qty)>0).map(x=>({product_id:Number(x.product_id),name:String(x.name||''),station:x.station==='bar'?'bar':'kitchen',qty:Math.min(100,Number(x.qty)),note:String(x.note||'').slice(0,300),variant_id:x.variant_id?Number(x.variant_id):null,variant_name:String(x.variant_name||''),modifier_option_ids:Array.isArray(x.modifier_option_ids)?x.modifier_option_ids.map(Number):[],modifier_names:Array.isArray(x.modifier_names)?x.modifier_names.map(String):[],prep_minutes:Math.max(0,Math.min(240,Number(x.prep_minutes??15))),release_after_minutes:Math.max(0,Math.min(240,Number(x.release_after_minutes??0))),unit_price:Number(x.unit_price)||0,promotion_name:String(x.promotion_name||'')})):[];}catch{state.account=null;state.draft=[];}}
@@ -46,7 +46,49 @@ async function refreshSessionIfNeeded(){
   try{await refreshPromise}catch(e){if(e?.authExpired)throw e;/* Si el servidor falla temporalmente, intenta la operación con el token actual. */}finally{refreshPromise=null}
 }
 async function api(path,method='GET',body){
-  if(path!=='/auth/refresh')await refreshSessionIfNeeded();if(!navigator.onLine&&method!=='GET')throw Error('Sin conexión: operación bloqueada para evitar duplicados');const r=await fetch('/api'+path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer '+state.token},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});let data={};try{data=await r.json()}catch{}if(r.status===401){logout('expired');throw Error('Tu sesión venció o fue revocada. Vuelve a iniciar sesión.')}if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:'Error al procesar la operación');return data}
+  const verb=String(method||'GET').toUpperCase();
+  if(path!=='/auth/refresh')await refreshSessionIfNeeded();
+  if(!navigator.onLine&&verb!=='GET')throw Error('Sin conexión: operación bloqueada para evitar duplicados');
+
+  const requestKey=String(state.user?.id||'session')+':'+path;
+  if(verb==='GET'){
+    const pending=state.apiInflight.get(requestKey);
+    if(pending)return pending;
+  }
+
+  const request=(async()=>{
+    let response;
+    try{
+      response=await fetch('/api'+path,{
+        method:verb,
+        headers:{'Content-Type':'application/json',Authorization:'Bearer '+state.token},
+        body:body===undefined?undefined:JSON.stringify(body),
+        cache:'no-store'
+      });
+    }catch(error){
+      setConnectionState(false);
+      throw Error(verb==='GET'
+        ?'No se pudo conectar con el servidor. Revisa Internet e inténtalo de nuevo.'
+        :'No se confirmó la operación. Verifica la cuenta antes de repetir para evitar duplicados.');
+    }
+    let data={};try{data=await response.json()}catch{}
+    if(response.status===401){
+      logout('expired');
+      throw Error('Tu sesión venció o fue revocada. Vuelve a iniciar sesión.');
+    }
+    setConnectionState(true);
+    if(!response.ok)throw Error(typeof data.detail==='string'?data.detail:'Error al procesar la operación');
+    return data;
+  })();
+
+  if(verb!=='GET')return request;
+  state.apiInflight.set(requestKey,request);
+  try{
+    return await request;
+  }finally{
+    if(state.apiInflight.get(requestKey)===request)state.apiInflight.delete(requestKey);
+  }
+}
 async function fetchProtectedPdf(url){
   await refreshSessionIfNeeded();
   if(!navigator.onLine)throw Error('Se necesita internet para descargar cortes.');
@@ -126,6 +168,7 @@ function logout(reason='manual'){
   }).catch(()=>{});}
   if(reason==='manual'&&window.MitoteAndroid){try{window.MitoteAndroid.clearSession()}catch(e){}}
   if(reason==='manual'&&state.user){try{localStorage.removeItem(workKey())}catch{}}
+  state.apiInflight.clear();
   state.token='';state.user=null;state.screen='';state.navStack=[];state.waiterReadyInitialized=false;state.waiterReadySeen=new Set();
   localStorage.removeItem('mitote-token');sessionStorage.removeItem('mitote-token');localStorage.removeItem('mitote-screen');
   $('#app').hidden=true;$('#login').hidden=false;stopAlarm();
@@ -174,6 +217,8 @@ async function render(options={}){
   const area=$('#content');
   const screen=state.screen;
   const seq=++state.renderSeq;
+  // Las lecturas de una pantalla anterior no deben bloquear ni contaminar la nueva.
+  state.apiInflight.clear();
   const preserveScroll=options.preserveScroll!==false;
   const scrollY=window.scrollY||0;
   persistWorkState();
