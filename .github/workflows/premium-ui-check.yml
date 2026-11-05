@@ -41,7 +41,9 @@ jobs:
           sw = Path('static/sw.js').read_text(encoding='utf-8')
           assert '/static/theme-obsidian-titanium.css?v=1' in html
           assert '/static/theme-obsidian-modules.css?v=2' in html
-          assert '/static/app.js?v=21' in html
+          assert '/static/app.js?v=22' in html
+          assert '/static/app.js?v=22' in sw
+          assert "syncWaiterReadyAlerts" in app
           assert '/static/cash-receipt.css?v=1' in html
           assert '/static/cash-receipt.css?v=1' in sw
           assert '/static/features.js?v=2' in html
@@ -55,7 +57,7 @@ jobs:
           waiter = Path('static/pos-ui-v3.js').read_text(encoding='utf-8')
           assert '/static/theme-service-fast.css?v=1' in html
           assert '/static/theme-service-fast.css?v=1' in sw
-          assert 'mitote-comandas-v25' in sw
+          assert 'mitote-comandas-v26' in sw
           assert 'pos-search' in waiter and 'applyCatalogFilter()' in waiter
           assert 'obs.observe(content,{childList:true});' in waiter
           assert 'subtree:true' not in waiter
@@ -105,6 +107,7 @@ jobs:
           python -m scripts.test_new_features
           python -m scripts.test_cash_cut_archive
           python -m scripts.test_cash_receipt
+          python -m scripts.test_waiter_notifications
           python -m scripts.test_menu_photo
           python -m scripts.test_owner_one_time
           python -m scripts.test_photo_menu_approved
