@@ -102,6 +102,7 @@ jobs:
       - name: Validar API y roles con SQLite temporal
         run: |
           python -m scripts.test_owner_permissions
+          python -m scripts.test_performance_regressions
           python -m scripts.test_pin_login
           python -m scripts.test_audit_regressions
           python -m scripts.test_new_features
