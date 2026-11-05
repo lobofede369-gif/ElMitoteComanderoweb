@@ -16,3 +16,7 @@
 .prep-bar-track>div{height:100%;border-radius:8px;background:linear-gradient(90deg,#c08b29,#f5d675)}
 .prep-bar-row b{text-align:right;font-variant-numeric:tabular-nums}
 @media(max-width:460px){.prep-bar-row{grid-template-columns:65px minmax(10px,1fr) 82px;font-size:.74rem}}
+
+
+/* Operación integral: cronómetros programados, alertas y modo sin conexión. */
+.prep-clock-queued{color:#e5b84b;font-weight:800;letter-spacing:.01em}.prep-flag.prep-scheduled{border-color:rgba(229,184,75,.45);color:#f1cf7c;background:rgba(229,184,75,.10)}.owner-live-panel{display:grid;gap:14px;margin:12px 0 20px}.owner-alert-grid{margin-top:0}.owner-alert-grid .card{min-width:0}.connection.offline{color:#ff7188!important;border-color:rgba(255,113,136,.45)!important}.inventory-cost-form{margin-top:10px}.inventory-movement{border-bottom:1px solid rgba(255,255,255,.08);padding:10px 0}.inventory-movement:last-child{border-bottom:0}
