@@ -2251,7 +2251,17 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         prepared.append({'line':line,'product':p,'variant':variant,'options':modifier_snapshot,
                          'base_cents':promo_base,'modifier_cents':modifier_cents,'final_cents':final_price,
                          'promo_name':promo.name if promo else ''})
-    batch=Batch(account_id=a.id,sent_by=user.id,client_key=data.client_key);db.add(batch);db.flush()
+    batch=Batch(account_id=a.id,sent_by=user.id,client_key=data.client_key);db.add(batch)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
+        if existing and existing.account_id==account_id:
+            return {'batch_id':existing.id,'duplicate':True}
+        if existing:
+            raise HTTPException(409,'Identificador de envío ya utilizado')
+        raise
     mitote_extensions.snapshot_batch_policy(db,batch.id)
     for row in prepared:
         line=row['line'];p=row['product'];variant=row['variant']
