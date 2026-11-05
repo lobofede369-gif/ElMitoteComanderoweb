@@ -235,6 +235,36 @@ try:
         )
         print(f"OK: 12 cuentas con {len(statements)} consultas SELECT; totales y mesa correctos.")
 
+        # Reintentar la creación tras una respuesta perdida no debe duplicar la cuenta.
+        create_payload = {"name": "Cuenta idempotente", "table_id": None}
+        create_key = uuid4().hex
+        first_create = client.post(
+            "/api/accounts", json={**create_payload, "client_key": create_key},
+            headers=headers,
+        )
+        assert first_create.status_code == 200, first_create.text
+        first_create_data = first_create.json()
+        assert first_create_data["duplicate"] is False, first_create_data
+        retry_create = client.post(
+            "/api/accounts", json={**create_payload, "client_key": create_key},
+            headers=headers,
+        )
+        assert retry_create.status_code == 200, retry_create.text
+        retry_data = retry_create.json()
+        assert retry_data["id"] == first_create_data["id"], retry_data
+        assert retry_data["duplicate"] is True, retry_data
+        changed_payload = {"name": "Cuenta idempotente modificada", "table_id": None}
+        changed_retry = client.post(
+            "/api/accounts", json={**changed_payload, "client_key": create_key},
+            headers=headers,
+        )
+        assert changed_retry.status_code == 409, changed_retry.text
+        with app.SessionLocal() as db:
+            created_count = db.scalar(app.select(app.func.count(app.Account.id)).where(
+                app.Account.name == "Cuenta idempotente"))
+            assert created_count == 1, created_count
+        print("OK: reintentos de apertura idempotentes; no duplica cuentas ni cambia el payload.")
+
         statements.clear()
         event.listen(app.engine, "before_cursor_execute", count_selects)
         try:
@@ -298,6 +328,9 @@ try:
             "async function refreshAccountPanel", 1
         )[0]
         assert "apiInflight:new Map()" in js
+        new_account_action = js.split("case 'new-account':", 1)[1].split("case 'reassign-form':", 1)[0]
+        assert "pendingOperationKey(scope,payload)" in new_account_action
+        assert "client_key" in new_account_action
         assert "state.apiInflight.clear()" in js
         assert "load-account-history" in account_detail
         assert "api(`/accounts/${id}/history`)" not in account_detail
