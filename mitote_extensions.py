@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app import (
     app, Base, Batch, Account, DiningTable, TableOccupancy, Product, ArchivedProduct, CashPeriod, OrderItem,
-    OrderItemMeta, StationTicket, Payment, PaymentTip, Audit, User,
+    OrderItemMeta, StationTicket, Payment, PaymentTip, Audit, User, ProductCost, OrderItemCost,
     SessionLocal, db_session, auth, allow, audit, active_period, TipDistribution, now, notify,
     push_to, fcm_to, ticket_status, StatusIn, amount
 )
@@ -198,18 +198,24 @@ def preparation_tickets(db: Session = Depends(db_session), user: User = Depends(
             if qty <= 0:
                 continue
             meta = db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id == item.id))
-            limit = meta.prep_minutes if meta else 15
+            limit = max(1, meta.prep_minutes if meta else 15)
+            release_after = max(0, meta.release_after_minutes if meta else 0)
+            item_start = aware(batch.created_at) + timedelta(minutes=release_after)
             completion = get_item_completion(db, item.id, ticket)
-            elapsed = elapsed_seconds(batch.created_at, completion or stamp)
+            elapsed = elapsed_seconds(item_start, completion or stamp)
+            scheduled = completion is None and aware(stamp) < item_start
+            timing = ("ready" if completion else "scheduled" if scheduled else
+                      "late" if elapsed > limit * 60 else
+                      "warning" if elapsed >= limit * 60 * warning_pct / 100 else "ok")
             items.append({
                 "id": item.id, "name": item.name, "qty": qty, "note": item.note,
                 "variant_name": meta.variant_name if meta else "",
                 "modifiers": json.loads(meta.modifiers_json or "[]") if meta else [],
-                "prep_minutes": max(1, limit), "ready": bool(completion),
+                "prep_minutes": limit, "ready": bool(completion),
                 "ready_at": aware(completion).isoformat() if completion else None,
-                "elapsed_seconds": elapsed,
-                "timing": "ready" if completion else "late" if elapsed > limit * 60
-                           else "warning" if elapsed >= limit * 60 * warning_pct / 100 else "ok",
+                "started_at": item_start.isoformat(),
+                "release_after_minutes": release_after,
+                "elapsed_seconds": elapsed, "timing": timing,
             })
         other_tickets = db.scalars(select(StationTicket).where(StationTicket.batch_id == batch.id)).all()
         batch_ready = all(t.status == "ready" for t in other_tickets)
@@ -454,17 +460,43 @@ def owner_analytics(start: date, end: date, scope: Literal["current","history"] 
     batches = db.scalars(batches_query).all() if scope == "history" or active else []
     batch_ids = [b.id for b in batches]
     products = {}
+    total_quantity = 0
+    costed_quantity = 0
+    cost_cents_total = 0
+    costed_gross_cents_total = 0
     if batch_ids:
-        for item in db.scalars(select(OrderItem).where(OrderItem.batch_id.in_(batch_ids))):
+        items = db.scalars(select(OrderItem).where(OrderItem.batch_id.in_(batch_ids))).all()
+        item_ids = [item.id for item in items]
+        cost_rows = db.scalars(select(OrderItemCost).where(OrderItemCost.order_item_id.in_(item_ids))).all() if item_ids else []
+        costs_by_item = {row.order_item_id: row for row in cost_rows}
+        for item in items:
             qty = max(0, item.qty - item.cancelled_qty)
-            if qty:
-                row = products.setdefault(item.product_id, {"product_id": item.product_id, "name": item.name,
-                    "quantity": 0, "estimated_gross_cents": 0})
-                row["quantity"] += qty
-                row["estimated_gross_cents"] += qty * item.price_cents
+            if not qty:
+                continue
+            total_quantity += qty
+            row = products.setdefault(item.product_id, {"product_id": item.product_id, "name": item.name,
+                "quantity": 0, "estimated_gross_cents": 0, "estimated_cost_cents": 0,
+                "costed_quantity": 0, "costed_gross_cents": 0})
+            row["quantity"] += qty
+            row["estimated_gross_cents"] += qty * item.price_cents
+            snapshot = costs_by_item.get(item.id)
+            if snapshot:
+                item_cost = qty * snapshot.unit_cost_cents
+                row["estimated_cost_cents"] += item_cost
+                row["costed_quantity"] += qty
+                row["costed_gross_cents"] += qty * item.price_cents
+                cost_cents_total += item_cost
+                costed_gross_cents_total += qty * item.price_cents
+                costed_quantity += qty
     product_rank = sorted(products.values(), key=lambda x: (-x["quantity"], x["name"]))[:15]
     for product in product_rank:
+        costed_gross = product.pop("costed_gross_cents")
+        costed_cost = product.pop("estimated_cost_cents")
+        covered = product.pop("costed_quantity")
         product["estimated_gross"] = amount(product.pop("estimated_gross_cents"))
+        product["cost_coverage_percent"] = round(covered / product["quantity"] * 100, 1) if product["quantity"] else 0
+        product["estimated_cost"] = amount(costed_cost) if covered else None
+        product["estimated_gross_profit"] = amount(costed_gross - costed_cost) if covered else None
     ticket_query = select(StationTicket).where(
         StationTicket.ready_at >= begin, StationTicket.ready_at < finish,
         StationTicket.status == "ready")
@@ -497,8 +529,13 @@ def owner_analytics(start: date, end: date, scope: Literal["current","history"] 
         "products": product_rank, "prep_avg_minutes": prep_average,
         "completed_station_tickets": len(prep_samples),
         "table_rotation": [{"table": k, "accounts_opened": v} for k, v in sorted(rotation.items())],
-        "costs_available": False,
-        "note": "Propinas excluidas. Productos por fecha de comanda y cobros por fecha de pago; no son importes equivalentes.",
+        "costs_available": costed_quantity > 0,
+        "estimated_cost": amount(cost_cents_total) if costed_quantity else None,
+        "estimated_gross_profit": amount(costed_gross_cents_total - cost_cents_total) if costed_quantity else None,
+        "estimated_margin_percent": round((costed_gross_cents_total - cost_cents_total) / costed_gross_cents_total * 100, 1) if costed_gross_cents_total else None,
+        "cost_coverage_percent": round(costed_quantity / total_quantity * 100, 1) if total_quantity else 0,
+        "costed_quantity": costed_quantity, "total_quantity": total_quantity,
+        "note": "Propinas excluidas. La utilidad bruta solo cubre unidades con costo unitario capturado; no incluye nómina, renta, servicios ni otros gastos. Productos por fecha de comanda y cobros por fecha de pago; no son importes equivalentes.",
     }
 
 
@@ -535,8 +572,10 @@ async def prep_alert_worker():
                         if item.qty <= item.cancelled_qty or get_item_completion(db, item.id, ticket):
                             continue
                         meta = db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id == item.id))
-                        product_limit = meta.prep_minutes if meta else 15
-                        if seconds <= max(1, product_limit) * 60:
+                        product_limit = max(1, meta.prep_minutes if meta else 15)
+                        item_start = aware(batch.created_at) + timedelta(minutes=max(0, meta.release_after_minutes if meta else 0))
+                        item_seconds = elapsed_seconds(item_start, stamp)
+                        if aware(stamp) < item_start or item_seconds <= product_limit * 60:
                             continue
                         key = f"item:{item.id}"
                         if db.scalar(select(PrepAlert.id).where(PrepAlert.alert_key == key)):
@@ -550,11 +589,12 @@ async def prep_alert_worker():
             for station, body, key in outgoing:
                 payload = {"title": "El Mitote · Retraso de preparación",
                            "body": body, "url": "/?push=station", "tag": f"mitote-delay-{key}"}
-                try:
-                    await push_to(payload, role=station)
-                    await fcm_to(payload, role=station)
-                except Exception:
-                    LOG.exception("No se pudo enviar aviso de demora %s", key)
+                for recipient_role in (station, "owner", "admin"):
+                    try:
+                        await push_to(payload, role=recipient_role)
+                        await fcm_to(payload, role=recipient_role)
+                    except Exception:
+                        LOG.exception("No se pudo enviar aviso de demora %s a %s", key, recipient_role)
         except asyncio.CancelledError:
             raise
         except Exception:

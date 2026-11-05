@@ -394,11 +394,7 @@ class FcmDevice(Base):
     updated_at = Column(DateTime(timezone=True), default=now, nullable=False)
 
 class ReadyNotificationEvent(Base):
-    """Registro persistente de aviso por estación y por comanda.
-
-    Se registra en la MISMA transacción que la transición a READY, de modo que
-    si Render se reinicia el aviso sigue en PostgreSQL.
-    """
+    """Evento persistente e idempotente de pedido listo, dirigido al mesero asignado."""
     __tablename__ = 'ready_notification_events'
     id = Column(Integer, primary_key=True)
     event_key = Column(String(90), nullable=False, unique=True)
@@ -411,6 +407,66 @@ class ReadyNotificationEvent(Base):
     created_at = Column(DateTime(timezone=True), default=now, nullable=False)
     attempted_at = Column(DateTime(timezone=True), nullable=True)
     acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ReadyNotificationDelivery(Base):
+    """Outbox por canal: reintenta fallos y evita perder eventos tras reinicios."""
+    __tablename__ = 'ready_notification_deliveries'
+    id = Column(Integer, primary_key=True)
+    event_id = Column(Integer, ForeignKey('ready_notification_events.id'), nullable=False, index=True)
+    channel = Column(String(12), nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    next_attempt_at = Column(DateTime(timezone=True), default=now, nullable=False, index=True)
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(300), default='', nullable=False)
+    __table_args__ = (UniqueConstraint('event_id', 'channel'),)
+
+
+def ensure_ready_delivery_rows(db, event):
+    for channel in ('webpush', 'fcm'):
+        row = db.scalar(select(ReadyNotificationDelivery).where(
+            ReadyNotificationDelivery.event_id == event.id,
+            ReadyNotificationDelivery.channel == channel))
+        if row is None:
+            db.add(ReadyNotificationDelivery(
+                event_id=event.id, channel=channel, next_attempt_at=now()))
+
+class InventoryMovement(Base):
+    """Kardex inmutable de existencias: entradas, ventas, mermas y ajustes."""
+    __tablename__='inventory_movements'
+    id=Column(Integer,primary_key=True)
+    movement_key=Column(String(120),nullable=False,unique=True)
+    product_id=Column(Integer,ForeignKey('products.id'),nullable=False,index=True)
+    period_id=Column(Integer,ForeignKey('cash_periods.id'),nullable=True,index=True)
+    actor_id=Column(Integer,ForeignKey('users.id'),nullable=True)
+    kind=Column(String(16),nullable=False)
+    delta=Column(Integer,nullable=False)
+    before_stock=Column(Integer,nullable=False)
+    after_stock=Column(Integer,nullable=False)
+    reason=Column(String(400),nullable=False)
+    batch_id=Column(Integer,ForeignKey('batches.id'),nullable=True,index=True)
+    created_at=Column(DateTime(timezone=True),default=now,nullable=False)
+
+
+class ProductCost(Base):
+    """Costo unitario vigente capturado por administración."""
+    __tablename__='product_costs'
+    product_id=Column(Integer,ForeignKey('products.id'),primary_key=True)
+    unit_cost_cents=Column(Integer,nullable=False)
+    updated_by=Column(Integer,ForeignKey('users.id'),nullable=False)
+    updated_at=Column(DateTime(timezone=True),default=now,nullable=False)
+
+
+class OrderItemCost(Base):
+    """Instantánea del costo unitario al enviar la comanda; no cambia retroactivamente."""
+    __tablename__='order_item_costs'
+    order_item_id=Column(Integer,ForeignKey('order_items.id'),primary_key=True)
+    product_id=Column(Integer,ForeignKey('products.id'),nullable=False,index=True)
+    unit_cost_cents=Column(Integer,nullable=False)
+    created_at=Column(DateTime(timezone=True),default=now,nullable=False)
+
 
 class Audit(Base):
     __tablename__='audit'
@@ -477,54 +533,162 @@ def bootstrap():
                     ticket_id=ticket.id,batch_id=batch.id,account_id=account.id,
                     waiter_id=account.owner_id,station=ticket.station,complete=complete,
                     created_at=ticket.ready_at or now(),attempted_at=now()))
+        # Reanudar eventos antiguos que aún no habían iniciado su envío.
+        legacy_pending = db.scalars(select(ReadyNotificationEvent).where(
+            ReadyNotificationEvent.attempted_at.is_(None),
+            ReadyNotificationEvent.acknowledged_at.is_(None))).all()
+        for event in legacy_pending:
+            ensure_ready_delivery_rows(db, event)
         # Solo aplica menú cuando exista la aprobación explícita en Render.
         menu_photo_import.apply_approved_photo_menu_at_startup(db)
         db.commit()
 
-async def dispatch_ready_notification(event_id:int):
-    """Intenta enviar Web Push y FCM; la consulta del mesero es el respaldo durable."""
+def ready_retry_delay(attempts:int) -> timedelta:
+    """Backoff exponencial acotado: 20 s, 40 s... hasta 15 minutos."""
+    return timedelta(seconds=min(900, 20 * (2 ** min(max(attempts - 1, 0), 6))))
+
+
+def delivery_was_accepted(result) -> bool:
+    # None conserva compatibilidad con adaptadores de pruebas y conectores antiguos.
+    if result is None:
+        return True
+    return isinstance(result, dict) and int(result.get('accepted', 0) or 0) > 0
+
+
+async def dispatch_ready_delivery(delivery_id:int):
+    """Procesa un canal con bloqueo, reintento y persistencia del resultado."""
     with SessionLocal() as db:
-        row=db.execute(select(ReadyNotificationEvent).where(
-            ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
-        if not row or row.attempted_at is not None or row.acknowledged_at is not None:return
-        account=db.get(Account,row.account_id)
-        waiter=db.get(User,row.waiter_id)
-        if not account or not waiter or not waiter.active or waiter.role!='waiter':
+        candidate=db.get(ReadyNotificationDelivery, delivery_id)
+        if not candidate:
             return
-        # Marcar el intento ANTES del transporte evita notificaciones repetidas
-        # tras una ejecución concurrente. El evento siempre queda consultable.
-        row.attempted_at=now()
-        event_key=row.event_key
-        station_label='Cocina' if row.station=='kitchen' else 'Barra'
-        title='El Mitote · Pedido completo' if row.complete else f'El Mitote · {station_label} lista'
-        body=(f'Pedido completo para {account.name} · comanda #{row.batch_id}. ¡Listo para entregar!'
-              if row.complete else f'{station_label} terminó {account.name} · comanda #{row.batch_id}.')
+        event_id=candidate.event_id
+        event_ref=db.get(ReadyNotificationEvent, event_id)
+        if not event_ref:
+            candidate.resolved_at=now()
+            db.commit()
+            return
+        # El mismo orden de bloqueo que la reasignación evita carreras de destinatario.
+        account=db.execute(select(Account).where(
+            Account.id==event_ref.account_id).with_for_update()).scalar_one_or_none()
+        event=db.execute(select(ReadyNotificationEvent).where(
+            ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
+        row=db.execute(select(ReadyNotificationDelivery).where(
+            ReadyNotificationDelivery.id==delivery_id,
+            ReadyNotificationDelivery.resolved_at.is_(None),
+            ReadyNotificationDelivery.accepted_at.is_(None),
+            ReadyNotificationDelivery.next_attempt_at<=now()
+        ).with_for_update()).scalar_one_or_none()
+        if not row or not event:
+            return
+        if event.acknowledged_at is not None or not account or account.status not in ('open','pending'):
+            row.resolved_at=now()
+            db.commit()
+            return
+        if account.owner_id != event.waiter_id:
+            event.waiter_id=account.owner_id
+            event.attempted_at=None
+            row.attempts=0
+            row.accepted_at=None
+            row.resolved_at=None
+            row.last_error=''
+        waiter=db.get(User, account.owner_id)
+        if not waiter or not waiter.active or waiter.role!='waiter':
+            row.attempts+=1
+            row.last_attempt_at=now()
+            row.next_attempt_at=now()+ready_retry_delay(row.attempts)
+            row.last_error='La cuenta no tiene un mesero activo asignado'
+            db.commit()
+            return
+        event_key=event.event_key
+        station_label='Cocina' if event.station=='kitchen' else 'Barra'
+        title='El Mitote · Pedido completo' if event.complete else f'El Mitote · {station_label} lista'
+        body=(f'Pedido completo para {account.name} · comanda #{event.batch_id}. ¡Listo para entregar!'
+              if event.complete else f'{station_label} terminó {account.name} · comanda #{event.batch_id}.')
         payload={'title':title,'body':body,
                  'url':f'/?push=accounts&account={account.id}',
-                 'kind':'ready_complete' if row.complete else 'ready_station',
-                 'tag':f'mitote-{event_key}','event_id':event_key}
-        recipient=row.waiter_id
+                 'kind':'ready_complete' if event.complete else 'ready_station',
+                 'tag':f'mitote-{event_key}','event_id':event_key,
+                 'recipient_id':str(waiter.id)}
+        channel=row.channel
+        recipient=waiter.id
+        row.attempts+=1
+        row.last_attempt_at=now()
+        row.next_attempt_at=now()+ready_retry_delay(row.attempts)
         db.commit()
-    await push_to(payload,role='waiter',user_id=recipient)
-    await fcm_to(payload,role='waiter',user_id=recipient)
+
+    try:
+        result = (await push_to(payload,role='waiter',user_id=recipient)
+                  if channel=='webpush' else
+                  await fcm_to(payload,role='waiter',user_id=recipient))
+        accepted=delivery_was_accepted(result)
+        detail=''
+        if not accepted:
+            if isinstance(result,dict):
+                if not result.get('enabled',True):
+                    detail='Canal de notificación no configurado'
+                elif not result.get('registered',0):
+                    detail='No hay dispositivos registrados para el mesero'
+                else:
+                    detail='El proveedor no aceptó el envío'
+            else:
+                detail='No se pudo confirmar la aceptación del proveedor'
+    except Exception as exc:
+        accepted=False
+        detail=f'Error de transporte: {type(exc).__name__}'
+
+    with SessionLocal() as db:
+        row=db.execute(select(ReadyNotificationDelivery).where(
+            ReadyNotificationDelivery.id==delivery_id).with_for_update()).scalar_one_or_none()
+        if not row or row.resolved_at is not None:
+            return
+        event=db.get(ReadyNotificationEvent,row.event_id)
+        if event and event.attempted_at is None:
+            event.attempted_at=now()
+        if accepted:
+            row.accepted_at=now()
+            row.last_error=''
+        else:
+            row.last_error=detail[:300]
+        db.commit()
+
+
+async def dispatch_ready_notification(event_id:int):
+    """Despacha los canales pendientes sin bloquear ni perder el evento persistido."""
+    with SessionLocal() as db:
+        event=db.get(ReadyNotificationEvent,event_id)
+        if not event or event.acknowledged_at is not None:
+            return
+        ensure_ready_delivery_rows(db,event)
+        db.flush()
+        ids=db.scalars(select(ReadyNotificationDelivery.id).where(
+            ReadyNotificationDelivery.event_id==event_id,
+            ReadyNotificationDelivery.resolved_at.is_(None),
+            ReadyNotificationDelivery.accepted_at.is_(None),
+            ReadyNotificationDelivery.next_attempt_at<=now()
+        ).order_by(ReadyNotificationDelivery.channel)).all()
+        db.commit()
+    for delivery_id in ids:
+        await dispatch_ready_delivery(delivery_id)
 
 
 async def ready_notification_outbox_worker():
-    """Reanuda avisos confirmados en BD cuya entrega no alcanzó a iniciar."""
+    """Reintenta cada canal hasta que el proveedor lo acepte o el mesero confirme."""
     while True:
-        await asyncio.sleep(25)
+        await asyncio.sleep(10)
         try:
             with SessionLocal() as db:
-                ids=db.scalars(select(ReadyNotificationEvent.id).where(
-                    ReadyNotificationEvent.attempted_at.is_(None),
-                    ReadyNotificationEvent.acknowledged_at.is_(None)
-                ).order_by(ReadyNotificationEvent.id).limit(40)).all()
-            for event_id in ids:
-                await dispatch_ready_notification(event_id)
+                ids=db.scalars(select(ReadyNotificationDelivery.id).where(
+                    ReadyNotificationDelivery.resolved_at.is_(None),
+                    ReadyNotificationDelivery.accepted_at.is_(None),
+                    ReadyNotificationDelivery.next_attempt_at<=now()
+                ).order_by(ReadyNotificationDelivery.next_attempt_at,
+                           ReadyNotificationDelivery.id).limit(50)).all()
+            for delivery_id in ids:
+                await dispatch_ready_delivery(delivery_id)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception('Error reanudando avisos de pedidos listos')
+            log.exception('Error reanudando entregas de pedidos listos')
 
 
 @asynccontextmanager
@@ -805,6 +969,7 @@ def push_subscribe(data:PushSubscribeIn,db:Session=Depends(db_session),user:User
         row.user_id=user.id;row.p256dh=data.keys.p256dh;row.auth_key=data.keys.auth
     else:
         db.add(PushDevice(user_id=user.id,endpoint=data.endpoint,p256dh=data.keys.p256dh,auth_key=data.keys.auth))
+    wake_ready_deliveries(db,user.id,'webpush')
     db.commit()
     return {'ok':True}
 
@@ -815,6 +980,18 @@ def push_unsubscribe(data:PushUnsubscribeIn,db:Session=Depends(db_session),user:
     if row:db.delete(row);db.commit()
     return {'ok':True}
 
+def wake_ready_deliveries(db, user_id:int, channel:str):
+    rows=db.scalars(select(ReadyNotificationDelivery).join(
+        ReadyNotificationEvent,ReadyNotificationEvent.id==ReadyNotificationDelivery.event_id
+    ).where(ReadyNotificationEvent.waiter_id==user_id,
+            ReadyNotificationEvent.acknowledged_at.is_(None),
+            ReadyNotificationDelivery.channel==channel,
+            ReadyNotificationDelivery.accepted_at.is_(None),
+            ReadyNotificationDelivery.resolved_at.is_(None))).all()
+    for row in rows:
+        row.next_attempt_at=now()
+
+
 def _push_one(row,payload):
     try:
         webpush(subscription_info={'endpoint':row['endpoint'],
@@ -822,16 +999,18 @@ def _push_one(row,payload):
                 data=json.dumps(payload,ensure_ascii=False),
                 vapid_private_key=VAPID_PRIVATE_KEY,
                 vapid_claims={'sub':VAPID_SUBJECT},ttl=600,timeout=5)
-        return None
+        return True
     except WebPushException as exc:
         if exc.status_code in (404,410):return row['id']
         log.warning('Fallo push id=%s codigo=%s',row['id'],exc.status_code)
     except Exception:
         log.exception('Error de notificación push id=%s',row['id'])
-    return None
+    return False
+
 
 async def push_to(payload,role=None,user_id=None):
-    if not PUSH_ENABLED:return
+    if not PUSH_ENABLED:
+        return {'enabled':False,'registered':0,'accepted':0,'failed':0}
     try:
         with SessionLocal() as db:
             q=select(PushDevice).join(User,PushDevice.user_id==User.id).where(User.active.is_(True))
@@ -839,17 +1018,24 @@ async def push_to(payload,role=None,user_id=None):
             if user_id:q=q.where(User.id==user_id)
             rows=[{'id':d.id,'endpoint':d.endpoint,'p256dh':d.p256dh,'auth_key':d.auth_key}
                   for d in db.scalars(q)]
-        if not rows:return
+        if not rows:
+            return {'enabled':True,'registered':0,'accepted':0,'failed':0}
         results=await asyncio.gather(*(asyncio.to_thread(_push_one,r,payload) for r in rows),return_exceptions=True)
-        expired=[x for x in results if isinstance(x,int)]
+        expired=[x for x in results if isinstance(x,int) and not isinstance(x,bool)]
         if expired:
             with SessionLocal() as db:
                 for rid in expired:
                     d=db.get(PushDevice,rid)
                     if d:db.delete(d)
                 db.commit()
-    except Exception:
+        return {'enabled':True,'registered':len(rows),
+                'accepted':sum(x is True for x in results),
+                'failed':sum(x is False or isinstance(x,BaseException) for x in results),
+                'expired':len(expired)}
+    except Exception as exc:
         log.exception('No se pudieron distribuir notificaciones push')
+        return {'enabled':True,'registered':0,'accepted':0,'failed':1,
+                'error':type(exc).__name__}
 
 @app.post('/api/push/test')
 async def push_test(user:User=Depends(auth)):
@@ -876,6 +1062,7 @@ def fcm_register(data: FcmTokenIn, db: Session = Depends(db_session), user: User
         device.updated_at = now()
     else:
         db.add(FcmDevice(user_id=user.id, token=data.token))
+    wake_ready_deliveries(db,user.id,'fcm')
     db.commit()
     return {'ok': True}
 
@@ -896,21 +1083,23 @@ def _fcm_send_one(device, payload):
               'route': route,
               'kind': str(payload.get('kind','general'))[:32],
               'tag': str(payload.get('tag','mitote-aviso'))[:100],
-              'event_id': str(payload.get('event_id',''))[:90]},
+              'event_id': str(payload.get('event_id',''))[:90],
+              'recipient_id': str(payload.get('recipient_id',''))[:20]},
         android=messaging.AndroidConfig(priority='high', ttl=timedelta(minutes=10))
     )
     try:
         messaging.send(msg)
-        return None
+        return True
     except Exception as exc:
         if isinstance(exc, getattr(messaging, 'UnregisteredError', type(None))):
             return device['id']
         log.warning('FCM no pudo entregar al dispositivo %s: %s', device['id'], type(exc).__name__)
-        return None
+        return False
+
 
 async def fcm_to(payload, role=None, user_id=None):
     if not _firebase_ready():
-        return
+        return {'enabled':False,'registered':0,'accepted':0,'failed':0}
     try:
         with SessionLocal() as db:
             q = select(FcmDevice).join(User, FcmDevice.user_id == User.id).where(User.active.is_(True))
@@ -920,9 +1109,9 @@ async def fcm_to(payload, role=None, user_id=None):
                 q = q.where(User.id == user_id)
             devices = [{'id': x.id, 'token': x.token} for x in db.scalars(q)]
         if not devices:
-            return
+            return {'enabled':True,'registered':0,'accepted':0,'failed':0}
         results = await asyncio.gather(*(asyncio.to_thread(_fcm_send_one, d, payload) for d in devices), return_exceptions=True)
-        expired = [x for x in results if isinstance(x, int)]
+        expired = [x for x in results if isinstance(x, int) and not isinstance(x, bool)]
         if expired:
             with SessionLocal() as db:
                 for device_id in expired:
@@ -930,8 +1119,14 @@ async def fcm_to(payload, role=None, user_id=None):
                     if old:
                         db.delete(old)
                 db.commit()
-    except Exception:
+        return {'enabled':True,'registered':len(devices),
+                'accepted':sum(x is True for x in results),
+                'failed':sum(x is False or isinstance(x,BaseException) for x in results),
+                'expired':len(expired)}
+    except Exception as exc:
         log.exception('Fallo el envío FCM')
+        return {'enabled':True,'registered':0,'accepted':0,'failed':1,
+                'error':type(exc).__name__}
 
 @app.post('/api/fcm/test')
 async def fcm_test(db: Session = Depends(db_session), user: User = Depends(auth)):
@@ -1222,7 +1417,13 @@ async def toggle_product_promotion(promotion_id:int,data:ActiveToggleIn,db:Sessi
 async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
     p=Product(name=data.name.strip(),category=data.category.strip()[:80],station=data.station,price_cents=cents(data.price),active=data.active,blocked=data.blocked,inventory_enabled=data.inventory_enabled,stock=data.stock)
-    db.add(p);audit(db,user,'product.create',name=p.name);db.commit();await notify();return {'id':p.id}
+    db.add(p);db.flush()
+    if p.stock>0:
+        period_id=db.scalar(select(CashPeriod.id).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+        db.add(InventoryMovement(movement_key=f'initial:{p.id}',product_id=p.id,period_id=period_id,
+            actor_id=user.id,kind='initial',delta=p.stock,before_stock=0,after_stock=p.stock,
+            reason='Existencia inicial registrada al crear el producto'))
+    audit(db,user,'product.create',name=p.name,initial_stock=p.stock);db.commit();await notify();return {'id':p.id}
 @app.get('/api/products/archived')
 def archived_products(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
@@ -1270,7 +1471,13 @@ async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_sessi
     if data.expected_version is None or p.version != data.expected_version:
         raise HTTPException(409,'El producto o sus existencias cambiaron. Actualiza la pantalla antes de guardar')
     before=product_dict(p,db.get(Setting,1),db)
+    before_stock=p.stock
     p.name=data.name.strip();p.category=data.category.strip()[:80];p.station=data.station;p.price_cents=cents(data.price);p.active=data.active;p.blocked=data.blocked;p.inventory_enabled=data.inventory_enabled;p.stock=data.stock;p.version+=1
+    if p.stock!=before_stock:
+        period_id=db.scalar(select(CashPeriod.id).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+        db.add(InventoryMovement(movement_key='adjust:'+secrets.token_hex(16),product_id=p.id,period_id=period_id,
+            actor_id=user.id,kind='adjustment',delta=p.stock-before_stock,before_stock=before_stock,
+            after_stock=p.stock,reason='Ajuste manual desde la ficha del producto'))
     audit(db,user,'product.update',id=p.id,before=before,after=product_dict(p,db.get(Setting,1),db));db.commit();await notify();return {'ok':True}
 class RestockIn(BaseModel): delta:int=Field(gt=0,le=100000);reason:str=Field(min_length=3,max_length=400);expected_version:int
 @app.post('/api/products/{product_id}/restock')
@@ -1280,7 +1487,95 @@ async def restock(product_id:int,data:RestockIn,db:Session=Depends(db_session),u
     if not p:raise HTTPException(404,'Producto inexistente')
     if p.version!=data.expected_version:raise HTTPException(409,'Existencias cambiaron; actualiza la pantalla')
     before=p.stock;p.stock+=data.delta;p.version+=1
+    period_id=db.scalar(select(CashPeriod.id).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    db.add(InventoryMovement(movement_key='restock:'+secrets.token_hex(16),product_id=p.id,period_id=period_id,
+        actor_id=user.id,kind='restock',delta=data.delta,before_stock=before,after_stock=p.stock,reason=data.reason))
     audit(db,user,'inventory.restock',product_id=p.id,before=before,delta=data.delta,after=p.stock,reason=data.reason);db.commit();await notify();return {'stock':p.stock}
+
+class ProductCostIn(BaseModel):
+    unit_cost:Optional[Decimal]=Field(default=None,ge=0)
+
+
+@app.get('/api/inventory/costs')
+def inventory_costs(db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    rows=db.execute(select(Product,ProductCost).outerjoin(ProductCost,ProductCost.product_id==Product.id)
+        .outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id)
+        .where(ArchivedProduct.product_id.is_(None)).order_by(Product.category,Product.name)).all()
+    return [{'product_id':p.id,'name':p.name,
+             'unit_cost':amount(c.unit_cost_cents) if c else None,
+             'updated_at':c.updated_at.isoformat() if c and c.updated_at else None}
+            for p,c in rows]
+
+
+@app.put('/api/products/{product_id}/cost')
+async def set_product_cost(product_id:int,data:ProductCostIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    product=db.get(Product,product_id)
+    if not product:raise HTTPException(404,'Producto inexistente')
+    row=db.get(ProductCost,product_id)
+    if data.unit_cost is None:
+        if row:db.delete(row)
+        audit(db,user,'inventory.cost.clear',product_id=product_id,name=product.name)
+        db.commit();await notify()
+        return {'ok':True,'unit_cost':None}
+    value=cents(data.unit_cost)
+    if row is None:
+        row=ProductCost(product_id=product_id,unit_cost_cents=value,updated_by=user.id)
+        db.add(row)
+    else:
+        row.unit_cost_cents=value;row.updated_by=user.id;row.updated_at=now()
+    audit(db,user,'inventory.cost.update',product_id=product_id,name=product.name,unit_cost_cents=value)
+    db.commit();await notify()
+    return {'ok':True,'unit_cost':amount(value)}
+
+
+class InventoryWasteIn(BaseModel):
+    product_id:int=Field(gt=0)
+    quantity:int=Field(gt=0,le=10000)
+    reason:str=Field(min_length=3,max_length=400)
+    expected_version:int=Field(ge=1)
+
+
+@app.post('/api/inventory/waste')
+async def record_inventory_waste(data:InventoryWasteIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    product=db.execute(select(Product).where(Product.id==data.product_id).with_for_update()).scalar_one_or_none()
+    if not product:raise HTTPException(404,'Producto inexistente')
+    if product.version!=data.expected_version:raise HTTPException(409,'Las existencias cambiaron; actualiza antes de registrar la merma')
+    setting=db.get(Setting,1)
+    if not setting.inventory_on or not product.inventory_enabled:
+        raise HTTPException(409,'Activa el inventario general y el control individual del producto para registrar mermas')
+    if product.stock<data.quantity:raise HTTPException(409,'La merma supera las existencias registradas')
+    before=product.stock;product.stock-=data.quantity;product.version+=1
+    period_id=db.scalar(select(CashPeriod.id).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    db.add(InventoryMovement(movement_key='waste:'+secrets.token_hex(16),product_id=product.id,
+        period_id=period_id,actor_id=user.id,kind='waste',delta=-data.quantity,
+        before_stock=before,after_stock=product.stock,reason=data.reason.strip()))
+    audit(db,user,'inventory.waste',product_id=product.id,quantity=data.quantity,
+          before=before,after=product.stock,reason=data.reason.strip())
+    db.commit();await notify()
+    return {'ok':True,'stock':product.stock}
+
+
+@app.get('/api/inventory/movements')
+def inventory_movements(limit:int=100,period_id:Optional[int]=None,
+                        db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    query=select(InventoryMovement,Product,User).join(Product,Product.id==InventoryMovement.product_id).outerjoin(
+        User,User.id==InventoryMovement.actor_id)
+    if period_id is not None:query=query.where(InventoryMovement.period_id==period_id)
+    rows=db.execute(query.order_by(InventoryMovement.created_at.desc(),InventoryMovement.id.desc())
+        .limit(max(1,min(200,limit)))).all()
+    labels={'initial':'Existencia inicial','sale':'Venta por comanda','restock':'Reposición',
+            'waste':'Merma','adjustment':'Ajuste manual','return':'Devolución'}
+    return [{'id':m.id,'product_id':p.id,'product':p.name,'kind':m.kind,
+             'label':labels.get(m.kind,m.kind),'delta':m.delta,'before':m.before_stock,
+             'after':m.after_stock,'reason':m.reason,'batch_id':m.batch_id,
+             'period_id':m.period_id,'actor':u.display if u else 'Sistema',
+             'created_at':m.created_at.isoformat() if m.created_at else ''}
+            for m,p,u in rows]
+
 
 def dining_table_dict(db,t):
     occupancy=db.get(TableOccupancy,t.id)
@@ -1443,14 +1738,29 @@ async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session)
     dest=db.get(User,data.owner_id)
     if not dest or not dest.active or dest.role!='waiter':raise HTTPException(400,'El destino debe ser un mesero activo')
     old=a.owner_id;a.owner_id=dest.id
-    # Un aviso no confirmado debe seguir la cuenta hacia el nuevo mesero.
+    # Los avisos pendientes cambian de destinatario y vuelven a la cola de entrega.
     pending=db.scalars(select(ReadyNotificationEvent).where(
-        ReadyNotificationEvent.account_id==a.id,ReadyNotificationEvent.acknowledged_at.is_(None))).all()
+        ReadyNotificationEvent.account_id==a.id,
+        ReadyNotificationEvent.acknowledged_at.is_(None)).with_for_update()).all()
     for notice in pending:
         notice.waiter_id=dest.id
         notice.attempted_at=None
+        ensure_ready_delivery_rows(db,notice)
+        deliveries=db.scalars(select(ReadyNotificationDelivery).where(
+            ReadyNotificationDelivery.event_id==notice.id).with_for_update()).all()
+        for delivery in deliveries:
+            delivery.attempts=0
+            delivery.next_attempt_at=now()
+            delivery.last_attempt_at=None
+            delivery.accepted_at=None
+            delivery.resolved_at=None
+            delivery.last_error=''
     audit(db,user,'account.reassign',id=a.id,old=old,new=dest.id,reason=data.reason)
-    db.commit();await notify();return {'ok':True}
+    pending_ids=[notice.id for notice in pending]
+    db.commit();await notify()
+    for event_id in pending_ids:
+        await dispatch_ready_notification(event_id)
+    return {'ok':True}
 
 
 # --- Gestión avanzada de cuentas (Fase 2B) ---------------------------------
@@ -1839,7 +2149,7 @@ class OrderIn(BaseModel):
 @app.post('/api/accounts/{account_id}/orders')
 async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','waiter')
-    active_period(db)
+    period=active_period(db)
     existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
     if existing:
         if existing.account_id!=account_id:raise HTTPException(409,'Identificador de envío ya utilizado')
@@ -1900,9 +2210,17 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
             modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=mitote_extensions.product_prep_minutes(db,p.id,line.prep_minutes),
             release_after_minutes=line.release_after_minutes,promotion_name=row['promo_name'],
             base_price_cents=row['base_cents'],modifier_price_cents=row['modifier_cents']))
+        product_cost=db.get(ProductCost,p.id)
+        if product_cost:
+            db.add(OrderItemCost(order_item_id=item.id,product_id=p.id,unit_cost_cents=product_cost.unit_cost_cents))
     for pid,qty in need.items():
         p=products[pid]
-        if setting.inventory_on and p.inventory_enabled:p.stock-=qty;p.version+=1
+        if setting.inventory_on and p.inventory_enabled:
+            before=p.stock;p.stock-=qty;p.version+=1
+            db.add(InventoryMovement(movement_key=f'sale:{batch.id}:{pid}',product_id=p.id,
+                period_id=period.id,actor_id=user.id,kind='sale',delta=-qty,
+                before_stock=before,after_stock=p.stock,reason=f'Consumo por comanda #{batch.id}',
+                batch_id=batch.id))
     for station in stations:db.add(StationTicket(batch_id=batch.id,station=station))
     audit(db,user,'order.send',account_id=a.id,batch_id=batch.id,stations=sorted(stations),items=len(prepared))
     db.commit();await notify()
@@ -1996,7 +2314,12 @@ async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),u
                     raise HTTPException(409,'No se puede devolver stock: la preparación ya comenzó')
                 p=db.execute(select(Product).where(Product.id==item.product_id).with_for_update()).scalar_one()
                 s=db.get(Setting,1)
-                if s.inventory_on and p.inventory_enabled:p.stock+=r.qty;p.version+=1
+                if s.inventory_on and p.inventory_enabled:
+                    before=p.stock;p.stock+=r.qty;p.version+=1
+                    period_id=db.scalar(select(CashPeriod.id).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+                    db.add(InventoryMovement(movement_key=f'return:{r.id}',product_id=p.id,period_id=period_id,
+                        actor_id=user.id,kind='return',delta=r.qty,before_stock=before,after_stock=p.stock,
+                        reason=f'Devolución autorizada por cancelación #{r.id}',batch_id=item.batch_id))
     r.status='approved' if data.approve else 'rejected';r.decided_by=user.id
     audit(db,user,'approval.decide',id=r.id,approved=data.approve,return_stock=data.return_stock);db.commit();await notify();return {'ok':True}
 
@@ -2050,14 +2373,26 @@ def waiter_ready_alerts(db:Session=Depends(db_session),user:User=Depends(auth)):
 @app.post('/api/waiter/ready-alerts/{event_id}/ack')
 async def acknowledge_ready_alert(event_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'waiter')
+    candidate=db.get(ReadyNotificationEvent,event_id)
+    if not candidate:raise HTTPException(404,'Aviso no encontrado')
+    # Mantener el mismo orden de bloqueo que dispatch/reassign: cuenta, evento y entregas.
+    account=db.execute(select(Account).where(
+        Account.id==candidate.account_id).with_for_update()).scalar_one_or_none()
     row=db.execute(select(ReadyNotificationEvent).where(
         ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
     if not row:raise HTTPException(404,'Aviso no encontrado')
-    account=db.get(Account,row.account_id)
     if row.waiter_id!=user.id or not account or account.owner_id!=user.id:
         raise HTTPException(403,'Aviso no asignado a este mesero')
-    if row.acknowledged_at is not None:return {'ok':True,'duplicate':True}
+    deliveries=db.scalars(select(ReadyNotificationDelivery).where(
+        ReadyNotificationDelivery.event_id==row.id).with_for_update()).all()
+    if row.acknowledged_at is not None:
+        for delivery in deliveries:
+            delivery.resolved_at=delivery.resolved_at or now()
+        db.commit()
+        return {'ok':True,'duplicate':True}
     row.acknowledged_at=now()
+    for delivery in deliveries:
+        delivery.resolved_at=now()
     audit(db,user,'ready.ack',event_id=row.id,ticket_id=row.ticket_id,account_id=row.account_id)
     db.commit();await notify()
     return {'ok':True,'duplicate':False}
@@ -2092,6 +2427,7 @@ async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_sessio
             waiter_id=owner_id,station=station,complete=complete,
             created_at=t.ready_at)
         db.add(event);db.flush();event_id=event.id
+        ensure_ready_delivery_rows(db,event)
     db.commit();await notify()
     if event_id is not None:
         await dispatch_ready_notification(event_id)
