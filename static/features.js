@@ -5,9 +5,10 @@ function prepBadge(status){return '<span class="prep-flag prep-'+esc(status)+'">
 function clockNode(start,ready,limit){return '<span class="prep-clock" data-prep-start="'+esc(start||'')+'" data-prep-stop="'+esc(ready||'')+'" data-prep-limit="'+Number(limit||15)+'">—</span>'}
 let prepOffset=0;
 function tickPrepClocks(){
-  if(!document.querySelector('.prep-clock'))return;
+  const clocks=document.querySelectorAll('.prep-clock');
+  if(!clocks.length)return;
   const instant=Date.now()+prepOffset;
-  document.querySelectorAll('.prep-clock').forEach(el=>{
+  clocks.forEach(el=>{
     const start=Date.parse(el.dataset.prepStart||''),stop=Date.parse(el.dataset.prepStop||'');
     if(!Number.isFinite(start))return;
     const seconds=Math.max(0,Math.floor(((Number.isFinite(stop)?stop:instant)-start)/1000));
@@ -16,7 +17,19 @@ function tickPrepClocks(){
     el.classList.toggle('prep-clock-late',!Number.isFinite(stop)&&seconds>limit*60);
   });
 }
-setInterval(tickPrepClocks,1000);
+let prepClockTimer=null;
+function startPrepClock(){
+  if(document.hidden)return;
+  if(prepClockTimer===null)prepClockTimer=setInterval(tickPrepClocks,1000);
+  tickPrepClocks();
+}
+function stopPrepClock(){
+  if(prepClockTimer!==null){clearInterval(prepClockTimer);prepClockTimer=null;}
+}
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden)stopPrepClock();
+  else if(['station','history','tickets'].includes(state.screen))startPrepClock();
+});
 
 async function showPrepStation(history=false,all=false){
   const response=await api('/preparation/tickets');
@@ -42,7 +55,7 @@ async function showPrepStation(history=false,all=false){
     stat('Con demora',shown.filter(t=>t.batch_timing==='late').length)+'</div>'+
     (!history?'<div class="note">Cronómetros simultáneos por producto y por envío. Las nuevas adiciones a la cuenta comienzan un nuevo envío.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':'')+
     '<div class="cards">'+(cards||'<div class="empty">No hay comandas en esta sección.</div>')+'</div>';
-  requestAnimationFrame(tickPrepClocks);
+  requestAnimationFrame(startPrepClock);
   return html;
 }
 

@@ -2,7 +2,7 @@
 const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
 const savedToken=localStorage.getItem('mitote-token')||sessionStorage.getItem('mitote-token')||'';
 if(savedToken)localStorage.setItem('mitote-token',savedToken);
-const state={token:savedToken,user:null,screen:'',account:null,draft:[],products:[],data:{},lastRefresh:0,alarmTimer:null,audio:null,alarmArmed:false,navStack:[],renderSeq:0,pendingRefresh:false,waiterReadyInitialized:false,waiterReadySeen:new Set(),waiterReadyBusy:false,waiterReadyPending:false};
+const state={token:savedToken,user:null,screen:'',account:null,draft:[],products:[],data:{},apiInflight:new Map(),lastRefresh:0,alarmTimer:null,audio:null,alarmArmed:false,navStack:[],renderSeq:0,pendingRefresh:false,waiterReadyInitialized:false,waiterReadySeen:new Set(),waiterReadyBusy:false,waiterReadyPending:false};
 const workKey=()=>state.user?`mitote-work-${state.user.id}`:'';
 function persistWorkState(){if(!state.user)return;try{localStorage.setItem(workKey(),JSON.stringify({account:state.account,draft:state.draft}));}catch{}}
 function restoreWorkState(){if(!state.user)return;try{const saved=JSON.parse(localStorage.getItem(workKey())||'{}');state.account=Number(saved.account)||null;state.draft=Array.isArray(saved.draft)?saved.draft.filter(x=>x&&Number.isInteger(Number(x.product_id))&&Number(x.qty)>0).map(x=>({product_id:Number(x.product_id),name:String(x.name||''),station:x.station==='bar'?'bar':'kitchen',qty:Math.min(100,Number(x.qty)),note:String(x.note||'').slice(0,300),variant_id:x.variant_id?Number(x.variant_id):null,variant_name:String(x.variant_name||''),modifier_option_ids:Array.isArray(x.modifier_option_ids)?x.modifier_option_ids.map(Number):[],modifier_names:Array.isArray(x.modifier_names)?x.modifier_names.map(String):[],prep_minutes:Math.max(0,Math.min(240,Number(x.prep_minutes??15))),release_after_minutes:Math.max(0,Math.min(240,Number(x.release_after_minutes??0))),unit_price:Number(x.unit_price)||0,promotion_name:String(x.promotion_name||'')})):[];}catch{state.account=null;state.draft=[];}}
@@ -46,7 +46,49 @@ async function refreshSessionIfNeeded(){
   try{await refreshPromise}catch(e){if(e?.authExpired)throw e;/* Si el servidor falla temporalmente, intenta la operación con el token actual. */}finally{refreshPromise=null}
 }
 async function api(path,method='GET',body){
-  if(path!=='/auth/refresh')await refreshSessionIfNeeded();if(!navigator.onLine&&method!=='GET')throw Error('Sin conexión: operación bloqueada para evitar duplicados');const r=await fetch('/api'+path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer '+state.token},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});let data={};try{data=await r.json()}catch{}if(r.status===401){logout('expired');throw Error('Tu sesión venció o fue revocada. Vuelve a iniciar sesión.')}if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:'Error al procesar la operación');return data}
+  const verb=String(method||'GET').toUpperCase();
+  if(path!=='/auth/refresh')await refreshSessionIfNeeded();
+  if(!navigator.onLine&&verb!=='GET')throw Error('Sin conexión: operación bloqueada para evitar duplicados');
+
+  const requestKey=String(state.user?.id||'session')+':'+path;
+  if(verb==='GET'){
+    const pending=state.apiInflight.get(requestKey);
+    if(pending)return pending;
+  }
+
+  const request=(async()=>{
+    let response;
+    try{
+      response=await fetch('/api'+path,{
+        method:verb,
+        headers:{'Content-Type':'application/json',Authorization:'Bearer '+state.token},
+        body:body===undefined?undefined:JSON.stringify(body),
+        cache:'no-store'
+      });
+    }catch(error){
+      setConnectionState(false);
+      throw Error(verb==='GET'
+        ?'No se pudo conectar con el servidor. Revisa Internet e inténtalo de nuevo.'
+        :'No se confirmó la operación. Verifica la cuenta antes de repetir para evitar duplicados.');
+    }
+    let data={};try{data=await response.json()}catch{}
+    if(response.status===401){
+      logout('expired');
+      throw Error('Tu sesión venció o fue revocada. Vuelve a iniciar sesión.');
+    }
+    setConnectionState(true);
+    if(!response.ok)throw Error(typeof data.detail==='string'?data.detail:'Error al procesar la operación');
+    return data;
+  })();
+
+  if(verb!=='GET')return request;
+  state.apiInflight.set(requestKey,request);
+  try{
+    return await request;
+  }finally{
+    if(state.apiInflight.get(requestKey)===request)state.apiInflight.delete(requestKey);
+  }
+}
 async function fetchProtectedPdf(url){
   await refreshSessionIfNeeded();
   if(!navigator.onLine)throw Error('Se necesita internet para descargar cortes.');
@@ -126,13 +168,18 @@ function logout(reason='manual'){
   }).catch(()=>{});}
   if(reason==='manual'&&window.MitoteAndroid){try{window.MitoteAndroid.clearSession()}catch(e){}}
   if(reason==='manual'&&state.user){try{localStorage.removeItem(workKey())}catch{}}
+  if(typeof stopPrepClock==='function')stopPrepClock();
+  state.apiInflight.clear();
   state.token='';state.user=null;state.screen='';state.navStack=[];state.waiterReadyInitialized=false;state.waiterReadySeen=new Set();
   localStorage.removeItem('mitote-token');sessionStorage.removeItem('mitote-token');localStorage.removeItem('mitote-screen');
   $('#app').hidden=true;$('#login').hidden=false;stopAlarm();
 }
 function refreshNav(){const list=sections[state.user.role]||[];$('#nav').innerHTML=list.map(([id,icon,title])=>`<button class="navbtn ${state.screen===id?'active':''}" data-nav="${id}"><span style="font-size:1.15rem">${icon}</span>${title}</button>`).join('');$('#role-name').textContent=`${state.user.display} · ${labels[state.user.role]}`;$('#page-title').textContent=(list.find(x=>x[0]===state.screen)||list[0]||[])[2]||'Inicio';const back=$('#back');if(back)back.hidden=state.navStack.length===0;}
-async function start(){try{
-    state.user=await api('/me');
+async function start(authenticatedUser=null){try{
+    const validUser=authenticatedUser&&Number.isSafeInteger(Number(authenticatedUser.id))&&
+      typeof authenticatedUser.display==='string'&&sections[authenticatedUser.role]
+      ?authenticatedUser:null;
+    state.user=validUser||await api('/me');
     if(window.MitoteAndroid){try{window.MitoteAndroid.syncSession(state.token,state.user.role)}catch(e){}}
     restoreWorkState();
     $('#login').hidden=true;$('#app').hidden=false;
@@ -145,8 +192,17 @@ async function start(){try{
     state.navStack=[];
     history.replaceState({mitoteScreen:state.screen,mitoteStack:[]},'',location.pathname+location.search+'#'+state.screen);
     localStorage.setItem('mitote-screen',state.screen);
-    if(state.user.role==='waiter')await syncWaiterReadyAlerts(true).catch(()=>{});
-    refreshNav();await render({preserveScroll:false});listenEvents();syncPushOnLogin().catch(()=>{});
+    refreshNav();
+    // Limpiar cualquier contenido de la sesión anterior y pintar el esqueleto sin bloquear.
+    $('#content').innerHTML='';
+    const initialRender=render({preserveScroll:false});
+    // La conexión de eventos se inicia mientras se consultan los primeros datos.
+    listenEvents();
+    initialRender.then(()=>{
+      if(!state.user)return;
+      if(state.user.role==='waiter')syncWaiterReadyAlerts(true).catch(()=>{});
+      syncPushOnLogin().catch(()=>{});
+    });
   }catch(e){logout('expired');toast(e.message,true)}}
 async function go(screen,options={}){
   if(!state.user)return;
@@ -169,38 +225,74 @@ window.addEventListener('popstate',event=>{
 });
 function stat(label,val){return `<div class="stat"><b>${esc(val)}</b><span>${esc(label)}</span></div>`}
 function accountCard(a,action='open-account'){return `<div class="card"><div class="row"><div><h3>${esc(a.name)}</h3><div class="mini">Folio #${a.id} · ${esc(a.owner)}${a.table_name?` · ${esc(a.table_name)}`:''}</div></div>${pill(a.status)}</div><div class="divider"></div><div class="row"><span class="muted">Total ${money(a.total)} · Saldo ${money(a.due)}</span><button class="outline small" data-action="${action}" data-id="${a.id}">Abrir</button></div></div>`}
+function loadingScreenHtml(screen){
+  const labels={accounts:'Mis cuentas',all:'Cuentas',tables:'Mesas',new:'Nueva cuenta',
+    orders:'Comandas',station:'Cocina / barra',history:'Historial de preparación',
+    notifications:'Avisos',tickets:'Estaciones',cashier:'Cobros',cash:'Caja',
+    tips:'Propinas',products:'Menú',inventory:'Inventario',users:'Personal',
+    approvals:'Autorizaciones',audit:'Auditoría',reservations:'Reservaciones',
+    prepconfig:'Tiempos de preparación',analytics:'Estadísticas',overview:'Resumen'};
+  const label=labels[screen]||'la aplicación';
+  return `<div class="loading-screen" role="status" aria-live="polite">
+    <div class="loading-screen-heading"><span class="loading-screen-indicator"></span>
+      <div><strong>Abriendo ${esc(label)}</strong><p>Conectando y preparando tus datos…</p></div>
+    </div>
+    <div class="loading-screen-grid"><div class="loading-skeleton"></div>
+      <div class="loading-skeleton"></div><div class="loading-skeleton"></div></div>
+    <div class="loading-skeleton loading-screen-wide"></div>
+  </div>`;
+}
 async function render(options={}){
   if(!state.user)return;
   const area=$('#content');
   const screen=state.screen;
+  if(!['station','history','tickets'].includes(screen)&&typeof stopPrepClock==='function')stopPrepClock();
   const seq=++state.renderSeq;
+  // Las lecturas de una pantalla anterior no deben bloquear ni contaminar la nueva.
+  state.apiInflight.clear();
   const preserveScroll=options.preserveScroll!==false;
   const scrollY=window.scrollY||0;
   persistWorkState();
-  // No vaciar la pantalla durante una actualización: el contenido anterior permanece
-  // visible mientras llegan los datos nuevos. Solo mostramos carga en la primera entrada.
-  if(!area.childElementCount)area.innerHTML='<div class="empty">Cargando información…</div>';
+  // En el primer acceso se pinta una estructura ligera antes de esperar a la API.
+  if(!area.childElementCount)area.innerHTML=loadingScreenHtml(screen);
   area.setAttribute('aria-busy','true');
   try{
     let html='';
     switch(screen){case 'accounts':html=await showAccounts(false);break;case 'all':html=await showAccounts(true);break;case 'tables':html=await showTables();break;case 'new':html=await showNew();break;case 'orders':html=await showOrders();break;case 'station':html=await showPrepStation(false);break;case 'history':html=await showPrepStation(true);break;case 'notifications':html=await showNotifications();break;case 'tickets':html=await showPrepStation(false,true);break;case 'cashier':html=await showCashier();break;case 'cash':html=await showCash();break;case 'tips':html=await showTips();break;case 'products':html=await showProducts();break;case 'inventory':html=await showInventory();break;case 'users':html=await showUsers();break;case 'approvals':html=await showApprovals();break;case 'audit':html=await showAudit();break;case 'reservations':html=await showReservations();break;case 'prepconfig':html=await showPrepConfig();break;case 'analytics':html=await showAnalytics();break;case 'overview':html=await showOverview();break;default:html='<div class="empty">Sin pantalla</div>'}
-    // Evita que una consulta lenta de la pantalla anterior reemplace la pantalla actual.
     if(seq!==state.renderSeq||screen!==state.screen)return;
     area.innerHTML=html;area.removeAttribute('aria-busy');
     if(preserveScroll)window.scrollTo(0,scrollY);else window.scrollTo(0,0);
     $('#refresh')?.classList.remove('has-update');
     state.pendingRefresh=false;
     checkAlarm();
+    // El historial es secundario: se consulta después de mostrar el panel de caja.
+    if(screen==='cash')loadCashHistory(seq).catch(()=>{});
   }catch(e){
     if(seq!==state.renderSeq||screen!==state.screen)return;
     area.removeAttribute('aria-busy');
     area.innerHTML=`<div class="note danger-note">${esc(e.message)}</div>`;toast(e.message,true);
   }
 }
-async function showAccounts(all){const arr=await api('/accounts');state.data.accounts=arr;const active=arr.filter(x=>x.status==='open'||x.status==='pending');const ready=all?[]:(state.data.readyAlerts||[]);const readyHtml=!all?'<div class="card waiter-ready-card"><div class="row"><h3>🔔 Pedidos pendientes de entregar</h3><button class="outline small" data-action="enable-sound">♪ Probar sonido</button></div>'+(
-ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+'</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+(x.complete?' · Todas las estaciones listas':'')+'</div></div><div class="row"><button class="outline small" data-action="open-account" data-id="'+Number(x.account_id)+'">Ver cuenta</button><button class="primary small" data-action="ack-ready" data-id="'+Number(x.event_id)+'">✓ Entregado</button></div></div>').join(''):'<p class="mini">No tienes avisos pendientes de entregar en este turno.</p>'
-)+'</div>':'';
-return `<div class="statgrid">${stat('Cuentas activas',active.length)}${stat('Por cobrar',active.filter(x=>x.status==='pending').length)}</div>${readyHtml}${!all?'<button class="primary" data-nav="new">＋ Abrir nueva cuenta</button>':''}<h2 class="section">${all?'Todas las cuentas':'Mis cuentas'}</h2><div class="cards">${active.map(a=>accountCard(a,all?'admin-account':'open-account')).join('')||'<div class="empty">Todavía no hay cuentas activas.</div>'}</div>${all?'<h2 class="section">Cuentas pagadas de este turno</h2><div class="cards">'+arr.filter(x=>x.status==='paid').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div><h2 class="section">Cuentas unidas recientemente</h2><div class="cards">'+arr.filter(x=>x.status==='merged').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div>':''}`}
+function waiterReadyAlertsHtml(){
+  const ready=state.data.readyAlerts||[];
+  return '<div class="card waiter-ready-card"><div class="row"><h3>🔔 Pedidos pendientes de entregar</h3><button class="outline small" data-action="enable-sound">♪ Probar sonido</button></div>'+
+    (ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+
+      esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+
+      '</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+
+      (x.complete?' · Todas las estaciones listas':'')+
+      '</div></div><div class="row"><button class="outline small" data-action="open-account" data-id="'+
+      Number(x.account_id)+'">Ver cuenta</button><button class="primary small" data-action="ack-ready" data-id="'+
+      Number(x.event_id)+'">✓ Entregado</button></div></div>').join(''):
+      '<p class="mini">No tienes avisos pendientes de entregar en este turno.</p>')+'</div>';
+}
+async function showAccounts(all){
+  const arr=await api('/accounts');
+  state.data.accounts=arr;
+  const active=arr.filter(x=>x.status==='open'||x.status==='pending');
+  const readyHtml=!all?waiterReadyAlertsHtml():'';
+  return `<div class="statgrid">${stat('Cuentas activas',active.length)}${stat('Por cobrar',active.filter(x=>x.status==='pending').length)}</div>${readyHtml}${!all?'<button class="primary" data-nav="new">＋ Abrir nueva cuenta</button>':''}<h2 class="section">${all?'Todas las cuentas':'Mis cuentas'}</h2><div class="cards">${active.map(a=>accountCard(a,all?'admin-account':'open-account')).join('')||'<div class="empty">Todavía no hay cuentas activas.</div>'}</div>${all?'<h2 class="section">Cuentas pagadas de este turno</h2><div class="cards">'+arr.filter(a=>a.status==='paid').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div><h2 class="section">Cuentas unidas recientemente</h2><div class="cards">'+arr.filter(a=>a.status==='merged').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div>':''}`;
+}
+
 function ticketLookupHtml(){return `<div class="card" style="margin-top:15px"><h3>Consultar ticket histórico</h3><p>Busca por folio, aunque la cuenta ya esté pagada.</p><form id="ticket-lookup" class="formrow"><label>Folio de cuenta<input type="number" min="1" name="id" required></label><button class="outline">Buscar ticket</button></form></div>`}
 async function showNew(){
   const tables=await api('/tables');state.data.tables=tables;
@@ -248,9 +340,13 @@ function updateDraftUI(){
   if(bill)bill.disabled=state.draft.length>0;
 }
 async function showOrders(){
-  // Cargar cuentas y catálogo en paralelo, no uno detrás del otro.
-  // Cada respuesta mantiene el control de sesión existente en api().
-  const [arr,productResponse]=await Promise.all([api('/accounts'),api('/products')]);state.data.accounts=arr;
+  // Cargar las dependencias de la pantalla en paralelo y reutilizar el contexto
+  // de cuentas/mesas al construir el detalle, sin repetir las mismas peticiones.
+  const requests=[api('/accounts'),api('/products')];
+  if(state.user?.role==='owner')requests.push(api('/tables'));
+  const [arr,productResponse,tables]=await Promise.all(requests);
+  state.data.accounts=arr;
+  if(tables)state.data.tables=tables;
   const open=arr.filter(x=>x.status==='open');
   if(!open.length)return '<div class="empty">No tienes cuentas abiertas. Crea una para comenzar.</div><p><button class="primary" data-nav="new">Nueva cuenta</button></p>';
   if(!open.some(a=>a.id===state.account)){state.account=open[0].id;state.draft=[];persistWorkState()}
@@ -269,25 +365,8 @@ async function showOrders(){
   <div class="card" style="margin-top:15px"><button id="bill-btn" class="outline" data-action="bill" data-id="${a.id}" ${state.draft.length?'disabled':''}>Solicitar cuenta a caja</button><p class="mini">Envía o quita los productos pendientes antes de solicitar el cobro.</p></div>
   <h2 class="section">Detalle y solicitudes</h2>${await accountDetailHtml(a.id,false)}`;
 }
-async function accountDetailHtml(id,admin=false){
-  const a=await api('/accounts/'+id);
-  const canManage=['owner','admin','waiter'].includes(state.user?.role);
-  // Conservar acciones operativas de meseros; reservar la edición avanzada al Propietario.
-  const canEditAccount=state.user?.role==='owner';
-  const isAdmin=['owner','admin'].includes(state.user?.role);
-  let tables=[],accounts=[],history=[];
-  if(canEditAccount&&['open','pending'].includes(a.status)){
-    [tables,accounts,history]=await Promise.all([
-      api('/tables'),api('/accounts'),api(`/accounts/${id}/history`)
-    ]);
-  }else if(canManage){
-    history=await api(`/accounts/${id}/history`);
-  }
-  if(canEditAccount&&!state.data.users)state.data.users=await api('/users');
-  const availableTables=tables.filter(t=>t.active&&(t.status==='available'||t.id===a.table_id));
-  const otherAccounts=accounts.filter(x=>x.id!==a.id&&['open','pending'].includes(x.status));
-  const activeItems=a.items.filter(i=>i.qty>i.cancelled_qty);
-  const historyLabels={
+function accountHistoryMarkup(rows){
+  const labels={
     'account.rename':'Cambio de nombre',
     'account.table_transfer':'Cambio de mesa',
     'account.reassign':'Cambio de mesero',
@@ -299,7 +378,33 @@ async function accountDetailHtml(id,admin=false){
     'account.reopen_closed':'Cuenta reabierta',
     'account.close':'Cuenta cerrada'
   };
-  const historyHtml=history.length?`<div class="card"><h3>Historial de movimientos</h3>${history.slice(0,12).map(h=>`<div class="lineitem"><div class="row"><b>${esc(historyLabels[h.action]||h.action)}</b><span class="mini">${esc(h.date?new Date(h.date).toLocaleString('es-MX'):'')}</span></div><div class="mini">${esc(h.actor||'Sistema')} · ${esc(h.detail?.reason||h.detail?.product||'Movimiento registrado')}${h.detail?.target_account_id?` · Cuenta destino #${h.detail.target_account_id}`:''}${h.detail?.to_table?` · ${esc(h.detail.to_table)}`:''}</div></div>`).join('')}</div>`:'';
+  if(!rows.length)return '<p class="mini">No hay movimientos registrados para esta cuenta.</p>';
+  return rows.slice(0,12).map(h=>'<div class="lineitem"><div class="row"><b>'+
+    esc(labels[h.action]||h.action)+'</b><span class="mini">'+
+    esc(h.date?new Date(h.date).toLocaleString('es-MX'):'')+
+    '</span></div><div class="mini">'+esc(h.actor||'Sistema')+' · '+
+    esc(h.detail?.reason||h.detail?.product||'Movimiento registrado')+
+    (h.detail?.target_account_id?' · Cuenta destino #'+Number(h.detail.target_account_id):'')+
+    (h.detail?.to_table?' · '+esc(h.detail.to_table):'')+
+    '</div></div>').join('');
+}
+async function accountDetailHtml(id,admin=false){
+  const a=await api('/accounts/'+id);
+  const canManage=['owner','admin','waiter'].includes(state.user?.role);
+  // Conservar acciones operativas de meseros; reservar la edición avanzada al Propietario.
+  const canEditAccount=state.user?.role==='owner';
+  const isAdmin=['owner','admin'].includes(state.user?.role);
+  let tables=[],accounts=[];
+  if(canEditAccount&&['open','pending'].includes(a.status)){
+    tables=state.data.tables||await api('/tables');
+    accounts=state.data.accounts||await api('/accounts');
+  }
+  if(canEditAccount&&!state.data.users)state.data.users=await api('/users');
+  const availableTables=tables.filter(t=>t.active&&(t.status==='available'||t.id===a.table_id));
+  const otherAccounts=accounts.filter(x=>x.id!==a.id&&['open','pending'].includes(x.status));
+  const activeItems=a.items.filter(i=>i.qty>i.cancelled_qty);
+  // El historial se consulta solo cuando alguien lo solicita, no en cada apertura.
+  const historyHtml=canManage?`<div class="card"><div class="row"><h3>Historial de movimientos</h3><button class="outline small" data-action="load-account-history" data-id="${id}">Consultar historial</button></div><div id="account-history-${id}" class="mini">El historial se cargará cuando lo necesites.</div></div>`:'';
   const actionsHtml=canEditAccount&&['open','pending'].includes(a.status)?`
     <div class="card"><h3>Modificar cuenta</h3>
       <form id="account-rename-form" class="formrow">
@@ -325,7 +430,14 @@ async function accountDetailHtml(id,admin=false){
 }
 async function refreshAccountPanel(id,admin=false){
   if(admin){
-    state.data.users=await api('/users');
+    if(state.user?.role==='owner'){
+      const [users,accounts,tables]=await Promise.all([
+        api('/users'),api('/accounts'),api('/tables')
+      ]);
+      state.data.users=users;state.data.accounts=accounts;state.data.tables=tables;
+    }else{
+      state.data.accounts=await api('/accounts');
+    }
     $('#content').innerHTML=`<button class="outline small" data-nav="all">← Volver a todas las cuentas</button><h2 class="section">Cuenta #${id}</h2>${await accountDetailHtml(id,true)}`;
   }else{
     await render();
@@ -334,11 +446,17 @@ async function refreshAccountPanel(id,admin=false){
 async function showStation(history=false,all=false){const tickets=await api('/tickets');state.data.tickets=tickets;const shown=tickets.filter(t=>history?t.status==='ready':t.status!=='ready');const newCount=tickets.filter(t=>t.status==='new'&&(all?true:t.station===state.user.role)).length;return `<div class="statgrid">${stat('Comandas nuevas',newCount)}${stat('En proceso',shown.filter(t=>t.status==='received'||t.status==='preparing').length)}</div>${!history?'<div class="note">Las comandas nuevas requieren confirmar recepción. Los tiempos de preparación y salida se muestran por producto.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':''}<div class="cards" style="margin-top:15px">${shown.map(t=>`<div class="card ticket ${t.status}"><div class="row"><h3>${esc(t.account)} · #${t.account_id}</h3>${pill(t.status)}</div><div class="mini">${t.station==='kitchen'?'🍳 Cocina':'🥤 Barra'} · Mesero: ${esc(t.waiter)} · Comanda #${t.batch_id} · ${t.created_at?new Date(t.created_at).toLocaleTimeString('es-MX',{hour:'2-digit',minute:'2-digit'}):''}</div><div class="divider"></div>${t.items.map(i=>`<div class="lineitem"><b>${i.qty} × ${esc(i.name)}${i.variant_name?' · '+esc(i.variant_name):''}</b>${i.modifiers?.length?`<div class="mini">Extras: ${i.modifiers.map(m=>esc(m.name)).join(', ')}</div>`:''}${i.note?`<div class="note">${esc(i.note)}</div>`:''}<div class="mini">Preparación estimada: ${Number(i.prep_minutes||15)} min${i.release_after_minutes?' · Salida programada +'+Number(i.release_after_minutes)+' min desde el envío':''}</div></div>`).join('')}${!history?`<button class="primary" data-action="ticket-status" data-id="${t.id}" data-status="${t.status==='new'?'received':t.status==='received'?'preparing':'ready'}">${t.status==='new'?'Confirmar recepción':t.status==='received'?'Iniciar preparación':'Marcar como listo'}</button>`:''}</div>`).join('')||'<div class="empty">No hay comandas en esta sección.</div>'}</div>`}
 
 async function showCashier(){
-  const accounts=(await api('/accounts')).filter(x=>x.status==='pending');
+  const query=state.account?'?account_id='+encodeURIComponent(state.account):'';
+  const data=await api('/cashier/overview'+query);
+  const accounts=data.accounts||[];
   state.data.accounts=accounts;
-  if(!accounts.length)return '<div class="empty">No hay cuentas pendientes de cobro.</div>'+ticketLookupHtml();
-  if(!accounts.some(x=>x.id===state.account))state.account=accounts[0].id;
-  const a=await api('/accounts/'+state.account);state.data.currentAccount=a;
+  if(!accounts.length){
+    state.account=null;state.data.currentAccount=null;
+    return '<div class="empty">No hay cuentas pendientes de cobro.</div>'+ticketLookupHtml();
+  }
+  const a=data.selected;
+  if(!a)throw Error('No se pudo cargar el detalle de la cuenta seleccionada. Actualiza e inténtalo de nuevo.');
+  state.account=a.id;state.data.currentAccount=a;
   const admin=['owner','admin'].includes(state.user.role);
   const activeDiscounts=(a.discounts||[]).filter(d=>d.status==='applied');
   const hasPayments=(a.payments||[]).length>0;
@@ -352,11 +470,29 @@ async function showCashier(){
   <h2 class="section">Registrar pago parcial o mixto</h2><div class="card"><form id="pay-form" class="formrow"><label>Forma de división<select id="split-mode" name="split_mode"><option value="amount">Por importe</option><option value="products" ${activeDiscounts.length?'disabled':''}>Por productos completos ${activeDiscounts.length?'(deshabilitado con descuentos)':''}</option></select></label><div id="split-products" hidden><p class="mini">Indica cuántas unidades paga esta persona. La suma se calculará automáticamente.</p>${a.items.filter(i=>i.qty>i.cancelled_qty).map(i=>`<label>${esc(i.name)} · ${money(i.price)} por unidad<input class="allocation-qty" type="number" min="0" max="${i.qty-i.cancelled_qty}" value="0" data-item="${i.id}" data-price="${i.price}"></label>`).join('')}</div><div class="formgrid"><label>Consumo en efectivo ($)<input type="number" step="0.01" min="0" name="cash" value="0"></label><label>Consumo con tarjeta ($)<input type="number" step="0.01" min="0" name="card" value="0"></label><label>Consumo por transferencia ($)<input type="number" step="0.01" min="0" name="transfer" value="0"></label><label>Efectivo recibido (incluye propina) ($)<input type="number" step="0.01" min="0" name="received" value="0"></label></div><h3>Propinas (separadas del consumo)</h3><div class="formgrid"><label>Propina en efectivo ($)<input type="number" step="0.01" min="0" name="cash_tip" value="0"></label><label>Propina con tarjeta ($)<input type="number" step="0.01" min="0" name="card_tip" value="0"></label><label>Propina por transferencia ($)<input type="number" step="0.01" min="0" name="transfer_tip" value="0"></label></div><div class="note">Las propinas no reducen el saldo de consumo; se registran por separado y se incluyen en el corte de caja. Si se recibe efectivo, indica el total entregado incluyendo la propina.</div><button class="primary" ${Number(a.due)<=0?'disabled':''}>Confirmar pago</button></form></div>
   <h2 class="section">Pagos registrados</h2><div class="card">${(a.payments||[]).map(p=>`<div class="lineitem row"><span>${esc(p.method)} · ${money(p.amount)}${Number(p.tip)>0?` · Propina ${money(p.tip)}`:''}</span><span class="mini">#${p.id}</span></div>`).join('')||'<p class="muted">Sin pagos.</p>'}<div class="row"><span>Propinas acumuladas</span><b>${money((a.tips||[]).reduce((s,t)=>s+Number(t.amount||0),0))}</b></div>${Number(a.due)===0?`<button class="primary" data-action="close-account" data-id="${a.id}">Cerrar cuenta pagada</button>`:''}<div class="inline"><button class="outline" data-action="print-prebill" data-id="${a.id}">Pre-cuenta</button><button class="outline" data-action="download-prebill" data-id="${a.id}">Descargar pre-cuenta PDF</button><button class="outline" data-action="print-ticket" data-id="${a.id}">Ver ticket</button><button class="outline" data-action="download-ticket" data-id="${a.id}">Descargar PDF</button><button class="outline" data-action="share-ticket" data-id="${a.id}">Compartir por WhatsApp</button></div></div>${ticketLookupHtml()}`;
 }
+function cashHistoryMarkup(history){
+  return `<h2 class="section">Historial de turnos cerrados</h2><div class="cards">${history.map(p=>`<div class="card"><div class="row"><h3>Turno #${p.id}</h3>${pill('paid')}</div><p>${esc(new Date(p.closed_at).toLocaleString('es-MX'))} · ${esc(p.closed_by)}</p><p><b>Ventas ${money(p.sales)}</b> · Propinas ${money(p.tips||0)} · ${p.account_count} cuentas · Diferencia ${money(p.difference)} · ${p.tip_distribution?'Reparto de propinas generado':'Sin reparto de propinas'}</p><div class="inline"><button class="primary small" data-action="view-report" data-id="${p.id}">Ver corte tipo ticket</button><button class="outline small" data-action="download-report" data-id="${p.id}">Descargar PDF</button><button class="outline small" data-action="period-detail" data-id="${p.id}">Detalles</button></div></div>`).join('')||'<div class="empty">Aún no hay turnos cerrados.</div>'}</div><div id="period-detail" style="margin-top:14px"></div>`;
+}
+async function loadCashHistory(seq=state.renderSeq){
+  const target=$('#cash-history');
+  if(!target||state.screen!=='cash')return;
+  target.innerHTML='<div class="empty">Cargando historial de turnos…</div>';
+  try{
+    const history=await api('/cash/history');
+    if(seq!==state.renderSeq||state.screen!=='cash')return;
+    const current=$('#cash-history');
+    if(current)current.innerHTML=cashHistoryMarkup(history);
+  }catch(error){
+    if(seq!==state.renderSeq||state.screen!=='cash')return;
+    const current=$('#cash-history');
+    if(current)current.innerHTML='<div class="note danger-note">No se pudo cargar el historial. Usa Actualizar para volver a intentarlo.</div>';
+  }
+}
 async function showCash(){
-  const [c,history]=await Promise.all([api('/cash'),api('/cash/history')]);
+  const c=await api('/cash');
   state.data.cash=c;
   const admin=['owner','admin'].includes(state.user.role);
-  const historyHtml=`<h2 class="section">Historial de turnos cerrados</h2><div class="cards">${history.map(p=>`<div class="card"><div class="row"><h3>Turno #${p.id}</h3>${pill('paid')}</div><p>${esc(new Date(p.closed_at).toLocaleString('es-MX'))} · ${esc(p.closed_by)}</p><p><b>Ventas ${money(p.sales)}</b> · Propinas ${money(p.tips||0)} · ${p.account_count} cuentas · Diferencia ${money(p.difference)} · ${p.tip_distribution?'Reparto de propinas generado':'Sin reparto de propinas'}</p><div class="inline"><button class="primary small" data-action="view-report" data-id="${p.id}">Ver corte tipo ticket</button><button class="outline small" data-action="download-report" data-id="${p.id}">Descargar PDF</button><button class="outline small" data-action="period-detail" data-id="${p.id}">Detalles</button></div></div>`).join('')||'<div class="empty">Aún no hay turnos cerrados.</div>'}</div><div id="period-detail" style="margin-top:14px"></div>`;
+  const historyHtml='<div id="cash-history"><div class="empty">Preparando historial de turnos…</div></div>';
   if(!c.open)return `<div class="note danger-note">Turno cerrado y archivado. La actividad del turno anterior quedó en Historial con su PDF. Abre un turno nuevo para empezar con las vistas activas limpias.</div>${admin?'<form id="cash-open" class="card formrow"><label>Fondo inicial ($)<input name="opening" type="number" min="0" step="0.01" required value="0"></label><button class="primary">Abrir turno nuevo</button></form>':''}${historyHtml}`;
   const blockers=c.blocking_accounts||[];
   const blockersHtml=`<div class="card" style="margin-top:14px"><h3>Control de cierre de turno</h3>${c.blocking_count>0?`<div class="note danger-note"><b>Cierre bloqueado:</b> hay ${c.blocking_count} cuenta(s) sin finalizar. Deben quedar pagadas y cerradas o anuladas con autorización.</div><div class="stack" style="margin-top:12px">${blockers.map(a=>`<div class="row lineitem"><div><b>#${a.id} · ${esc(a.name)}</b><div class="mini">${esc(a.status==='pending'?'Por cobrar':'Abierta')} · Saldo ${money(a.due)}</div></div>${admin?`<button class="outline small" data-action="admin-account" data-id="${a.id}">Revisar</button>`:''}</div>`).join('')}</div>`:'<div class="note">Todas las cuentas están finalizadas. El turno puede cerrarse cuando no existan movimientos pendientes.</div>'}</div>`;
@@ -487,7 +623,8 @@ async function showUsers(){
 async function showApprovals(){const rs=await api('/requests');return `<div class="cards">${rs.map(r=>`<div class="card"><div class="row"><h3>${r.kind==='reopen'?'Reapertura':'Cancelación'} · #${r.account_id}</h3>${pill(r.status)}</div><p>${esc(r.account)} · ${esc(r.requester)}</p><p>${esc(r.reason)}</p>${r.kind==='cancel'?`<p class="mini">Producto #${r.item_id} · ${r.qty} unidad(es)</p>`:''}${r.status==='pending'?`<div class="inline"><button class="primary small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="true">Autorizar</button><button class="ghost small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="false">Rechazar</button></div>`:''}</div>`).join('')||'<div class="empty">No hay solicitudes.</div>'}</div>`}
 async function showAudit(){const rs=await api('/audit');return `<div class="card table-wrap"><table><thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Detalle</th></tr></thead><tbody>${rs.map(x=>`<tr><td>${esc(new Date(x.date).toLocaleString('es-MX'))}</td><td>${esc(x.actor)}</td><td>${esc(x.action)}</td><td class="mini">${esc(JSON.stringify(x.detail))}</td></tr>`).join('')}</tbody></table></div>`}
 async function showOverview(){
-  const [as,ts,ps]=await Promise.all([api('/accounts'),api('/tickets'),api('/products')]);
+  const data=await api('/overview');
+  // El panel utiliza métricas agregadas; los listados completos se cargan al abrir cada módulo.
   // Los accesos solo navegan a módulos ya existentes, sin alterar API o permisos.
   const drawings={
     list:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h9M8 13h9M8 17h6"/>',
@@ -523,7 +660,7 @@ async function showOverview(){
       <p>Revisa el servicio y entra directamente al módulo que necesitas.</p></div>
       <span class="premium-dashboard-live">● Información actualizada</span>
     </div>
-    <div class="statgrid">${stat('Cuentas activas',as.filter(a=>a.status==='open'||a.status==='pending').length)}${stat('Por cobrar',as.filter(a=>a.status==='pending').length)}${stat('Comandas nuevas',ts.filter(t=>t.status==='new').length)}${stat('Productos',ps.length)}</div>
+    <div class="statgrid">${stat('Cuentas activas',data.active_accounts)}${stat('Por cobrar',data.pending_accounts)}${stat('Comandas nuevas',data.new_tickets)}${stat('Productos',data.products)}</div>
     <div class="premium-dashboard-heading premium-dashboard-second"><div><p class="premium-eyebrow">GESTIÓN Y ADMINISTRACIÓN</p><h2>Todos los módulos</h2></div></div>
     <div class="premium-shortcut-grid">
     ${shortcuts.map(([id,label,desc,drawing])=>`<button type="button" class="premium-shortcut" data-nav="${id}" aria-label="Abrir ${label}"><span class="premium-shortcut-icon">${icon(drawing)}</span><strong>${label}</strong><small>${desc}</small><span class="premium-shortcut-arrow" aria-hidden="true">›</span></button>`).join('')}
@@ -545,6 +682,15 @@ case 'ack-ready':{
   state.data.readyAlerts=(state.data.readyAlerts||[]).filter(x=>x.event_id!==id);
   toast('Entrega confirmada');
   await render();
+  break;
+}
+case 'load-account-history':{
+  const accountId=Number(btn.dataset.id);
+  if(!Number.isSafeInteger(accountId)||accountId<1)throw Error('Cuenta inválida');
+  const rows=await api(`/accounts/${accountId}/history`);
+  const target=document.getElementById('account-history-'+accountId);
+  if(target)target.innerHTML=accountHistoryMarkup(rows);
+  btn.textContent='Actualizar historial';
   break;
 }
 case 'view-report':await showCashTicket(id);break;case 'period-detail':await showPeriodDetail(id);break;case 'hide-period-detail':{const el=$('#period-detail');if(el)el.innerHTML='';break}case 'void-account':{const reason=ask('Motivo para anular esta cuenta sin saldo:');if(!reason)return;if(!confirm('¿Confirmas la anulación? Esta acción quedará registrada.'))return;await api(`/accounts/${id}/void`,'POST',{reason});toast('Cuenta anulada y archivada');await go('all');break}case 'enable-sound':state.alarmArmed=true;beep('ready');toast('Sonido potente activado en esta pantalla');break;case 'reset-user':{const secret=ask(btn.dataset.role==='waiter'?'Nuevo PIN de 4 dígitos:':'Nueva contraseña (mínimo 8 caracteres):');if(!secret)return;await api(`/users/${id}`,'PATCH',{secret});toast('Clave cambiada; sesiones anteriores revocadas');await render();break}case 'toggle-user':{if(!confirm('¿Confirmar cambio de acceso?'))return;await api(`/users/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Acceso actualizado y sesiones revocadas');await render();break}case 'open-account':state.account=id;state.draft=[];await go('orders');break;case 'admin-account':{const a=await api('/accounts/'+id);if(!state.data.users)state.data.users=await api('/users');$('#content').innerHTML=`<button class="outline small" data-nav="all">← Volver</button><h2 class="section">Cuenta #${id}</h2>${await accountDetailHtml(id,true)}`;break}case 'remove-line':state.draft.splice(id,1);persistWorkState();updateDraftUI();toast('Producto retirado del borrador');break;
@@ -718,7 +864,7 @@ case 'account-split-form':{
   await refreshAccountPanel(accountId,['owner','admin'].includes(state.user.role));
   break;
 }
-case 'table-add':await api('/tables','POST',{name:d.name,area:d.area,capacity:Number(d.capacity),sort_order:Number(d.sort_order||0),active:true});toast('Mesa registrada');await render();break;case 'ticket-lookup':{const a=await api('/accounts/'+Number(d.id));$('#content').innerHTML=`<button class="outline small" data-nav="cashier">← Volver</button><div class="card"><h3>Ticket #${a.id} · ${esc(a.name)}</h3><p>${pill(a.status)} · Total ${money(a.total)} · Pagado ${money(a.paid)}</p><div class="inline"><button class="outline" data-action="download-ticket" data-id="${a.id}">Descargar PDF</button><button class="outline" data-action="share-ticket" data-id="${a.id}">Compartir por WhatsApp</button></div></div>`;break}case 'new-account':{const tableId=d.table_id?Number(d.table_id):null;const name=(d.name||'').trim();const r=await api('/accounts','POST',{name,table_id:tableId});state.account=r.id;state.draft=[];persistWorkState();toast(tableId?'Cuenta abierta en '+(state.data.tables||[]).find(t=>t.id===tableId)?.name:'Cuenta libre creada');await go('orders',{replace:true});break}case 'reassign-form':{const accountId=Number(d.account_id);await api(`/accounts/${accountId}/reassign`,'POST',{owner_id:Number(d.owner_id),reason:d.reason});toast('Cuenta reasignada');await refreshAccountPanel(accountId,true);break}case 'discount-form':{const accountId=Number(state.data.currentAccount?.id);if(!accountId)throw Error('No hay una cuenta seleccionada');const payload={scope:d.scope,mode:d.mode,value:d.value,reason:d.reason,...(d.scope==='item'?{item_id:Number(d.item_id)}:{})};if(d.scope==='item'&&!payload.item_id)throw Error('Selecciona el producto');await api(`/accounts/${accountId}/discounts`,'POST',payload);toast('Descuento aplicado y auditado');await render();break}
+case 'table-add':await api('/tables','POST',{name:d.name,area:d.area,capacity:Number(d.capacity),sort_order:Number(d.sort_order||0),active:true});toast('Mesa registrada');await render();break;case 'ticket-lookup':{const a=await api('/accounts/'+Number(d.id));$('#content').innerHTML=`<button class="outline small" data-nav="cashier">← Volver</button><div class="card"><h3>Ticket #${a.id} · ${esc(a.name)}</h3><p>${pill(a.status)} · Total ${money(a.total)} · Pagado ${money(a.paid)}</p><div class="inline"><button class="outline" data-action="download-ticket" data-id="${a.id}">Descargar PDF</button><button class="outline" data-action="share-ticket" data-id="${a.id}">Compartir por WhatsApp</button></div></div>`;break}case 'new-account':{const tableId=d.table_id?Number(d.table_id):null;const name=(d.name||'').trim();const payload={name,table_id:tableId};const scope='account-create';const client_key=pendingOperationKey(scope,payload);const r=await api('/accounts','POST',{...payload,client_key});clearPendingOperation(scope);state.account=r.id;state.draft=[];persistWorkState();toast(r.duplicate?'Cuenta ya registrada; no se duplicó':tableId?'Cuenta abierta en '+(state.data.tables||[]).find(t=>t.id===tableId)?.name:'Cuenta libre creada');await go('orders',{replace:true});break}case 'reassign-form':{const accountId=Number(d.account_id);await api(`/accounts/${accountId}/reassign`,'POST',{owner_id:Number(d.owner_id),reason:d.reason});toast('Cuenta reasignada');await refreshAccountPanel(accountId,true);break}case 'discount-form':{const accountId=Number(state.data.currentAccount?.id);if(!accountId)throw Error('No hay una cuenta seleccionada');const payload={scope:d.scope,mode:d.mode,value:d.value,reason:d.reason,...(d.scope==='item'?{item_id:Number(d.item_id)}:{})};if(d.scope==='item'&&!payload.item_id)throw Error('Selecciona el producto');await api(`/accounts/${accountId}/discounts`,'POST',payload);toast('Descuento aplicado y auditado');await render();break}
 case 'pay-form':{const a=state.data.currentAccount;const methods=['cash','card','transfer'];const lines=methods.filter(x=>Number(d[x])>0).map(x=>({method:x,amount:d[x],tip:d[x+'_tip']||'0',...(x==='cash'&&Number(d.received)>0?{received:d.received}:{})}));if(!lines.length)throw Error('Escribe al menos un importe de consumo');for(const method of methods){if(Number(d[method+'_tip']||0)>0&&Number(d[method]||0)<=0)throw Error(`Registra primero un importe de consumo en ${method==='cash'?'efectivo':method==='card'?'tarjeta':'transferencia'} para asociar esa propina`)}let allocations=[];if(d.split_mode==='products'){allocations=$$('.allocation-qty').filter(x=>Number(x.value)>0).map(x=>({item_id:Number(x.dataset.item),qty:Number(x.value)}));if(!allocations.length)throw Error('Selecciona productos');const expected=allocations.reduce((s,x)=>{const el=$(`.allocation-qty[data-item="${x.item_id}"]`);return s+x.qty*Number(el.dataset.price)},0);const got=lines.reduce((s,x)=>s+Math.round(Number(x.amount)*100),0);if(Math.round(expected*100)!==got)throw Error(`Los productos elegidos suman ${money(expected)}; ajusta los métodos de pago`)}if(!confirm('¿Confirmar el pago y registrar las propinas por separado?'))return;const scope='payment-'+a.id;const payload={lines,allocations};const client_key=pendingOperationKey(scope,payload);const result=await api(`/accounts/${a.id}/payments`,'POST',{client_key,...payload});clearPendingOperation(scope);toast(result.duplicate?'Pago ya registrado; no se duplicó':'Pago y propinas registrados');await render();break}case 'cash-movement':await api('/cash/movements','POST',{kind:d.kind,amount:d.amount,reason:d.reason});toast('Movimiento registrado o solicitado');await render();break;case 'cash-close':if(!confirm('¿Confirmar corte general? El periodo quedará cerrado y no podrá modificarse.'))return;await api('/cash/close','POST',{counted:d.counted,note:d.note});toast('Corte cerrado y archivado con su PDF. Ventas anteriores fuera de las vistas activas.');await render();break;case 'cash-open':await api('/cash/open','POST',{opening:d.opening});toast('Periodo de caja abierto');await render();break;case 'product-add':await api('/products','POST',{name:d.name,category:d.category||'General',station:d.station,price:d.price,stock:Number(d.stock||0),inventory_enabled:form.querySelector('[name="inventory_enabled"]').checked});toast('Producto creado');await render();break;
 case (form.id.startsWith('variant-add-')?form.id:'__no-variant__'):{const productId=Number(form.id.slice('variant-add-'.length));await api(`/products/${productId}/variants`,'POST',{name:d.name,price:d.price,active:true,sort_order:0});toast('Presentación agregada');await render();break;}
 case (form.id.startsWith('modifier-group-add-')?form.id:'__no-group__'):{const productId=Number(form.id.slice('modifier-group-add-'.length));const min=Number(d.min_select||0),max=Number(d.max_select||1);if(min>max)throw Error('El mínimo no puede superar al máximo');await api(`/products/${productId}/modifier-groups`,'POST',{name:d.name,min_select:min,max_select:max,active:true,sort_order:0});toast('Grupo de modificadores creado');await render();break;}
@@ -866,6 +1012,11 @@ async function syncWaiterReadyAlerts(initial=false){
     }
     state.data.readyAlerts=items;
     try{sessionStorage.setItem(userKey,JSON.stringify([...state.waiterReadySeen].slice(-180)))}catch{}
+    // Actualizar solo el panel de avisos; no volver a cargar las cuentas.
+    if(initial&&state.screen==='accounts'){
+      const panel=$('.waiter-ready-card');
+      if(panel)panel.outerHTML=waiterReadyAlertsHtml();
+    }
   }finally{
     state.waiterReadyBusy=false;
     if(state.waiterReadyPending){state.waiterReadyPending=false;syncWaiterReadyAlerts().catch(()=>{});}
@@ -918,7 +1069,7 @@ async function loginSession(path,payload){
   if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:'Acceso incorrecto');
   state.token=d.token;localStorage.setItem('mitote-token',d.token);
   sessionStorage.removeItem('mitote-token');state.alarmArmed=true;
-  await start();
+  await start(d.user);
 }
 $('#login-pin-form').addEventListener('submit',async e=>{
   e.preventDefault();if(pinLoginBusy)return;loginError('');
@@ -939,7 +1090,7 @@ $('#legacy-login-form').addEventListener('submit',async e=>{
     if(d.user?.role!=='owner')throw Error('La activación inicial solo está permitida al Propietario');
     state.token=d.token;localStorage.setItem('mitote-token',d.token);
     sessionStorage.removeItem('mitote-token');state.alarmArmed=true;
-    await start();
+    await start(d.user);
     if(state.user?.role==='owner'&&state.screen!=='users')await go('users');
   }catch(err){loginError(err.message);}
 });

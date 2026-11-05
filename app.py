@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, Column, Integer, String, Boolean, ForeignKey,
-                        DateTime, Text, LargeBinary, UniqueConstraint, select, func)
+                        DateTime, Text, LargeBinary, UniqueConstraint, Index, select, func)
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as PDFImage
@@ -140,6 +140,17 @@ class Account(Base):
     status=Column(String(20),default='open',nullable=False)
     created_at=Column(DateTime(timezone=True),default=now)
     closed_at=Column(DateTime(timezone=True))
+
+class AccountCreateKey(Base):
+    """Clave idempotente para evitar cuentas duplicadas tras reintentos de red."""
+    __tablename__='account_create_keys'
+    id=Column(Integer,primary_key=True)
+    user_id=Column(Integer,ForeignKey('users.id'),nullable=False)
+    client_key=Column(String(80),nullable=False)
+    account_id=Column(Integer,ForeignKey('accounts.id'),nullable=False)
+    request_hash=Column(String(64),nullable=False)
+    created_at=Column(DateTime(timezone=True),default=now,nullable=False)
+    __table_args__=(UniqueConstraint('user_id','client_key'),)
 
 class DiningTable(Base):
     __tablename__='restaurant_tables'
@@ -420,6 +431,15 @@ class Audit(Base):
     detail=Column(Text,default='{}')
     created_at=Column(DateTime(timezone=True),default=now)
 
+# Índices de alto tráfico. Se crean también sobre tablas existentes durante bootstrap.
+PERFORMANCE_INDEXES = (
+    Index('ix_accounts_owner_created_at', Account.owner_id, Account.created_at),
+    Index('ix_accounts_created_at', Account.created_at),
+    Index('ix_batches_account_id', Batch.account_id),
+    Index('ix_order_items_batch_id', OrderItem.batch_id),
+    Index('ix_payments_account_id', Payment.account_id),
+)
+
 listeners=set()
 login_failures={}
 async def notify():
@@ -432,6 +452,10 @@ def audit(db,user,action,**data):
 
 def bootstrap():
     Base.metadata.create_all(engine)
+    # create_all no agrega índices a tablas ya creadas; checkfirst permite
+    # desplegar esta migración de forma idempotente en SQLite y PostgreSQL.
+    for performance_index in PERFORMANCE_INDEXES:
+        performance_index.create(bind=engine,checkfirst=True)
     with SessionLocal() as db:
         if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False))
         if not db.scalar(select(User).where(User.role=='owner')):
@@ -542,6 +566,32 @@ async def lifespan(app):
 app=FastAPI(title='El Mitote Comandas',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 
+http_log=logging.getLogger('mitote.http')
+
+@app.middleware("http")
+async def observe_request_performance(request:Request,call_next):
+    """Expose server time and log only slow/failed requests without customer data."""
+    request_id=request.headers.get('x-request-id','')
+    if not request_id or len(request_id)>64 or not re.fullmatch(r'[A-Za-z0-9._-]+',request_id):
+        request_id=secrets.token_hex(8)
+    started=time.perf_counter()
+    try:
+        response=await call_next(request)
+    except Exception:
+        elapsed_ms=(time.perf_counter()-started)*1000
+        http_log.exception(
+            "request_failed id=%s method=%s path=%s duration_ms=%.1f",
+            request_id,request.method,request.url.path,elapsed_ms)
+        raise
+    elapsed_ms=(time.perf_counter()-started)*1000
+    response.headers["X-Request-ID"]=request_id
+    response.headers["Server-Timing"]=f"app;dur={elapsed_ms:.1f}"
+    if elapsed_ms>=500:
+        http_log.warning(
+            "slow_request id=%s method=%s path=%s status=%s duration_ms=%.1f",
+            request_id,request.method,request.url.path,response.status_code,elapsed_ms)
+    return response
+
 @app.get('/')
 def root(): return FileResponse('static/index.html')
 @app.get('/sw.js')
@@ -573,8 +623,11 @@ def owner_account(db,user,account_id,allowed=('open','pending')):
     return acc
 
 def account_gross_total(db,acc):
-    rows=db.execute(select(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(Batch.account_id==acc.id)).scalars().all()
-    return sum(x.price_cents*(x.qty-x.cancelled_qty) for x in rows)
+    value=db.scalar(select(func.coalesce(func.sum(
+        OrderItem.price_cents*(OrderItem.qty-func.coalesce(OrderItem.cancelled_qty,0))),0
+    )).select_from(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(
+        Batch.account_id==acc.id))
+    return int(value or 0)
 
 def account_discount_total(db,account_id):
     return db.scalar(select(func.coalesce(func.sum(AccountDiscount.discount_cents),0)).where(
@@ -601,6 +654,63 @@ def account_dict(db,a):
             'table_id':table.id if table else None,'table_name':table.name if table else None,
             'table_area':table.area if table else None,
             'created_at':a.created_at.isoformat() if a.created_at else ''}
+
+def account_dict_many(db, accounts):
+    """Serializa cuentas activas con agregados y relaciones precargadas en bloque."""
+    if not accounts:
+        return []
+    account_ids=[a.id for a in accounts]
+    owner_ids={a.owner_id for a in accounts if a.owner_id is not None}
+
+    gross_rows=db.execute(
+        select(Batch.account_id,func.coalesce(func.sum(
+            OrderItem.price_cents*(OrderItem.qty-func.coalesce(OrderItem.cancelled_qty,0))),0))
+        .join(OrderItem,OrderItem.batch_id==Batch.id)
+        .where(Batch.account_id.in_(account_ids))
+        .group_by(Batch.account_id)
+    ).all()
+    discount_rows=db.execute(
+        select(AccountDiscount.account_id,func.coalesce(func.sum(AccountDiscount.discount_cents),0))
+        .where(AccountDiscount.account_id.in_(account_ids),AccountDiscount.status=='applied')
+        .group_by(AccountDiscount.account_id)
+    ).all()
+    payment_rows=db.execute(
+        select(Payment.account_id,func.coalesce(func.sum(Payment.cents),0))
+        .where(Payment.account_id.in_(account_ids))
+        .group_by(Payment.account_id)
+    ).all()
+    owner_rows=db.scalars(select(User).where(User.id.in_(owner_ids))).all() if owner_ids else []
+    occupancy_rows=db.execute(
+        select(TableOccupancy.account_id,DiningTable.id,DiningTable.name,DiningTable.area)
+        .join(DiningTable,DiningTable.id==TableOccupancy.table_id)
+        .where(TableOccupancy.account_id.in_(account_ids))
+    ).all()
+
+    gross_by={row[0]:int(row[1] or 0) for row in gross_rows}
+    discount_by={row[0]:int(row[1] or 0) for row in discount_rows}
+    paid_by={row[0]:int(row[1] or 0) for row in payment_rows}
+    owner_by={u.id:u.display for u in owner_rows}
+    table_by={row[0]:{"id":row[1],"name":row[2],"area":row[3]} for row in occupancy_rows}
+
+    result=[]
+    for account in accounts:
+        gross=gross_by.get(account.id,0)
+        discounts=discount_by.get(account.id,0)
+        total=max(0,gross-discounts)
+        paid=paid_by.get(account.id,0)
+        table=table_by.get(account.id)
+        result.append({
+            "id":account.id,"name":account.name,"owner_id":account.owner_id,
+            "owner":owner_by.get(account.owner_id,"?"),"status":account.status,
+            "gross_total":amount(gross),"discount_total":amount(discounts),
+            "total":amount(total),"paid":amount(paid),"due":amount(total-paid),
+            "table_id":table["id"] if table else None,
+            "table_name":table["name"] if table else None,
+            "table_area":table["area"] if table else None,
+            "created_at":account.created_at.isoformat() if account.created_at else ""
+        })
+    return result
+
 
 def release_table_for_account(db,a,user,reason):
     occupancy=db.execute(select(TableOccupancy).where(TableOccupancy.account_id==a.id).with_for_update()).scalar_one_or_none()
@@ -647,20 +757,82 @@ def apply_promotion(base_cents, promo):
         return max(0,int((Decimal(base_cents)*(Decimal(100-promo.discount_percent)/Decimal(100))).quantize(Decimal('1'),rounding=ROUND_HALF_UP)))
     return base_cents
 
-def product_dict(p,settings,db=None):
+def product_related_data(db, products):
+    """Carga las relaciones del catálogo en lotes, evitando consultas N+1."""
+    product_ids = [p.id for p in products]
+    if not product_ids:
+        return {"variants": {}, "groups": {}, "options": {}, "promotions": {}}
+
+    variants = db.scalars(
+        select(ProductVariant)
+        .where(ProductVariant.product_id.in_(product_ids))
+        .order_by(ProductVariant.product_id, ProductVariant.sort_order, ProductVariant.id)
+    ).all()
+    groups = db.scalars(
+        select(ProductModifierGroup)
+        .where(ProductModifierGroup.product_id.in_(product_ids))
+        .order_by(ProductModifierGroup.product_id, ProductModifierGroup.sort_order,
+                  ProductModifierGroup.id)
+    ).all()
+    group_ids = [g.id for g in groups]
+    options = db.scalars(
+        select(ProductModifierOption)
+        .where(ProductModifierOption.group_id.in_(group_ids))
+        .order_by(ProductModifierOption.group_id, ProductModifierOption.sort_order,
+                  ProductModifierOption.id)
+    ).all() if group_ids else []
+    promotions = db.scalars(
+        select(ProductPromotion)
+        .where(ProductPromotion.product_id.in_(product_ids))
+        .order_by(ProductPromotion.product_id, ProductPromotion.id.desc())
+    ).all()
+
+    def grouped(rows, key):
+        result = {}
+        for row in rows:
+            result.setdefault(getattr(row, key), []).append(row)
+        return result
+
+    return {
+        "variants": grouped(variants, "product_id"),
+        "groups": grouped(groups, "product_id"),
+        "options": grouped(options, "group_id"),
+        "promotions": grouped(promotions, "product_id"),
+    }
+
+
+def product_dict(p,settings,db=None,related=None):
     status='No disponible' if p.blocked or not p.active else ('Sin control' if not settings.inventory_on or not p.inventory_enabled else ('Agotado' if p.stock==0 else 'Stock bajo' if p.stock<=3 else 'Disponible'))
-    variants=[];groups=[];promotions=[];active_promo=None
-    if db is not None:
-        variants=[{'id':v.id,'name':v.name,'price':amount(v.price_cents),'active':v.active,'sort_order':v.sort_order}
-                  for v in db.scalars(select(ProductVariant).where(ProductVariant.product_id==p.id).order_by(ProductVariant.sort_order,ProductVariant.id))]
-        for g in db.scalars(select(ProductModifierGroup).where(ProductModifierGroup.product_id==p.id).order_by(ProductModifierGroup.sort_order,ProductModifierGroup.id)):
-            options=[{'id':o.id,'name':o.name,'price_delta':amount(o.price_delta_cents),'active':o.active,'sort_order':o.sort_order}
-                     for o in db.scalars(select(ProductModifierOption).where(ProductModifierOption.group_id==g.id).order_by(ProductModifierOption.sort_order,ProductModifierOption.id))]
-            groups.append({'id':g.id,'name':g.name,'min_select':g.min_select,'max_select':g.max_select,'active':g.active,'options':options})
-        promo_rows=db.scalars(select(ProductPromotion).where(ProductPromotion.product_id==p.id).order_by(ProductPromotion.id.desc())).all()
-        promotions=[{'id':x.id,'name':x.name,'price':amount(x.price_cents) if x.price_cents is not None else None,'discount_percent':x.discount_percent,'weekdays':x.weekdays,'start_time':x.start_time,'end_time':x.end_time,'start_date':x.start_date,'end_date':x.end_date,'active':x.active}
-                    for x in promo_rows]
-        active_promo=next((x for x in promo_rows if promotion_is_active(x)),None)
+    variant_rows=[];group_rows=[];option_map={};promo_rows=[]
+    if related is not None:
+        variant_rows=related["variants"].get(p.id, [])
+        group_rows=related["groups"].get(p.id, [])
+        option_map=related["options"]
+        promo_rows=related["promotions"].get(p.id, [])
+    elif db is not None:
+        variant_rows=db.scalars(select(ProductVariant).where(
+            ProductVariant.product_id==p.id).order_by(
+            ProductVariant.sort_order,ProductVariant.id)).all()
+        group_rows=db.scalars(select(ProductModifierGroup).where(
+            ProductModifierGroup.product_id==p.id).order_by(
+            ProductModifierGroup.sort_order,ProductModifierGroup.id)).all()
+        for group in group_rows:
+            option_map[group.id]=db.scalars(select(ProductModifierOption).where(
+                ProductModifierOption.group_id==group.id).order_by(
+                ProductModifierOption.sort_order,ProductModifierOption.id)).all()
+        promo_rows=db.scalars(select(ProductPromotion).where(
+            ProductPromotion.product_id==p.id).order_by(ProductPromotion.id.desc())).all()
+
+    variants=[{'id':v.id,'name':v.name,'price':amount(v.price_cents),'active':v.active,'sort_order':v.sort_order}
+              for v in variant_rows]
+    groups=[]
+    for g in group_rows:
+        options=[{'id':o.id,'name':o.name,'price_delta':amount(o.price_delta_cents),'active':o.active,'sort_order':o.sort_order}
+                 for o in option_map.get(g.id, [])]
+        groups.append({'id':g.id,'name':g.name,'min_select':g.min_select,'max_select':g.max_select,'active':g.active,'options':options})
+    promotions=[{'id':x.id,'name':x.name,'price':amount(x.price_cents) if x.price_cents is not None else None,'discount_percent':x.discount_percent,'weekdays':x.weekdays,'start_time':x.start_time,'end_time':x.end_time,'start_date':x.start_date,'end_date':x.end_date,'active':x.active}
+                for x in promo_rows]
+    active_promo=next((x for x in promo_rows if promotion_is_active(x)),None)
     current_cents=apply_promotion(p.price_cents,active_promo)
     return {'id':p.id,'name':p.name,'category':p.category,'station':p.station,'price':amount(p.price_cents),
             'current_price':amount(current_cents),'promotion':({'id':active_promo.id,'name':active_promo.name,'price':amount(current_cents),'fixed_price':amount(active_promo.price_cents) if active_promo.price_cents is not None else None,'discount_percent':active_promo.discount_percent} if active_promo else None),
@@ -701,12 +873,28 @@ def login_pin(data: PinLoginIn, request: Request, db: Session = Depends(db_sessi
     attempts = [t for t in login_failures.get(identifier, []) if time.time() - t < 600]
     if len(attempts) >= 15:
         raise HTTPException(429, 'Demasiados intentos. Espera 10 minutos.')
-    rec = db.scalar(select(UserPin).where(UserPin.lookup == _pin_lookup(data.pin)))
-    user = db.get(User, rec.user_id) if rec else None
+    lookup_started = time.perf_counter()
+    match = db.execute(
+        select(UserPin, User)
+        .join(User, User.id == UserPin.user_id)
+        .where(UserPin.lookup == _pin_lookup(data.pin))
+    ).first()
+    lookup_ms = (time.perf_counter() - lookup_started) * 1000
+    rec, user = match if match else (None, None)
+
+    verify_started = time.perf_counter()
     try:
         valid = bool(user and user.active and ph.verify(rec.pin_hash, data.pin))
     except (VerifyMismatchError, VerificationError):
         valid = False
+    verify_ms = (time.perf_counter() - verify_started) * 1000
+
+    total_ms = lookup_ms + verify_ms
+    if total_ms >= 250:
+        http_log.warning(
+            "slow_pin_login lookup_ms=%.1f argon2_ms=%.1f total_ms=%.1f outcome=%s",
+            lookup_ms, verify_ms, total_ms, "success" if valid else "rejected",
+        )
     if not valid:
         attempts.append(time.time())
         login_failures[identifier] = attempts
@@ -1023,7 +1211,12 @@ class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:
 @app.get('/api/users')
 def users(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
-    return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,'active':u.active,'has_pin':db.get(UserPin,u.id) is not None} for u in db.scalars(select(User).order_by(User.id))]
+    rows=db.scalars(select(User).order_by(User.id)).all()
+    user_ids=[row.id for row in rows]
+    pin_ids=set(db.scalars(select(UserPin.user_id).where(
+        UserPin.user_id.in_(user_ids))).all()) if user_ids else set()
+    return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,
+             'active':u.active,'has_pin':u.id in pin_ids} for u in rows]
 @app.post('/api/users')
 async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner')
@@ -1084,7 +1277,9 @@ def products(db:Session=Depends(db_session),user:User=Depends(auth)):
     s=db.get(Setting,1)
     query=select(Product).outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id).where(
         ArchivedProduct.product_id.is_(None)).order_by(Product.category,Product.name)
-    return [product_dict(p,s,db) for p in db.scalars(query)]
+    rows=db.scalars(query).all()
+    related=product_related_data(db,rows)
+    return [product_dict(p,s,related=related) for p in rows]
 class RemoveCategoryIn(BaseModel):
     name:str=Field(min_length=1,max_length=80)
     destination:str=Field(min_length=1,max_length=80)
@@ -1292,13 +1487,41 @@ def dining_table_dict(db,t):
             'account_id':account.id if occupied else None,'account_name':account.name if occupied else None,
             'waiter':owner.display if owner else None}
 
+def dining_table_dict_many(db,tables):
+    """Resuelve ocupación, cuenta y mesero de todas las mesas con una consulta."""
+    if not tables:
+        return []
+    table_ids=[t.id for t in tables]
+    rows=db.execute(
+        select(TableOccupancy.table_id,Account.id,Account.name,Account.status,User.display)
+        .join(Account,Account.id==TableOccupancy.account_id)
+        .outerjoin(User,User.id==Account.owner_id)
+        .where(TableOccupancy.table_id.in_(table_ids))
+    ).all()
+    by_table={row[0]:row for row in rows}
+    result=[]
+    for table in tables:
+        row=by_table.get(table.id)
+        occupied=bool(row and row[3] in ('open','pending'))
+        result.append({
+            'id':table.id,'name':table.name,'area':table.area,'capacity':table.capacity,
+            'active':table.active,'sort_order':table.sort_order,
+            'status':'occupied' if occupied else 'available',
+            'account_id':row[1] if occupied else None,
+            'account_name':row[2] if occupied else None,
+            'waiter':row[4] if row else None
+        })
+    return result
+
+
 @app.get('/api/tables')
 def dining_tables(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier','waiter')
     q=select(DiningTable).order_by(DiningTable.area,DiningTable.sort_order,DiningTable.id)
     if user.role not in ('owner','admin'):
         q=q.where(DiningTable.active.is_(True))
-    return [dining_table_dict(db,t) for t in db.scalars(q)]
+    rows=db.scalars(q).all()
+    return dining_table_dict_many(db,rows)
 
 class DiningTableIn(BaseModel):
     name:str=Field(min_length=1,max_length=80)
@@ -1357,14 +1580,75 @@ def accounts(db:Session=Depends(db_session),user:User=Depends(auth)):
     q=select(Account).where(Account.created_at>=p.opened_at).order_by(Account.id.desc())
     if user.role=='waiter':q=q.where(Account.owner_id==user.id)
     else:q=q.limit(200)
-    return [account_dict(db,a) for a in db.scalars(q)]
+    rows=db.scalars(q).all()
+    return account_dict_many(db,rows)
+
+@app.get('/api/overview')
+def overview(db:Session=Depends(db_session),user:User=Depends(auth)):
+    """Resumen compacto del panel: métricas agregadas sin descargar listas completas."""
+    allow(user,'owner','admin')
+    period=db.scalar(select(CashPeriod).where(
+        CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    status_counts={}
+    new_tickets=0
+    if period:
+        status_counts=dict(db.execute(
+            select(Account.status,func.count(Account.id))
+            .where(Account.created_at>=period.opened_at)
+            .group_by(Account.status)
+        ).all())
+        new_tickets=db.scalar(
+            select(func.count(StationTicket.id))
+            .join(Batch,Batch.id==StationTicket.batch_id)
+            .where(Batch.created_at>=period.opened_at,StationTicket.status=='new')
+        ) or 0
+    product_count=db.scalar(
+        select(func.count(Product.id))
+        .outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id)
+        .where(ArchivedProduct.product_id.is_(None))
+    ) or 0
+    return {
+        'active_accounts':int(status_counts.get('open',0)+status_counts.get('pending',0)),
+        'pending_accounts':int(status_counts.get('pending',0)),
+        'new_tickets':int(new_tickets),
+        'products':int(product_count),
+    }
 class AccountIn(BaseModel):
     name:Optional[str]=Field(default=None,max_length=120)
     table_id:Optional[int]=None
+    client_key:Optional[str]=Field(default=None,max_length=80)
 
 @app.post('/api/accounts')
 async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','waiter')
+    client_key=(data.client_key or '').strip()
+    payload={'name':(data.name or '').strip(),'table_id':data.table_id}
+    request_hash=hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+    def existing_create():
+        if not client_key:
+            return None
+        record=db.scalar(select(AccountCreateKey).where(
+            AccountCreateKey.user_id==user.id,
+            AccountCreateKey.client_key==client_key))
+        if not record:
+            return None
+        if not hmac.compare_digest(record.request_hash,request_hash):
+            raise HTTPException(409,'La clave de reintento ya fue utilizada con otros datos. Actualiza la pantalla antes de continuar.')
+        account=db.get(Account,record.account_id)
+        if not account:
+            raise HTTPException(409,'La cuenta asociada al reintento ya no está disponible.')
+        return account
+
+    def duplicate_response(account):
+        table_id=db.scalar(select(TableOccupancy.table_id).where(
+            TableOccupancy.account_id==account.id))
+        return {'id':account.id,'table_id':table_id,'duplicate':True}
+
+    previous=existing_create()
+    if previous:
+        return duplicate_response(previous)
+
     period=active_period(db)  # Locks the current shift against a concurrent close.
     if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id==period.id)):
         raise HTTPException(409,'El reparto de propinas ya fue generado; el turno está en proceso de cierre. Abre un nuevo turno para continuar.')
@@ -1372,8 +1656,12 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
     if data.table_id is not None:
         table=db.execute(select(DiningTable).where(DiningTable.id==data.table_id).with_for_update()).scalar_one_or_none()
         if not table or not table.active:raise HTTPException(404,'La mesa no existe o está desactivada')
-        if db.get(TableOccupancy,table.id):raise HTTPException(409,'Esta mesa ya está ocupada. Actualiza la lista de mesas.')
-    account_name=(data.name or '').strip()
+        if db.get(TableOccupancy,table.id):
+            previous=existing_create()
+            if previous:
+                return duplicate_response(previous)
+            raise HTTPException(409,'Esta mesa ya está ocupada. Actualiza la lista de mesas.')
+    account_name=payload['name']
     if not account_name and table:account_name=table.name
     if not account_name:raise HTTPException(400,'Escribe un nombre para la cuenta libre o selecciona una mesa')
     a=Account(name=account_name,owner_id=user.id)
@@ -1382,13 +1670,20 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
     if table:
         db.add(TableOccupancy(table_id=table.id,account_id=a.id,assigned_by=user.id))
         audit(db,user,'table.assign',table_id=table.id,table_name=table.name,account_id=a.id,waiter=user.display)
+    if client_key:
+        db.add(AccountCreateKey(user_id=user.id,client_key=client_key,
+            account_id=a.id,request_hash=request_hash))
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        previous=existing_create()
+        if previous:
+            return duplicate_response(previous)
         raise HTTPException(409,'La mesa acaba de ser ocupada por otro mesero. Actualiza las mesas.')
     await notify()
-    return {'id':a.id,'table_id':table.id if table else None}
+    return {'id':a.id,'table_id':table.id if table else None,'duplicate':False}
+
 class VoidAccountIn(BaseModel):
     reason:str=Field(min_length=3,max_length=400)
 
@@ -1410,32 +1705,88 @@ async def void_account(account_id:int,data:VoidAccountIn,db:Session=Depends(db_s
 def account_detail(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier','waiter')
     a=owner_account(db,user,account_id,allowed=None)
-    batches=db.scalars(select(Batch).where(Batch.account_id==a.id).order_by(Batch.id)).all()
-    result=account_dict(db,a);result['items']=[];result['batches']=[]
-    for b in batches:
-        items=db.scalars(select(OrderItem).where(OrderItem.batch_id==b.id)).all()
-        result['batches'].append({'id':b.id,'sent_by':db.get(User,b.sent_by).display,'created_at':b.created_at.isoformat() if b.created_at else ''})
-        for i in items:
-            meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==i.id))
-            try:modifiers=json.loads(meta.modifiers_json or '[]') if meta else []
-            except Exception:modifiers=[]
-            result['items'].append({'id':i.id,'batch_id':b.id,'name':i.name,'station':i.station,'price':amount(i.price_cents),
-                'qty':i.qty,'cancelled_qty':i.cancelled_qty,'note':i.note,'variant_name':meta.variant_name if meta else '',
-                'modifiers':modifiers,'prep_minutes':meta.prep_minutes if meta else 15,
-                'release_after_minutes':meta.release_after_minutes if meta else 0,'promotion_name':meta.promotion_name if meta else ''})
-    result['payments']=[{'id':p.id,'method':p.method,'amount':amount(p.cents),'received':amount(p.received_cents),
-                         'tip':amount(db.scalar(select(PaymentTip.cents).where(PaymentTip.payment_id==p.id)) or 0),
-                         'created_at':p.created_at.isoformat() if p.created_at else ''} for p in db.scalars(select(Payment).where(Payment.account_id==a.id).order_by(Payment.id))]
-    result['discounts']=[{'id':d.id,'scope':d.scope,'item_id':d.item_id,
-                          'item_name':(db.get(OrderItem,d.item_id).name if d.item_id and db.get(OrderItem,d.item_id) else ''),
-                          'mode':d.mode,'value':d.value_text,'base':amount(d.base_cents),
-                          'amount':amount(d.discount_cents),'reason':d.reason,'status':d.status,
-                          'created_at':d.created_at.isoformat() if d.created_at else ''}
-                         for d in db.scalars(select(AccountDiscount).where(AccountDiscount.account_id==a.id).order_by(AccountDiscount.id))]
-    result['tips']=[{'id':t.id,'payment_id':t.payment_id,'method':t.method,'amount':amount(t.cents),
-                     'created_at':t.created_at.isoformat() if t.created_at else ''}
-                    for t in db.scalars(select(PaymentTip).where(PaymentTip.account_id==a.id).order_by(PaymentTip.id))]
+    batches=db.scalars(select(Batch).where(
+        Batch.account_id==a.id).order_by(Batch.id)).all()
+    batch_ids=[row.id for row in batches]
+    items=db.scalars(select(OrderItem).where(
+        OrderItem.batch_id.in_(batch_ids)).order_by(
+        OrderItem.batch_id,OrderItem.id)).all() if batch_ids else []
+    item_ids=[row.id for row in items]
+    meta_rows=db.scalars(select(OrderItemMeta).where(
+        OrderItemMeta.order_item_id.in_(item_ids))).all() if item_ids else []
+    meta_by_item={row.order_item_id:row for row in meta_rows}
+    item_by_id={row.id:row for row in items}
+
+    sender_ids={row.sent_by for row in batches if row.sent_by is not None}
+    sender_map={row.id:row.display for row in db.scalars(
+        select(User).where(User.id.in_(sender_ids))).all()} if sender_ids else {}
+
+    payments=db.scalars(select(Payment).where(
+        Payment.account_id==a.id).order_by(Payment.id)).all()
+    tips=db.scalars(select(PaymentTip).where(
+        PaymentTip.account_id==a.id).order_by(PaymentTip.id)).all()
+    tip_by_payment={row.payment_id:row.cents for row in tips}
+    discounts=db.scalars(select(AccountDiscount).where(
+        AccountDiscount.account_id==a.id).order_by(AccountDiscount.id)).all()
+
+    result=account_dict_many(db,[a])[0]
+    result['items']=[]
+    result['batches']=[
+        {'id':batch.id,'sent_by':sender_map.get(batch.sent_by,'?'),
+         'created_at':batch.created_at.isoformat() if batch.created_at else ''}
+        for batch in batches
+    ]
+    for item in items:
+        meta=meta_by_item.get(item.id)
+        try:
+            modifiers=json.loads(meta.modifiers_json or '[]') if meta else []
+        except (TypeError,ValueError):
+            modifiers=[]
+        result['items'].append({
+            'id':item.id,'batch_id':item.batch_id,'name':item.name,
+            'station':item.station,'price':amount(item.price_cents),
+            'qty':item.qty,'cancelled_qty':item.cancelled_qty,'note':item.note,
+            'variant_name':meta.variant_name if meta else '',
+            'modifiers':modifiers,'prep_minutes':meta.prep_minutes if meta else 15,
+            'release_after_minutes':meta.release_after_minutes if meta else 0,
+            'promotion_name':meta.promotion_name if meta else ''
+        })
+    result['payments']=[
+        {'id':payment.id,'method':payment.method,'amount':amount(payment.cents),
+         'received':amount(payment.received_cents),
+         'tip':amount(tip_by_payment.get(payment.id,0)),
+         'created_at':payment.created_at.isoformat() if payment.created_at else ''}
+        for payment in payments
+    ]
+    result['discounts']=[
+        {'id':discount.id,'scope':discount.scope,'item_id':discount.item_id,
+         'item_name':(item_by_id[discount.item_id].name
+                      if discount.item_id in item_by_id else ''),
+         'mode':discount.mode,'value':discount.value_text,
+         'base':amount(discount.base_cents),'amount':amount(discount.discount_cents),
+         'reason':discount.reason,'status':discount.status,
+         'created_at':discount.created_at.isoformat() if discount.created_at else ''}
+        for discount in discounts
+    ]
+    result['tips']=[
+        {'id':tip.id,'payment_id':tip.payment_id,'method':tip.method,
+         'amount':amount(tip.cents),
+         'created_at':tip.created_at.isoformat() if tip.created_at else ''}
+        for tip in tips
+    ]
     return result
+
+@app.get('/api/cashier/overview')
+def cashier_overview(account_id:Optional[int]=None,db:Session=Depends(db_session),
+                     user:User=Depends(auth)):
+    """Una sola respuesta para lista de cobros y detalle inicial seleccionado."""
+    allow(user,'owner','admin','cashier')
+    pending=[row for row in accounts(db,user) if row['status']=='pending']
+    pending_ids={row['id'] for row in pending}
+    selected_id=account_id if account_id in pending_ids else (pending[0]['id'] if pending else None)
+    selected=account_detail(selected_id,db,user) if selected_id is not None else None
+    return {'accounts':pending,'selected':selected}
+
 class ReassignIn(BaseModel): owner_id:int;reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/accounts/{account_id}/reassign')
 async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -2313,16 +2664,29 @@ def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier')
     p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
     if not p:return {'open':False}
-    payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
-    totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
-    tips=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id)).all()
-    tip_totals={method:sum(x.cents for x in tips if x.method==method) for method in ('cash','card','transfer')}
+    totals={method:0 for method in ('cash','card','transfer')}
+    for method,value in db.execute(
+        select(Payment.method,func.coalesce(func.sum(Payment.cents),0))
+        .where(Payment.period_id==p.id).group_by(Payment.method)
+    ).all():
+        if method in totals:totals[method]=int(value or 0)
+    tip_totals={method:0 for method in ('cash','card','transfer')}
+    for method,value in db.execute(
+        select(PaymentTip.method,func.coalesce(func.sum(PaymentTip.cents),0))
+        .where(PaymentTip.period_id==p.id).group_by(PaymentTip.method)
+    ).all():
+        if method in tip_totals:tip_totals[method]=int(value or 0)
     moves=db.scalars(select(CashMovement).where(CashMovement.period_id==p.id)).all()
     net=sum((1 if x.kind=='in' else -1)*x.cents for x in moves if x.status=='approved')
     tip_payout_cash=tip_payout_cash_total(db,p.id)
     expected=p.opening_cents+totals['cash']+tip_totals['cash']+net-tip_payout_cash
     tip_distribution=db.scalar(select(TipDistribution).where(TipDistribution.period_id==p.id))
-    blocking=db.scalars(select(Account).where(Account.status.notin_(('paid','cancelled'))).order_by(Account.id)).all()
+    blocking_query=Account.status.notin_(('paid','cancelled'))
+    blocking_count=db.scalar(select(func.count(Account.id)).where(blocking_query)) or 0
+    blocking=db.scalars(
+        select(Account).where(blocking_query).order_by(Account.id).limit(50)
+    ).all()
+    blocking_data=account_dict_many(db,blocking)
     return {'open':True,'id':p.id,'opened_at':p.opened_at.isoformat(),'opening':amount(p.opening_cents),
             'cash':amount(totals['cash']),'card':amount(totals['card']),'transfer':amount(totals['transfer']),
             'tips':amount(sum(tip_totals.values())),'tip_cash':amount(tip_totals['cash']),
@@ -2330,8 +2694,8 @@ def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
             'tip_payout_cash':amount(tip_payout_cash),
             'tip_distribution':tip_distribution_dict(db,tip_distribution),
             'expected':amount(expected),'movements':[{'id':m.id,'kind':m.kind,'amount':amount(m.cents),'reason':m.reason,'status':m.status} for m in moves],
-            'blocking_count':len(blocking),'blocking_accounts':[account_dict(db,a) for a in blocking[:50]],
-            'can_close':not blocking and not any(m.status=='pending' for m in moves)}
+            'blocking_count':int(blocking_count),'blocking_accounts':blocking_data,
+            'can_close':blocking_count==0 and not any(m.status=='pending' for m in moves)}
 class MovementIn(BaseModel):kind:Literal['in','out'];amount:Decimal=Field(gt=0);reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/cash/movements')
 async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depends(auth)):
