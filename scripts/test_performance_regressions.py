@@ -82,5 +82,83 @@ try:
         )
         print(f"OK: catálogo completo con {len(statements)} consultas SELECT; sin N+1.")
 
+        # La lista de cuentas también debe usar agregados en bloque, no consultar
+        # productos, descuentos, pagos y mesas una vez por cada cuenta.
+        with app.SessionLocal() as db:
+            period = app.CashPeriod(opening_cents=0)
+            db.add(period)
+            db.flush()
+            accounts = []
+            items = []
+            for number in range(12):
+                account = app.Account(name=f"Cuenta perf {number}", owner_id=owner_id)
+                db.add(account)
+                db.flush()
+                batch = app.Batch(
+                    account_id=account.id, sent_by=owner_id,
+                    client_key=f"perf-{uuid4().hex}",
+                )
+                db.add(batch)
+                db.flush()
+                item = app.OrderItem(
+                    batch_id=batch.id, product_id=product_id,
+                    name="Producto perf", station="kitchen",
+                    price_cents=12500, qty=number + 1, cancelled_qty=0,
+                )
+                db.add(item)
+                accounts.append(account)
+                items.append(item)
+            db.flush()
+            db.add(app.AccountDiscount(
+                account_id=accounts[0].id, item_id=items[0].id,
+                created_by=owner_id, mode="fixed", scope="account",
+                value_text="10.00", base_cents=12500, discount_cents=1000,
+                reason="Prueba de agregados", status="applied",
+            ))
+            db.add(app.Payment(
+                account_id=accounts[0].id, cashier_id=owner_id,
+                period_id=period.id, client_key=f"perf-pay-{uuid4().hex}",
+                method="cash", cents=1000, received_cents=1000,
+            ))
+            table = app.DiningTable(
+                name="Mesa perf", name_key="mesa perf", area="Pruebas",
+                capacity=4, active=True,
+            )
+            db.add(table)
+            db.flush()
+            db.add(app.TableOccupancy(
+                table_id=table.id, account_id=accounts[1].id,
+                assigned_by=owner_id, assigned_at=app.now(),
+            ))
+            db.commit()
+            first_account_id = accounts[0].id
+            second_account_id = accounts[1].id
+            expected_table_id = table.id
+
+        statements.clear()
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get("/api/accounts", headers=headers)
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+
+        assert response.status_code == 200, response.text
+        account_rows = response.json()
+        assert len(account_rows) == 12, len(account_rows)
+        first = next(row for row in account_rows if row["id"] == first_account_id)
+        assert first["gross_total"] == "125.00", first
+        assert first["discount_total"] == "10.00", first
+        assert first["total"] == "115.00", first
+        assert first["paid"] == "10.00", first
+        assert first["due"] == "105.00", first
+        second = next(row for row in account_rows if row["id"] == second_account_id)
+        assert second["table_id"] == expected_table_id, second
+        assert second["table_name"] == "Mesa perf", second
+        assert len(statements) <= 9, (
+            "GET /api/accounts volvió a ejecutar consultas por cuenta: "
+            + str(len(statements))
+        )
+        print(f"OK: 12 cuentas con {len(statements)} consultas SELECT; totales y mesa correctos.")
+
 finally:
     dbfile.unlink(missing_ok=True)
