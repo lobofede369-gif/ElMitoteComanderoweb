@@ -168,6 +168,7 @@ function logout(reason='manual'){
   }).catch(()=>{});}
   if(reason==='manual'&&window.MitoteAndroid){try{window.MitoteAndroid.clearSession()}catch(e){}}
   if(reason==='manual'&&state.user){try{localStorage.removeItem(workKey())}catch{}}
+  if(typeof stopPrepClock==='function')stopPrepClock();
   state.apiInflight.clear();
   state.token='';state.user=null;state.screen='';state.navStack=[];state.waiterReadyInitialized=false;state.waiterReadySeen=new Set();
   localStorage.removeItem('mitote-token');sessionStorage.removeItem('mitote-token');localStorage.removeItem('mitote-screen');
@@ -216,6 +217,7 @@ async function render(options={}){
   if(!state.user)return;
   const area=$('#content');
   const screen=state.screen;
+  if(!['station','history','tickets'].includes(screen)&&typeof stopPrepClock==='function')stopPrepClock();
   const seq=++state.renderSeq;
   // Las lecturas de una pantalla anterior no deben bloquear ni contaminar la nueva.
   state.apiInflight.clear();
