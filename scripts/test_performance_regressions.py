@@ -14,6 +14,7 @@ os.environ.pop("FIREBASE_SERVICE_ACCOUNT_JSON", None)
 os.environ.pop("OWNER_RECOVERY_TOKEN", None)
 
 import app
+import mitote_extensions as ext
 from sqlalchemy import event
 from fastapi.testclient import TestClient
 
@@ -106,6 +107,10 @@ try:
                     price_cents=12500, qty=number + 1, cancelled_qty=0,
                 )
                 db.add(item)
+                db.flush()
+                db.add(app.StationTicket(batch_id=batch.id, station="kitchen", status="new"))
+                db.add(app.OrderItemMeta(order_item_id=item.id))
+                db.add(ext.BatchPrep(batch_id=batch.id, minutes=25))
                 accounts.append(account)
                 items.append(item)
             db.flush()
@@ -125,6 +130,12 @@ try:
                 capacity=4, active=True,
             )
             db.add(table)
+            for number in range(1, 12):
+                db.add(app.DiningTable(
+                    name=f"Mesa perf {number}", name_key=f"mesa perf {number}",
+                    area="Pruebas", capacity=4, active=True,
+                    sort_order=number,
+                ))
             db.flush()
             db.add(app.TableOccupancy(
                 table_id=table.id, account_id=accounts[1].id,
@@ -159,6 +170,42 @@ try:
             + str(len(statements))
         )
         print(f"OK: 12 cuentas con {len(statements)} consultas SELECT; totales y mesa correctos.")
+
+        statements.clear()
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get("/api/tables", headers=headers)
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+        assert response.status_code == 200, response.text
+        table_rows = response.json()
+        assert len(table_rows) == 12, len(table_rows)
+        occupied = next(row for row in table_rows if row["id"] == expected_table_id)
+        assert occupied["status"] == "occupied", occupied
+        assert occupied["account_id"] == second_account_id, occupied
+        assert len(statements) <= 4, (
+            "GET /api/tables volvió a consultar ocupación por mesa: "
+            + str(len(statements))
+        )
+        print(f"OK: 12 mesas con {len(statements)} consultas SELECT; ocupación correcta.")
+
+        statements.clear()
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get("/api/preparation/tickets", headers=headers)
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+        assert response.status_code == 200, response.text
+        prep = response.json()
+        assert len(prep["tickets"]) == 12, len(prep["tickets"])
+        newest = prep["tickets"][0]
+        assert newest["items"][0]["name"] == "Producto perf", newest
+        assert newest["batch_minutes"] == 25, newest
+        assert len(statements) <= 13, (
+            "GET /api/preparation/tickets volvió a ejecutar consultas por comanda: "
+            + str(len(statements))
+        )
+        print(f"OK: 12 comandas de cocina con {len(statements)} consultas SELECT; cronómetros correctos.")
 
 finally:
     dbfile.unlink(missing_ok=True)
