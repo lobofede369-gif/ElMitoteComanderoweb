@@ -566,6 +566,30 @@ async def lifespan(app):
 app=FastAPI(title='El Mitote Comandas',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 
+http_log=logging.getLogger('mitote.http')
+
+@app.middleware("http")
+async def observe_request_performance(request:Request,call_next):
+    """Expose server time and log only slow/failed requests without customer data."""
+    request_id=request.headers.get('x-request-id') or secrets.token_hex(8)
+    started=time.perf_counter()
+    try:
+        response=await call_next(request)
+    except Exception:
+        elapsed_ms=(time.perf_counter()-started)*1000
+        http_log.exception(
+            "request_failed id=%s method=%s path=%s duration_ms=%.1f",
+            request_id,request.method,request.url.path,elapsed_ms)
+        raise
+    elapsed_ms=(time.perf_counter()-started)*1000
+    response.headers["X-Request-ID"]=request_id
+    response.headers["Server-Timing"]=f"app;dur={elapsed_ms:.1f}"
+    if elapsed_ms>=500:
+        http_log.warning(
+            "slow_request id=%s method=%s path=%s status=%s duration_ms=%.1f",
+            request_id,request.method,request.url.path,response.status_code,elapsed_ms)
+    return response
+
 @app.get('/')
 def root(): return FileResponse('static/index.html')
 @app.get('/sw.js')
