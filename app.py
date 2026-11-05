@@ -1582,6 +1582,37 @@ def accounts(db:Session=Depends(db_session),user:User=Depends(auth)):
     else:q=q.limit(200)
     rows=db.scalars(q).all()
     return account_dict_many(db,rows)
+
+@app.get('/api/overview')
+def overview(db:Session=Depends(db_session),user:User=Depends(auth)):
+    """Resumen compacto del panel: métricas agregadas sin descargar listas completas."""
+    allow(user,'owner','admin')
+    period=db.scalar(select(CashPeriod).where(
+        CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    status_counts={}
+    new_tickets=0
+    if period:
+        status_counts=dict(db.execute(
+            select(Account.status,func.count(Account.id))
+            .where(Account.created_at>=period.opened_at)
+            .group_by(Account.status)
+        ).all())
+        new_tickets=db.scalar(
+            select(func.count(StationTicket.id))
+            .join(Batch,Batch.id==StationTicket.batch_id)
+            .where(Batch.created_at>=period.opened_at,StationTicket.status=='new')
+        ) or 0
+    product_count=db.scalar(
+        select(func.count(Product.id))
+        .outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id)
+        .where(ArchivedProduct.product_id.is_(None))
+    ) or 0
+    return {
+        'active_accounts':int(status_counts.get('open',0)+status_counts.get('pending',0)),
+        'pending_accounts':int(status_counts.get('pending',0)),
+        'new_tickets':int(new_tickets),
+        'products':int(product_count),
+    }
 class AccountIn(BaseModel):
     name:Optional[str]=Field(default=None,max_length=120)
     table_id:Optional[int]=None
@@ -1744,6 +1775,17 @@ def account_detail(account_id:int,db:Session=Depends(db_session),user:User=Depen
         for tip in tips
     ]
     return result
+
+@app.get('/api/cashier/overview')
+def cashier_overview(account_id:Optional[int]=None,db:Session=Depends(db_session),
+                     user:User=Depends(auth)):
+    """Una sola respuesta para lista de cobros y detalle inicial seleccionado."""
+    allow(user,'owner','admin','cashier')
+    pending=[row for row in accounts(db,user) if row['status']=='pending']
+    pending_ids={row['id'] for row in pending}
+    selected_id=account_id if account_id in pending_ids else (pending[0]['id'] if pending else None)
+    selected=account_detail(selected_id,db,user) if selected_id is not None else None
+    return {'accounts':pending,'selected':selected}
 
 class ReassignIn(BaseModel): owner_id:int;reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/accounts/{account_id}/reassign')
@@ -2622,16 +2664,29 @@ def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier')
     p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
     if not p:return {'open':False}
-    payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
-    totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
-    tips=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id)).all()
-    tip_totals={method:sum(x.cents for x in tips if x.method==method) for method in ('cash','card','transfer')}
+    totals={method:0 for method in ('cash','card','transfer')}
+    for method,value in db.execute(
+        select(Payment.method,func.coalesce(func.sum(Payment.cents),0))
+        .where(Payment.period_id==p.id).group_by(Payment.method)
+    ).all():
+        if method in totals:totals[method]=int(value or 0)
+    tip_totals={method:0 for method in ('cash','card','transfer')}
+    for method,value in db.execute(
+        select(PaymentTip.method,func.coalesce(func.sum(PaymentTip.cents),0))
+        .where(PaymentTip.period_id==p.id).group_by(PaymentTip.method)
+    ).all():
+        if method in tip_totals:tip_totals[method]=int(value or 0)
     moves=db.scalars(select(CashMovement).where(CashMovement.period_id==p.id)).all()
     net=sum((1 if x.kind=='in' else -1)*x.cents for x in moves if x.status=='approved')
     tip_payout_cash=tip_payout_cash_total(db,p.id)
     expected=p.opening_cents+totals['cash']+tip_totals['cash']+net-tip_payout_cash
     tip_distribution=db.scalar(select(TipDistribution).where(TipDistribution.period_id==p.id))
-    blocking=db.scalars(select(Account).where(Account.status.notin_(('paid','cancelled'))).order_by(Account.id)).all()
+    blocking_query=Account.status.notin_(('paid','cancelled'))
+    blocking_count=db.scalar(select(func.count(Account.id)).where(blocking_query)) or 0
+    blocking=db.scalars(
+        select(Account).where(blocking_query).order_by(Account.id).limit(50)
+    ).all()
+    blocking_data=account_dict_many(db,blocking)
     return {'open':True,'id':p.id,'opened_at':p.opened_at.isoformat(),'opening':amount(p.opening_cents),
             'cash':amount(totals['cash']),'card':amount(totals['card']),'transfer':amount(totals['transfer']),
             'tips':amount(sum(tip_totals.values())),'tip_cash':amount(tip_totals['cash']),
@@ -2639,8 +2694,8 @@ def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
             'tip_payout_cash':amount(tip_payout_cash),
             'tip_distribution':tip_distribution_dict(db,tip_distribution),
             'expected':amount(expected),'movements':[{'id':m.id,'kind':m.kind,'amount':amount(m.cents),'reason':m.reason,'status':m.status} for m in moves],
-            'blocking_count':len(blocking),'blocking_accounts':[account_dict(db,a) for a in blocking[:50]],
-            'can_close':not blocking and not any(m.status=='pending' for m in moves)}
+            'blocking_count':int(blocking_count),'blocking_accounts':blocking_data,
+            'can_close':blocking_count==0 and not any(m.status=='pending' for m in moves)}
 class MovementIn(BaseModel):kind:Literal['in','out'];amount:Decimal=Field(gt=0);reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/cash/movements')
 async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depends(auth)):
