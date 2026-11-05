@@ -647,20 +647,82 @@ def apply_promotion(base_cents, promo):
         return max(0,int((Decimal(base_cents)*(Decimal(100-promo.discount_percent)/Decimal(100))).quantize(Decimal('1'),rounding=ROUND_HALF_UP)))
     return base_cents
 
-def product_dict(p,settings,db=None):
+def product_related_data(db, products):
+    """Carga las relaciones del catálogo en lotes, evitando consultas N+1."""
+    product_ids = [p.id for p in products]
+    if not product_ids:
+        return {"variants": {}, "groups": {}, "options": {}, "promotions": {}}
+
+    variants = db.scalars(
+        select(ProductVariant)
+        .where(ProductVariant.product_id.in_(product_ids))
+        .order_by(ProductVariant.product_id, ProductVariant.sort_order, ProductVariant.id)
+    ).all()
+    groups = db.scalars(
+        select(ProductModifierGroup)
+        .where(ProductModifierGroup.product_id.in_(product_ids))
+        .order_by(ProductModifierGroup.product_id, ProductModifierGroup.sort_order,
+                  ProductModifierGroup.id)
+    ).all()
+    group_ids = [g.id for g in groups]
+    options = db.scalars(
+        select(ProductModifierOption)
+        .where(ProductModifierOption.group_id.in_(group_ids))
+        .order_by(ProductModifierOption.group_id, ProductModifierOption.sort_order,
+                  ProductModifierOption.id)
+    ).all() if group_ids else []
+    promotions = db.scalars(
+        select(ProductPromotion)
+        .where(ProductPromotion.product_id.in_(product_ids))
+        .order_by(ProductPromotion.product_id, ProductPromotion.id.desc())
+    ).all()
+
+    def grouped(rows, key):
+        result = {}
+        for row in rows:
+            result.setdefault(getattr(row, key), []).append(row)
+        return result
+
+    return {
+        "variants": grouped(variants, "product_id"),
+        "groups": grouped(groups, "product_id"),
+        "options": grouped(options, "group_id"),
+        "promotions": grouped(promotions, "product_id"),
+    }
+
+
+def product_dict(p,settings,db=None,related=None):
     status='No disponible' if p.blocked or not p.active else ('Sin control' if not settings.inventory_on or not p.inventory_enabled else ('Agotado' if p.stock==0 else 'Stock bajo' if p.stock<=3 else 'Disponible'))
-    variants=[];groups=[];promotions=[];active_promo=None
-    if db is not None:
-        variants=[{'id':v.id,'name':v.name,'price':amount(v.price_cents),'active':v.active,'sort_order':v.sort_order}
-                  for v in db.scalars(select(ProductVariant).where(ProductVariant.product_id==p.id).order_by(ProductVariant.sort_order,ProductVariant.id))]
-        for g in db.scalars(select(ProductModifierGroup).where(ProductModifierGroup.product_id==p.id).order_by(ProductModifierGroup.sort_order,ProductModifierGroup.id)):
-            options=[{'id':o.id,'name':o.name,'price_delta':amount(o.price_delta_cents),'active':o.active,'sort_order':o.sort_order}
-                     for o in db.scalars(select(ProductModifierOption).where(ProductModifierOption.group_id==g.id).order_by(ProductModifierOption.sort_order,ProductModifierOption.id))]
-            groups.append({'id':g.id,'name':g.name,'min_select':g.min_select,'max_select':g.max_select,'active':g.active,'options':options})
-        promo_rows=db.scalars(select(ProductPromotion).where(ProductPromotion.product_id==p.id).order_by(ProductPromotion.id.desc())).all()
-        promotions=[{'id':x.id,'name':x.name,'price':amount(x.price_cents) if x.price_cents is not None else None,'discount_percent':x.discount_percent,'weekdays':x.weekdays,'start_time':x.start_time,'end_time':x.end_time,'start_date':x.start_date,'end_date':x.end_date,'active':x.active}
-                    for x in promo_rows]
-        active_promo=next((x for x in promo_rows if promotion_is_active(x)),None)
+    variant_rows=[];group_rows=[];option_map={};promo_rows=[]
+    if related is not None:
+        variant_rows=related["variants"].get(p.id, [])
+        group_rows=related["groups"].get(p.id, [])
+        option_map=related["options"]
+        promo_rows=related["promotions"].get(p.id, [])
+    elif db is not None:
+        variant_rows=db.scalars(select(ProductVariant).where(
+            ProductVariant.product_id==p.id).order_by(
+            ProductVariant.sort_order,ProductVariant.id)).all()
+        group_rows=db.scalars(select(ProductModifierGroup).where(
+            ProductModifierGroup.product_id==p.id).order_by(
+            ProductModifierGroup.sort_order,ProductModifierGroup.id)).all()
+        for group in group_rows:
+            option_map[group.id]=db.scalars(select(ProductModifierOption).where(
+                ProductModifierOption.group_id==group.id).order_by(
+                ProductModifierOption.sort_order,ProductModifierOption.id)).all()
+        promo_rows=db.scalars(select(ProductPromotion).where(
+            ProductPromotion.product_id==p.id).order_by(ProductPromotion.id.desc())).all()
+
+    variants=[{'id':v.id,'name':v.name,'price':amount(v.price_cents),'active':v.active,'sort_order':v.sort_order}
+              for v in variant_rows]
+    groups=[]
+    for g in group_rows:
+        options=[{'id':o.id,'name':o.name,'price_delta':amount(o.price_delta_cents),'active':o.active,'sort_order':o.sort_order}
+                 for o in option_map.get(g.id, [])]
+        groups.append({'id':g.id,'name':g.name,'min_select':g.min_select,'max_select':g.max_select,'active':g.active,'options':options})
+    promotions=[{'id':x.id,'name':x.name,'price':amount(x.price_cents) if x.price_cents is not None else None,'discount_percent':x.discount_percent,'weekdays':x.weekdays,'start_time':x.start_time,'end_time':x.end_time,'start_date':x.start_date,'end_date':x.end_date,'active':x.active}
+                for x in promo_rows]
+    active_promo=next((x for x in promo_rows if promotion_is_active(x)),None)
     current_cents=apply_promotion(p.price_cents,active_promo)
     return {'id':p.id,'name':p.name,'category':p.category,'station':p.station,'price':amount(p.price_cents),
             'current_price':amount(current_cents),'promotion':({'id':active_promo.id,'name':active_promo.name,'price':amount(current_cents),'fixed_price':amount(active_promo.price_cents) if active_promo.price_cents is not None else None,'discount_percent':active_promo.discount_percent} if active_promo else None),
@@ -1084,7 +1146,9 @@ def products(db:Session=Depends(db_session),user:User=Depends(auth)):
     s=db.get(Setting,1)
     query=select(Product).outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id).where(
         ArchivedProduct.product_id.is_(None)).order_by(Product.category,Product.name)
-    return [product_dict(p,s,db) for p in db.scalars(query)]
+    rows=db.scalars(query).all()
+    related=product_related_data(db,rows)
+    return [product_dict(p,s,related=related) for p in rows]
 class RemoveCategoryIn(BaseModel):
     name:str=Field(min_length=1,max_length=80)
     destination:str=Field(min_length=1,max_length=80)
