@@ -120,10 +120,17 @@ try:
                 value_text="10.00", base_cents=12500, discount_cents=1000,
                 reason="Prueba de agregados", status="applied",
             ))
-            db.add(app.Payment(
+            payment = app.Payment(
                 account_id=accounts[0].id, cashier_id=owner_id,
                 period_id=period.id, client_key=f"perf-pay-{uuid4().hex}",
                 method="cash", cents=1000, received_cents=1000,
+            )
+            db.add(payment)
+            db.flush()
+            db.add(app.PaymentTip(
+                payment_id=payment.id, account_id=accounts[0].id,
+                cashier_id=owner_id, period_id=period.id,
+                method="cash", cents=200,
             ))
             table = app.DiningTable(
                 name="Mesa perf", name_key="mesa perf", area="Pruebas",
@@ -170,6 +177,24 @@ try:
             + str(len(statements))
         )
         print(f"OK: 12 cuentas con {len(statements)} consultas SELECT; totales y mesa correctos.")
+
+        statements.clear()
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get(f"/api/accounts/{first_account_id}", headers=headers)
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+        assert response.status_code == 200, response.text
+        detail = response.json()
+        assert len(detail["items"]) == 1, detail["items"]
+        assert detail["payments"][0]["tip"] == "2.00", detail["payments"]
+        assert detail["tips"][0]["amount"] == "2.00", detail["tips"]
+        assert detail["discounts"][0]["item_name"] == "Producto perf", detail["discounts"]
+        assert len(statements) <= 15, (
+            "GET /api/accounts/{id} volvió a ejecutar consultas por producto: "
+            + str(len(statements))
+        )
+        print(f"OK: detalle de cuenta con {len(statements)} consultas SELECT; historial contable íntegro.")
 
         statements.clear()
         event.listen(app.engine, "before_cursor_execute", count_selects)
