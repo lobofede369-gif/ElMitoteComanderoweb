@@ -1567,9 +1567,14 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
             raise HTTPException(409,'La cuenta asociada al reintento ya no está disponible.')
         return account
 
+    def duplicate_response(account):
+        table_id=db.scalar(select(TableOccupancy.table_id).where(
+            TableOccupancy.account_id==account.id))
+        return {'id':account.id,'table_id':table_id,'duplicate':True}
+
     previous=existing_create()
     if previous:
-        return {'id':previous.id,'table_id':None,'duplicate':True}
+        return duplicate_response(previous)
 
     period=active_period(db)  # Locks the current shift against a concurrent close.
     if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id==period.id)):
@@ -1581,7 +1586,7 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
         if db.get(TableOccupancy,table.id):
             previous=existing_create()
             if previous:
-                return {'id':previous.id,'table_id':None,'duplicate':True}
+                return duplicate_response(previous)
             raise HTTPException(409,'Esta mesa ya está ocupada. Actualiza la lista de mesas.')
     account_name=payload['name']
     if not account_name and table:account_name=table.name
@@ -1601,7 +1606,7 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
         db.rollback()
         previous=existing_create()
         if previous:
-            return {'id':previous.id,'table_id':None,'duplicate':True}
+            return duplicate_response(previous)
         raise HTTPException(409,'La mesa acaba de ser ocupada por otro mesero. Actualiza las mesas.')
     await notify()
     return {'id':a.id,'table_id':table.id if table else None,'duplicate':False}
