@@ -8,8 +8,8 @@ self.addEventListener('push',event=>{
   const url=typeof data.url==='string'&&data.url.startsWith('/')&&!data.url.startsWith('//')?data.url:'/';
   event.waitUntil(self.registration.showNotification(title,{
     body,icon:'/static/assets/icon-192.png',badge:'/static/assets/icon-192.png',
-    tag:String(data.tag||'mitote-notificacion'),renotify:true,requireInteraction:true,
-    data:{url}
+    tag:String(data.tag||'mitote-notificacion'),renotify:false,requireInteraction:true,
+    data:{url,eventId:String(data.event_id||'')}
   }));
 });
 self.addEventListener('notificationclick',event=>{
