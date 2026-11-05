@@ -873,12 +873,28 @@ def login_pin(data: PinLoginIn, request: Request, db: Session = Depends(db_sessi
     attempts = [t for t in login_failures.get(identifier, []) if time.time() - t < 600]
     if len(attempts) >= 15:
         raise HTTPException(429, 'Demasiados intentos. Espera 10 minutos.')
-    rec = db.scalar(select(UserPin).where(UserPin.lookup == _pin_lookup(data.pin)))
-    user = db.get(User, rec.user_id) if rec else None
+    lookup_started = time.perf_counter()
+    match = db.execute(
+        select(UserPin, User)
+        .join(User, User.id == UserPin.user_id)
+        .where(UserPin.lookup == _pin_lookup(data.pin))
+    ).first()
+    lookup_ms = (time.perf_counter() - lookup_started) * 1000
+    rec, user = match if match else (None, None)
+
+    verify_started = time.perf_counter()
     try:
         valid = bool(user and user.active and ph.verify(rec.pin_hash, data.pin))
     except (VerifyMismatchError, VerificationError):
         valid = False
+    verify_ms = (time.perf_counter() - verify_started) * 1000
+
+    total_ms = lookup_ms + verify_ms
+    if total_ms >= 250:
+        http_log.warning(
+            "slow_pin_login lookup_ms=%.1f argon2_ms=%.1f total_ms=%.1f outcome=%s",
+            lookup_ms, verify_ms, total_ms, "success" if valid else "rejected",
+        )
     if not valid:
         attempts.append(time.time())
         login_failures[identifier] = attempts
