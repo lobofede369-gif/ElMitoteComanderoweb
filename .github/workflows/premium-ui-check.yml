@@ -73,7 +73,7 @@ jobs:
           assert 'data-demo-pin="444444"' in html
           assert 'data-demo-pin="555555"' in html
           assert 'DEMO_MODE' in Path('app.py').read_text(encoding='utf-8')
-          assert 'function _seed_demo_data(db: Session)' in Path('app.py').read_text(encoding='utf-8')
+          assert 'def _seed_demo_data(db: Session)' in Path('app.py').read_text(encoding='utf-8')
           assert 'theme-pin-login.css?v=1' in sw
           assert 'id="login-pin-form"' in html
           assert 'id="login-pin"' in html
