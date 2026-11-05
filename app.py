@@ -1563,32 +1563,77 @@ async def void_account(account_id:int,data:VoidAccountIn,db:Session=Depends(db_s
 def account_detail(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier','waiter')
     a=owner_account(db,user,account_id,allowed=None)
-    batches=db.scalars(select(Batch).where(Batch.account_id==a.id).order_by(Batch.id)).all()
-    result=account_dict(db,a);result['items']=[];result['batches']=[]
-    for b in batches:
-        items=db.scalars(select(OrderItem).where(OrderItem.batch_id==b.id)).all()
-        result['batches'].append({'id':b.id,'sent_by':db.get(User,b.sent_by).display,'created_at':b.created_at.isoformat() if b.created_at else ''})
-        for i in items:
-            meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==i.id))
-            try:modifiers=json.loads(meta.modifiers_json or '[]') if meta else []
-            except Exception:modifiers=[]
-            result['items'].append({'id':i.id,'batch_id':b.id,'name':i.name,'station':i.station,'price':amount(i.price_cents),
-                'qty':i.qty,'cancelled_qty':i.cancelled_qty,'note':i.note,'variant_name':meta.variant_name if meta else '',
-                'modifiers':modifiers,'prep_minutes':meta.prep_minutes if meta else 15,
-                'release_after_minutes':meta.release_after_minutes if meta else 0,'promotion_name':meta.promotion_name if meta else ''})
-    result['payments']=[{'id':p.id,'method':p.method,'amount':amount(p.cents),'received':amount(p.received_cents),
-                         'tip':amount(db.scalar(select(PaymentTip.cents).where(PaymentTip.payment_id==p.id)) or 0),
-                         'created_at':p.created_at.isoformat() if p.created_at else ''} for p in db.scalars(select(Payment).where(Payment.account_id==a.id).order_by(Payment.id))]
-    result['discounts']=[{'id':d.id,'scope':d.scope,'item_id':d.item_id,
-                          'item_name':(db.get(OrderItem,d.item_id).name if d.item_id and db.get(OrderItem,d.item_id) else ''),
-                          'mode':d.mode,'value':d.value_text,'base':amount(d.base_cents),
-                          'amount':amount(d.discount_cents),'reason':d.reason,'status':d.status,
-                          'created_at':d.created_at.isoformat() if d.created_at else ''}
-                         for d in db.scalars(select(AccountDiscount).where(AccountDiscount.account_id==a.id).order_by(AccountDiscount.id))]
-    result['tips']=[{'id':t.id,'payment_id':t.payment_id,'method':t.method,'amount':amount(t.cents),
-                     'created_at':t.created_at.isoformat() if t.created_at else ''}
-                    for t in db.scalars(select(PaymentTip).where(PaymentTip.account_id==a.id).order_by(PaymentTip.id))]
+    batches=db.scalars(select(Batch).where(
+        Batch.account_id==a.id).order_by(Batch.id)).all()
+    batch_ids=[row.id for row in batches]
+    items=db.scalars(select(OrderItem).where(
+        OrderItem.batch_id.in_(batch_ids)).order_by(
+        OrderItem.batch_id,OrderItem.id)).all() if batch_ids else []
+    item_ids=[row.id for row in items]
+    meta_rows=db.scalars(select(OrderItemMeta).where(
+        OrderItemMeta.order_item_id.in_(item_ids))).all() if item_ids else []
+    meta_by_item={row.order_item_id:row for row in meta_rows}
+    item_by_id={row.id:row for row in items}
+
+    sender_ids={row.sent_by for row in batches if row.sent_by is not None}
+    sender_map={row.id:row.display for row in db.scalars(
+        select(User).where(User.id.in_(sender_ids))).all()} if sender_ids else {}
+
+    payments=db.scalars(select(Payment).where(
+        Payment.account_id==a.id).order_by(Payment.id)).all()
+    tips=db.scalars(select(PaymentTip).where(
+        PaymentTip.account_id==a.id).order_by(PaymentTip.id)).all()
+    tip_by_payment={row.payment_id:row.cents for row in tips}
+    discounts=db.scalars(select(AccountDiscount).where(
+        AccountDiscount.account_id==a.id).order_by(AccountDiscount.id)).all()
+
+    result=account_dict_many(db,[a])[0]
+    result['items']=[]
+    result['batches']=[
+        {'id':batch.id,'sent_by':sender_map.get(batch.sent_by,'?'),
+         'created_at':batch.created_at.isoformat() if batch.created_at else ''}
+        for batch in batches
+    ]
+    for item in items:
+        meta=meta_by_item.get(item.id)
+        try:
+            modifiers=json.loads(meta.modifiers_json or '[]') if meta else []
+        except (TypeError,ValueError):
+            modifiers=[]
+        result['items'].append({
+            'id':item.id,'batch_id':item.batch_id,'name':item.name,
+            'station':item.station,'price':amount(item.price_cents),
+            'qty':item.qty,'cancelled_qty':item.cancelled_qty,'note':item.note,
+            'variant_name':meta.variant_name if meta else '',
+            'modifiers':modifiers,'prep_minutes':meta.prep_minutes if meta else 15,
+            'release_after_minutes':meta.release_after_minutes if meta else 0,
+            'promotion_name':meta.promotion_name if meta else ''
+        })
+    result['payments']=[
+        {'id':payment.id,'method':payment.method,'amount':amount(payment.cents),
+         'received':amount(payment.received_cents),
+         'tip':amount(tip_by_payment.get(payment.id,0)),
+         'created_at':payment.created_at.isoformat() if payment.created_at else ''}
+        for payment in payments
+    ]
+    result['discounts']=[
+        {'id':discount.id,'scope':discount.scope,'item_id':discount.item_id,
+         'item_name':(item_by_id[discount.item_id].name
+                      if discount.item_id in item_by_id else ''),
+         'mode':discount.mode,'value':discount.value_text,
+         'base':amount(discount.base_cents),'amount':amount(discount.discount_cents),
+         'reason':discount.reason,'status':discount.status,
+         'created_at':discount.created_at.isoformat() if discount.created_at else ''}
+        for discount in discounts
+    ]
+    result['tips']=[
+        {'id':tip.id,'payment_id':tip.payment_id,'method':tip.method,
+         'amount':amount(tip.cents),
+         'created_at':tip.created_at.isoformat() if tip.created_at else ''}
+        for tip in tips
+    ]
     return result
+
 class ReassignIn(BaseModel): owner_id:int;reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/accounts/{account_id}/reassign')
 async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session),user:User=Depends(auth)):
