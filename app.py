@@ -573,8 +573,11 @@ def owner_account(db,user,account_id,allowed=('open','pending')):
     return acc
 
 def account_gross_total(db,acc):
-    rows=db.execute(select(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(Batch.account_id==acc.id)).scalars().all()
-    return sum(x.price_cents*(x.qty-x.cancelled_qty) for x in rows)
+    value=db.scalar(select(func.coalesce(func.sum(
+        OrderItem.price_cents*(OrderItem.qty-func.coalesce(OrderItem.cancelled_qty,0))),0
+    )).select_from(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(
+        Batch.account_id==acc.id))
+    return int(value or 0)
 
 def account_discount_total(db,account_id):
     return db.scalar(select(func.coalesce(func.sum(AccountDiscount.discount_cents),0)).where(
@@ -601,6 +604,63 @@ def account_dict(db,a):
             'table_id':table.id if table else None,'table_name':table.name if table else None,
             'table_area':table.area if table else None,
             'created_at':a.created_at.isoformat() if a.created_at else ''}
+
+def account_dict_many(db, accounts):
+    """Serializa cuentas activas con agregados y relaciones precargadas en bloque."""
+    if not accounts:
+        return []
+    account_ids=[a.id for a in accounts]
+    owner_ids={a.owner_id for a in accounts if a.owner_id is not None}
+
+    gross_rows=db.execute(
+        select(Batch.account_id,func.coalesce(func.sum(
+            OrderItem.price_cents*(OrderItem.qty-func.coalesce(OrderItem.cancelled_qty,0))),0))
+        .join(OrderItem,OrderItem.batch_id==Batch.id)
+        .where(Batch.account_id.in_(account_ids))
+        .group_by(Batch.account_id)
+    ).all()
+    discount_rows=db.execute(
+        select(AccountDiscount.account_id,func.coalesce(func.sum(AccountDiscount.discount_cents),0))
+        .where(AccountDiscount.account_id.in_(account_ids),AccountDiscount.status=='applied')
+        .group_by(AccountDiscount.account_id)
+    ).all()
+    payment_rows=db.execute(
+        select(Payment.account_id,func.coalesce(func.sum(Payment.cents),0))
+        .where(Payment.account_id.in_(account_ids))
+        .group_by(Payment.account_id)
+    ).all()
+    owner_rows=db.scalars(select(User).where(User.id.in_(owner_ids))).all() if owner_ids else []
+    occupancy_rows=db.execute(
+        select(TableOccupancy.account_id,DiningTable.id,DiningTable.name,DiningTable.area)
+        .join(DiningTable,DiningTable.id==TableOccupancy.table_id)
+        .where(TableOccupancy.account_id.in_(account_ids))
+    ).all()
+
+    gross_by={row[0]:int(row[1] or 0) for row in gross_rows}
+    discount_by={row[0]:int(row[1] or 0) for row in discount_rows}
+    paid_by={row[0]:int(row[1] or 0) for row in payment_rows}
+    owner_by={u.id:u.display for u in owner_rows}
+    table_by={row[0]:{"id":row[1],"name":row[2],"area":row[3]} for row in occupancy_rows}
+
+    result=[]
+    for account in accounts:
+        gross=gross_by.get(account.id,0)
+        discounts=discount_by.get(account.id,0)
+        total=max(0,gross-discounts)
+        paid=paid_by.get(account.id,0)
+        table=table_by.get(account.id)
+        result.append({
+            "id":account.id,"name":account.name,"owner_id":account.owner_id,
+            "owner":owner_by.get(account.owner_id,"?"),"status":account.status,
+            "gross_total":amount(gross),"discount_total":amount(discounts),
+            "total":amount(total),"paid":amount(paid),"due":amount(total-paid),
+            "table_id":table["id"] if table else None,
+            "table_name":table["name"] if table else None,
+            "table_area":table["area"] if table else None,
+            "created_at":account.created_at.isoformat() if account.created_at else ""
+        })
+    return result
+
 
 def release_table_for_account(db,a,user,reason):
     occupancy=db.execute(select(TableOccupancy).where(TableOccupancy.account_id==a.id).with_for_update()).scalar_one_or_none()
@@ -1421,7 +1481,8 @@ def accounts(db:Session=Depends(db_session),user:User=Depends(auth)):
     q=select(Account).where(Account.created_at>=p.opened_at).order_by(Account.id.desc())
     if user.role=='waiter':q=q.where(Account.owner_id==user.id)
     else:q=q.limit(200)
-    return [account_dict(db,a) for a in db.scalars(q)]
+    rows=db.scalars(q).all()
+    return account_dict_many(db,rows)
 class AccountIn(BaseModel):
     name:Optional[str]=Field(default=None,max_length=120)
     table_id:Optional[int]=None
