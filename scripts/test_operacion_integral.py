@@ -174,7 +174,7 @@ with TestClient(app.app) as client:
     with app.SessionLocal() as db:
         assert db.get(app.ProductCost,pid) is None
         assert db.scalar(app.select(app.OrderItemCost).where(
-            app.OrderItemCost.order_item_id==item_ids[0])).unit_cost_cents==4000
+            app.OrderItemCost.order_item_id==items[0].id)).unit_cost_cents==4000
 
     # Los cambios de inventario no deben producir cantidades negativas.
     with app.SessionLocal() as db:
