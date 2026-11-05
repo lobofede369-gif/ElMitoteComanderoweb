@@ -393,6 +393,25 @@ class FcmDevice(Base):
     token = Column(String(2048), unique=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=now, nullable=False)
 
+class ReadyNotificationEvent(Base):
+    """Registro persistente de aviso por estación y por comanda.
+
+    Se registra en la MISMA transacción que la transición a READY, de modo que
+    si Render se reinicia el aviso sigue en PostgreSQL.
+    """
+    __tablename__ = 'ready_notification_events'
+    id = Column(Integer, primary_key=True)
+    event_key = Column(String(90), nullable=False, unique=True)
+    ticket_id = Column(Integer, ForeignKey('station_tickets.id'), nullable=False, unique=True)
+    batch_id = Column(Integer, ForeignKey('batches.id'), nullable=False)
+    account_id = Column(Integer, ForeignKey('accounts.id'), nullable=False)
+    waiter_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    station = Column(String(12), nullable=False)
+    complete = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=now, nullable=False)
+    attempted_at = Column(DateTime(timezone=True), nullable=True)
+    acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+
 class Audit(Base):
     __tablename__='audit'
     id=Column(Integer,primary_key=True)
@@ -433,22 +452,92 @@ def bootstrap():
                 _set_user_pin(db,owner,new_pin)
                 db.add(OwnerRecoveryEvent(fingerprint=fingerprint))
                 audit(db,None,'owner.recovery',owner_id=owner.id)
+        # Conservar los pedidos que ya estaban listos durante el turno abierto
+        # cuando se introduce por primera vez el registro persistente.
+        period = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+        if period:
+            ready_rows = db.execute(
+                select(StationTicket,Batch,Account).join(Batch,Batch.id==StationTicket.batch_id)
+                .join(Account,Account.id==Batch.account_id)
+                .where(Batch.created_at>=period.opened_at,StationTicket.status=='ready',
+                       Account.status.in_(('open','pending')))
+            ).all()
+            batch_ids = {b.id for _,b,_ in ready_rows}
+            all_tickets = db.scalars(select(StationTicket).where(StationTicket.batch_id.in_(batch_ids))).all() if batch_ids else []
+            by_batch = {}
+            for ticket in all_tickets:
+                by_batch.setdefault(ticket.batch_id,[]).append(ticket)
+            for ticket,batch,account in ready_rows:
+                if db.scalar(select(ReadyNotificationEvent.id).where(ReadyNotificationEvent.ticket_id==ticket.id)):
+                    continue
+                siblings = by_batch[batch.id]
+                complete = all(x.status=='ready' for x in siblings) and ticket.id==max(
+                    siblings,key=lambda x:(x.ready_at or x.created_at or now(),x.id)).id
+                db.add(ReadyNotificationEvent(event_key=f'ready-{ticket.id}',
+                    ticket_id=ticket.id,batch_id=batch.id,account_id=account.id,
+                    waiter_id=account.owner_id,station=ticket.station,complete=complete,
+                    created_at=ticket.ready_at or now(),attempted_at=now()))
         # Solo aplica menú cuando exista la aprobación explícita en Render.
         menu_photo_import.apply_approved_photo_menu_at_startup(db)
         db.commit()
+
+async def dispatch_ready_notification(event_id:int):
+    """Intenta enviar Web Push y FCM; la consulta del mesero es el respaldo durable."""
+    with SessionLocal() as db:
+        row=db.execute(select(ReadyNotificationEvent).where(
+            ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
+        if not row or row.attempted_at is not None or row.acknowledged_at is not None:return
+        account=db.get(Account,row.account_id)
+        waiter=db.get(User,row.waiter_id)
+        if not account or not waiter or not waiter.active or waiter.role!='waiter':
+            return
+        # Marcar el intento ANTES del transporte evita notificaciones repetidas
+        # tras una ejecución concurrente. El evento siempre queda consultable.
+        row.attempted_at=now()
+        event_key=row.event_key
+        station_label='Cocina' if row.station=='kitchen' else 'Barra'
+        title='El Mitote · Pedido completo' if row.complete else f'El Mitote · {station_label} lista'
+        body=(f'Pedido completo para {account.name} · comanda #{row.batch_id}. ¡Listo para entregar!'
+              if row.complete else f'{station_label} terminó {account.name} · comanda #{row.batch_id}.')
+        payload={'title':title,'body':body,
+                 'url':f'/?push=accounts&account={account.id}',
+                 'kind':'ready_complete' if row.complete else 'ready_station',
+                 'tag':f'mitote-{event_key}','event_id':event_key}
+        recipient=row.waiter_id
+        db.commit()
+    await push_to(payload,role='waiter',user_id=recipient)
+    await fcm_to(payload,role='waiter',user_id=recipient)
+
+
+async def ready_notification_outbox_worker():
+    """Reanuda avisos confirmados en BD cuya entrega no alcanzó a iniciar."""
+    while True:
+        await asyncio.sleep(25)
+        try:
+            with SessionLocal() as db:
+                ids=db.scalars(select(ReadyNotificationEvent.id).where(
+                    ReadyNotificationEvent.attempted_at.is_(None),
+                    ReadyNotificationEvent.acknowledged_at.is_(None)
+                ).order_by(ReadyNotificationEvent.id).limit(40)).all()
+            for event_id in ids:
+                await dispatch_ready_notification(event_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('Error reanudando avisos de pedidos listos')
+
 
 @asynccontextmanager
 async def lifespan(app):
     bootstrap()
     prep_worker=asyncio.create_task(mitote_extensions.prep_alert_worker())
+    ready_worker=asyncio.create_task(ready_notification_outbox_worker())
     try:
         yield
     finally:
-        prep_worker.cancel()
-        try:
-            await prep_worker
-        except asyncio.CancelledError:
-            pass
+        for task in (prep_worker,ready_worker):
+            task.cancel()
+        await asyncio.gather(prep_worker,ready_worker,return_exceptions=True)
 
 app=FastAPI(title='El Mitote Comandas',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory='static'),name='static')
@@ -806,7 +895,8 @@ def _fcm_send_one(device, payload):
               'body': str(payload.get('body','Nuevo aviso'))[:180],
               'route': route,
               'kind': str(payload.get('kind','general'))[:32],
-              'tag': str(payload.get('tag','mitote-aviso'))[:100]},
+              'tag': str(payload.get('tag','mitote-aviso'))[:100],
+              'event_id': str(payload.get('event_id',''))[:90]},
         android=messaging.AndroidConfig(priority='high', ttl=timedelta(minutes=10))
     )
     try:
@@ -1352,7 +1442,15 @@ async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session)
     allow(user,'owner');a=owner_account(db,user,account_id)
     dest=db.get(User,data.owner_id)
     if not dest or not dest.active or dest.role!='waiter':raise HTTPException(400,'El destino debe ser un mesero activo')
-    old=a.owner_id;a.owner_id=dest.id;audit(db,user,'account.reassign',id=a.id,old=old,new=dest.id,reason=data.reason);db.commit();await notify();return {'ok':True}
+    old=a.owner_id;a.owner_id=dest.id
+    # Un aviso no confirmado debe seguir la cuenta hacia el nuevo mesero.
+    pending=db.scalars(select(ReadyNotificationEvent).where(
+        ReadyNotificationEvent.account_id==a.id,ReadyNotificationEvent.acknowledged_at.is_(None))).all()
+    for notice in pending:
+        notice.waiter_id=dest.id
+        notice.attempted_at=None
+    audit(db,user,'account.reassign',id=a.id,old=old,new=dest.id,reason=data.reason)
+    db.commit();await notify();return {'ok':True}
 
 
 # --- Gestión avanzada de cuentas (Fase 2B) ---------------------------------
@@ -1928,40 +2026,42 @@ def tickets(db:Session=Depends(db_session),user:User=Depends(auth)):
     return out
 @app.get('/api/waiter/ready-alerts')
 def waiter_ready_alerts(db:Session=Depends(db_session),user:User=Depends(auth)):
-    """Avisos del turno actual, visibles solo para el mesero responsable.
-
-    Cada ticket genera una sola alerta; la última estación lista se anuncia
-    como comanda completa sin emitir dos notificaciones por el mismo cambio.
-    """
+    """Avisos persistentes sin confirmar, solo para el mesero actual de la cuenta."""
     allow(user,'waiter')
     period=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
     if not period:return []
     rows=db.execute(
-        select(StationTicket,Batch,Account)
-        .join(Batch,Batch.id==StationTicket.batch_id)
-        .join(Account,Account.id==Batch.account_id)
-        .where(Account.owner_id==user.id,Batch.created_at>=period.opened_at,
-               Account.status.in_(('open','pending')),StationTicket.status=='ready')
-        .order_by(StationTicket.ready_at.desc(),StationTicket.id.desc()).limit(80)
+        select(ReadyNotificationEvent,Account).join(Account,ReadyNotificationEvent.account_id==Account.id)
+        .join(Batch,Batch.id==ReadyNotificationEvent.batch_id)
+        .where(ReadyNotificationEvent.waiter_id==user.id,Account.owner_id==user.id,
+               ReadyNotificationEvent.acknowledged_at.is_(None),
+               Batch.created_at>=period.opened_at,Account.status.in_(('open','pending')))
+        .order_by(ReadyNotificationEvent.created_at.desc(),ReadyNotificationEvent.id.desc()).limit(80)
     ).all()
-    if not rows:return []
-    batch_ids={batch.id for _,batch,_ in rows}
-    all_tickets=db.scalars(select(StationTicket).where(StationTicket.batch_id.in_(batch_ids))).all()
-    by_batch={}
-    for ticket in all_tickets:
-        by_batch.setdefault(ticket.batch_id,[]).append(ticket)
-    out=[]
-    for ticket,batch,account in rows:
-        siblings=by_batch[batch.id]
-        complete=all(x.status=='ready' for x in siblings) and ticket.id==max(
-            (x for x in siblings if x.status=='ready'),
-            key=lambda x:(x.ready_at or x.created_at or now(),x.id)).id
-        station='Cocina' if ticket.station=='kitchen' else 'Barra'
-        out.append({'id':f'ready-{ticket.id}','ticket_id':ticket.id,
-                    'batch_id':batch.id,'account_id':account.id,'account':account.name,
-                    'station':ticket.station,'station_name':station,
-                    'complete':complete,'ready_at':ticket.ready_at.isoformat() if ticket.ready_at else ''})
-    return out
+    return [{
+        'id':e.event_key,'event_id':e.id,'ticket_id':e.ticket_id,
+        'batch_id':e.batch_id,'account_id':e.account_id,'account':a.name,
+        'station':e.station,'station_name':'Cocina' if e.station=='kitchen' else 'Barra',
+        'complete':e.complete,'ready_at':e.created_at.isoformat(),
+        'acknowledged':False
+    } for e,a in rows]
+
+
+@app.post('/api/waiter/ready-alerts/{event_id}/ack')
+async def acknowledge_ready_alert(event_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'waiter')
+    row=db.execute(select(ReadyNotificationEvent).where(
+        ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
+    if not row:raise HTTPException(404,'Aviso no encontrado')
+    account=db.get(Account,row.account_id)
+    if row.waiter_id!=user.id or not account or account.owner_id!=user.id:
+        raise HTTPException(403,'Aviso no asignado a este mesero')
+    if row.acknowledged_at is not None:return {'ok':True,'duplicate':True}
+    row.acknowledged_at=now()
+    audit(db,user,'ready.ack',event_id=row.id,ticket_id=row.ticket_id,account_id=row.account_id)
+    db.commit();await notify()
+    return {'ok':True,'duplicate':False}
+
 
 class StatusIn(BaseModel):status:Literal['received','preparing','ready']
 @app.post('/api/tickets/{ticket_id}/status')
@@ -1985,18 +2085,16 @@ async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_sessio
     if data.status=='ready':
         siblings=db.scalars(select(StationTicket).where(StationTicket.batch_id==batch.id)).all()
         complete=bool(siblings) and all(x.status=='ready' for x in siblings)
-    db.commit();await notify()
+    event_id=None
     if data.status=='ready':
-        station_label='Cocina' if station=='kitchen' else 'Barra'
-        title='El Mitote · Pedido completo' if complete else f'El Mitote · {station_label} lista'
-        body=(f'Pedido completo para {account_name} · comanda #{batch.id}. ¡Listo para entregar!'
-              if complete else f'{station_label} terminó {account_name} · comanda #{batch.id}.')
-        payload={'title':title,'body':body,
-                 'url':f'/?push=accounts&account={account.id}',
-                 'kind':'ready_complete' if complete else 'ready_station',
-                 'tag':f'mitote-ready-{t.id}'}
-        await push_to(payload,role='waiter',user_id=owner_id)
-        await fcm_to(payload,role='waiter',user_id=owner_id)
+        event=ReadyNotificationEvent(event_key=f'ready-{t.id}',
+            ticket_id=t.id,batch_id=batch.id,account_id=account.id,
+            waiter_id=owner_id,station=station,complete=complete,
+            created_at=t.ready_at)
+        db.add(event);db.flush();event_id=event.id
+    db.commit();await notify()
+    if event_id is not None:
+        await dispatch_ready_notification(event_id)
     return {'ok':True}
 
 def active_period(db):
