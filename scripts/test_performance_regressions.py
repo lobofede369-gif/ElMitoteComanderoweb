@@ -22,6 +22,20 @@ try:
     with TestClient(app.app) as client:
         with app.SessionLocal() as db:
             owner_id = db.scalar(app.select(app.User.id).where(app.User.role == "owner"))
+            staff_ids = []
+            for number in range(12):
+                staff = app.User(
+                    username=f"perf_waiter_{number}",
+                    display=f"Mesero perf {number}", role="waiter",
+                    active=True, password_hash="test-only",
+                )
+                db.add(staff)
+                db.flush()
+                db.add(app.UserPin(
+                    user_id=staff.id, lookup=f"perf-pin-{uuid4().hex}",
+                    pin_hash="test-only",
+                ))
+                staff_ids.append(staff.id)
             product = app.Product(
                 name="Producto perf", category="Pruebas", station="kitchen",
                 price_cents=12500, active=True, blocked=False,
@@ -82,6 +96,23 @@ try:
             + str(len(statements))
         )
         print(f"OK: catálogo completo con {len(statements)} consultas SELECT; sin N+1.")
+
+        statements.clear()
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get("/api/users", headers=headers)
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+        assert response.status_code == 200, response.text
+        user_rows = response.json()
+        assert len(user_rows) == 13, len(user_rows)
+        assert all(next(row for row in user_rows if row["id"] == staff_id)["has_pin"]
+                   for staff_id in staff_ids)
+        assert len(statements) <= 4, (
+            "GET /api/users volvió a consultar el PIN por empleado: "
+            + str(len(statements))
+        )
+        print(f"OK: {len(user_rows)} usuarios con {len(statements)} consultas SELECT; PIN correctos.")
 
         # La lista de cuentas también debe usar agregados en bloque, no consultar
         # productos, descuentos, pagos y mesas una vez por cada cuenta.
