@@ -804,7 +804,9 @@ def _fcm_send_one(device, payload):
         token=device['token'],
         data={'title': str(payload.get('title','El Mitote Comandas'))[:100],
               'body': str(payload.get('body','Nuevo aviso'))[:180],
-              'route': route},
+              'route': route,
+              'kind': str(payload.get('kind','general'))[:32],
+              'tag': str(payload.get('tag','mitote-aviso'))[:100]},
         android=messaging.AndroidConfig(priority='high', ttl=timedelta(minutes=10))
     )
     try:
@@ -1924,6 +1926,43 @@ def tickets(db:Session=Depends(db_session),user:User=Depends(auth)):
                 'promotion_name':meta.promotion_name if meta else ''})
         out.append({'id':t.id,'batch_id':b.id,'account':a.name,'account_id':a.id,'waiter':db.get(User,b.sent_by).display,'station':t.station,'status':t.status,'created_at':t.created_at.isoformat() if t.created_at else '', 'items':ticket_items})
     return out
+@app.get('/api/waiter/ready-alerts')
+def waiter_ready_alerts(db:Session=Depends(db_session),user:User=Depends(auth)):
+    """Avisos del turno actual, visibles solo para el mesero responsable.
+
+    Cada ticket genera una sola alerta; la última estación lista se anuncia
+    como comanda completa sin emitir dos notificaciones por el mismo cambio.
+    """
+    allow(user,'waiter')
+    period=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    if not period:return []
+    rows=db.execute(
+        select(StationTicket,Batch,Account)
+        .join(Batch,Batch.id==StationTicket.batch_id)
+        .join(Account,Account.id==Batch.account_id)
+        .where(Account.owner_id==user.id,Batch.created_at>=period.opened_at,
+               Account.status.in_(('open','pending')),StationTicket.status=='ready')
+        .order_by(StationTicket.ready_at.desc(),StationTicket.id.desc()).limit(80)
+    ).all()
+    if not rows:return []
+    batch_ids={batch.id for _,batch,_ in rows}
+    all_tickets=db.scalars(select(StationTicket).where(StationTicket.batch_id.in_(batch_ids))).all()
+    by_batch={}
+    for ticket in all_tickets:
+        by_batch.setdefault(ticket.batch_id,[]).append(ticket)
+    out=[]
+    for ticket,batch,account in rows:
+        siblings=by_batch[batch.id]
+        complete=all(x.status=='ready' for x in siblings) and ticket.id==max(
+            (x for x in siblings if x.status=='ready'),
+            key=lambda x:(x.ready_at or x.created_at or now(),x.id)).id
+        station='Cocina' if ticket.station=='kitchen' else 'Barra'
+        out.append({'id':f'ready-{ticket.id}','ticket_id':ticket.id,
+                    'batch_id':batch.id,'account_id':account.id,'account':account.name,
+                    'station':ticket.station,'station_name':station,
+                    'complete':complete,'ready_at':ticket.ready_at.isoformat() if ticket.ready_at else ''})
+    return out
+
 class StatusIn(BaseModel):status:Literal['received','preparing','ready']
 @app.post('/api/tickets/{ticket_id}/status')
 async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -1942,15 +1981,22 @@ async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_sessio
     owner_id=account.owner_id
     station=t.station
     account_name=account.name
+    complete=False
+    if data.status=='ready':
+        siblings=db.scalars(select(StationTicket).where(StationTicket.batch_id==batch.id)).all()
+        complete=bool(siblings) and all(x.status=='ready' for x in siblings)
     db.commit();await notify()
     if data.status=='ready':
-        await push_to({'title':'El Mitote · Pedido listo',
-                       'body':f'{"Cocina" if station=="kitchen" else "Barra"} terminó el pedido de {account_name}',
-                       'url':f'/?push=accounts&account={account.id}',
-                       'tag':f'mitote-ready-{t.id}'},role='waiter',user_id=owner_id)
-        await fcm_to({'title': 'El Mitote · Pedido listo',
-                      'body': f'Pedido listo · comanda #{batch.id}',
-                      'url': '/?push=accounts'}, role='waiter', user_id=owner_id)
+        station_label='Cocina' if station=='kitchen' else 'Barra'
+        title='El Mitote · Pedido completo' if complete else f'El Mitote · {station_label} lista'
+        body=(f'Pedido completo para {account_name} · comanda #{batch.id}. ¡Listo para entregar!'
+              if complete else f'{station_label} terminó {account_name} · comanda #{batch.id}.')
+        payload={'title':title,'body':body,
+                 'url':f'/?push=accounts&account={account.id}',
+                 'kind':'ready_complete' if complete else 'ready_station',
+                 'tag':f'mitote-ready-{t.id}'}
+        await push_to(payload,role='waiter',user_id=owner_id)
+        await fcm_to(payload,role='waiter',user_id=owner_id)
     return {'ok':True}
 
 def active_period(db):
