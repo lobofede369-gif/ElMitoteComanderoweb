@@ -2,6 +2,7 @@
 
 Prueba offline con SQLite efímero. No toca Render ni envía push reales.
 """
+import asyncio
 import os
 import tempfile
 from datetime import timedelta
@@ -151,6 +152,59 @@ with TestClient(app.app) as client:
     assert post("waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/ack",{}).status_code==403
     assert post("other_waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/ack",{}).status_code==200
     assert len(get("other_waiter","/api/waiter/ready-alerts").json())==1
+    # La reasignación vuelve a notificar al nuevo responsable, no solo cambia la lista.
+    assert len([x for x in web_calls if x[1]=="waiter"])==5
+    assert len([x for x in fcm_calls if x[1]=="waiter"])==5
+    assert all(x[2]==users["other_waiter"] for x in [z for z in web_calls if z[1]=="waiter"][-2:])
+    assert all(x[2]==users["other_waiter"] for x in [z for z in fcm_calls if z[1]=="waiter"][-2:])
+
+    # Si el proveedor falla, el outbox conserva el aviso y lo reintenta tras el backoff.
+    retry_account=post("waiter","/api/accounts",{"name":"Mesa reintento","table_id":None})
+    assert retry_account.status_code==200,retry_account.text
+    retry_aid=retry_account.json()["id"]
+    with app.SessionLocal() as db:
+        retry_batch=app.Batch(account_id=retry_aid,sent_by=users["waiter"],client_key=uuid4().hex)
+        db.add(retry_batch);db.flush()
+        retry_ticket=app.StationTicket(batch_id=retry_batch.id,station="kitchen",
+                                       status="preparing",created_at=app.now())
+        db.add(retry_ticket);db.commit()
+        retry_ticket_id=retry_ticket.id
+
+    async def fail_transport(payload,role=None,user_id=None):
+        return {"enabled":True,"registered":1,"accepted":0,"failed":1}
+    app.push_to=fail_transport
+    app.fcm_to=fail_transport
+    failed=post("kitchen",f"/api/tickets/{retry_ticket_id}/status",{"status":"ready"})
+    assert failed.status_code==200,failed.text
+    with app.SessionLocal() as db:
+        retry_event=db.scalar(app.select(app.ReadyNotificationEvent).where(
+            app.ReadyNotificationEvent.ticket_id==retry_ticket_id))
+        assert retry_event and retry_event.attempted_at is not None
+        retry_event_id=retry_event.id
+        deliveries=list(db.scalars(app.select(app.ReadyNotificationDelivery).where(
+            app.ReadyNotificationDelivery.event_id==retry_event_id)))
+        assert {x.channel for x in deliveries}=={"webpush","fcm"}
+        assert all(x.attempts==1 and x.accepted_at is None and x.last_error for x in deliveries)
+        for delivery in deliveries:
+            delivery.next_attempt_at=app.now()-timedelta(seconds=1)
+        db.commit()
+
+    app.push_to=mock_web
+    app.fcm_to=mock_fcm
+    asyncio.run(app.dispatch_ready_notification(retry_event_id))
+    with app.SessionLocal() as db:
+        retried=list(db.scalars(app.select(app.ReadyNotificationDelivery).where(
+            app.ReadyNotificationDelivery.event_id==retry_event_id)))
+        assert all(x.attempts==2 and x.accepted_at is not None for x in retried)
+    web_before=len(web_calls);fcm_before=len(fcm_calls)
+    asyncio.run(app.dispatch_ready_notification(retry_event_id))
+    assert len(web_calls)==web_before and len(fcm_calls)==fcm_before
+    retry_ack=post("waiter",f"/api/waiter/ready-alerts/{retry_event_id}/ack",{})
+    assert retry_ack.status_code==200,retry_ack.text
+    with app.SessionLocal() as db:
+        retried=list(db.scalars(app.select(app.ReadyNotificationDelivery).where(
+            app.ReadyNotificationDelivery.event_id==retry_event_id)))
+        assert all(x.resolved_at is not None for x in retried)
 
     with app.SessionLocal() as db:
         period=db.scalar(app.select(app.CashPeriod).where(app.CashPeriod.closed_at.is_(None)))
