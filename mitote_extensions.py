@@ -602,7 +602,7 @@ async def prep_alert_worker():
                         except IntegrityError:
                             db.rollback()
             for station, body, key in outgoing:
-                payload = {"title": "El Mitote · Retraso de preparación",
+                payload = {"title": "PERSEO POS · Retraso de preparación",
                            "body": body, "url": "/?push=station", "tag": f"mitote-delay-{key}"}
                 try:
                     await push_to(payload, role=station)
