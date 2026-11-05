@@ -15,11 +15,37 @@ os.environ.pop("OWNER_RECOVERY_TOKEN", None)
 
 import app
 import mitote_extensions as ext
-from sqlalchemy import event
+from sqlalchemy import event, inspect
 from fastapi.testclient import TestClient
 
 try:
     with TestClient(app.app) as client:
+        expected_indexes = {
+            "accounts": {"ix_accounts_owner_created_at", "ix_accounts_created_at"},
+            "batches": {"ix_batches_account_id"},
+            "order_items": {"ix_order_items_batch_id"},
+            "payments": {"ix_payments_account_id"},
+        }
+        def current_indexes():
+            inspector = inspect(app.engine)
+            return {
+                table: {row["name"] for row in inspector.get_indexes(table)}
+                for table in expected_indexes
+            }
+        assert all(expected <= current_indexes()[table]
+                   for table, expected in expected_indexes.items()), current_indexes()
+        # Simular una base ya existente sin los nuevos índices y comprobar
+        # que bootstrap los restaura sin recrear tablas ni perder registros.
+        with app.engine.begin() as connection:
+            for names in expected_indexes.values():
+                for name in names:
+                    connection.exec_driver_sql(f'DROP INDEX IF EXISTS "{name}"')
+        app.bootstrap()
+        restored = current_indexes()
+        assert all(expected <= restored[table]
+                   for table, expected in expected_indexes.items()), restored
+        print("OK: índices de alto tráfico creados y migración idempotente.")
+
         with app.SessionLocal() as db:
             owner_id = db.scalar(app.select(app.User.id).where(app.User.role == "owner"))
             staff_ids = []
