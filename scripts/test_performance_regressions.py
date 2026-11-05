@@ -111,6 +111,8 @@ try:
             event.remove(app.engine, "before_cursor_execute", count_selects)
 
         assert response.status_code == 200, response.text
+        assert response.headers.get("X-Request-ID"), response.headers
+        assert response.headers.get("Server-Timing", "").startswith("app;dur="), response.headers
         rows = response.json()
         product_data = next(row for row in rows if row["id"] == product_id)
         assert product_data["variants"][0]["name"] == "Grande"
@@ -328,6 +330,9 @@ try:
             "async function refreshAccountPanel", 1
         )[0]
         assert "apiInflight:new Map()" in js
+        app_source = (root / "app.py").read_text(encoding="utf-8")
+        assert "observe_request_performance" in app_source
+        assert "slow_request" in app_source
         new_account_action = js.split("case 'new-account':", 1)[1].split("case 'reassign-form':", 1)[0]
         assert "pendingOperationKey(scope,payload)" in new_account_action
         assert "client_key" in new_account_action
