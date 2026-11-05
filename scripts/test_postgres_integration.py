@@ -156,6 +156,23 @@ with TestClient(app.app) as client:
     assert sorted(response.json()["duplicate"] for response in duplicate_results) == [False, True]
     print("OK: doble toque simultáneo produce una sola comanda idempotente.")
 
+    # Una clave reutilizada desde dos cuentas distintas debe rechazarse sin error 500.
+    cross_account_key = uuid4().hex
+    cross_payload = {"client_key": cross_account_key,
+        "items": [{"product_id": product_id, "qty": 1, "prep_minutes": 15}]}
+    def send_cross_account(index):
+        return post_user(waiter_ids[index],
+            f"/api/accounts/{account_ids[index]}/orders", cross_payload)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cross_results = list(pool.map(send_cross_account, (1, 2)))
+    assert sorted(response.status_code for response in cross_results) == [200, 409], [
+        (response.status_code, response.text) for response in cross_results]
+    with app.SessionLocal() as db:
+        key_count = db.scalar(app.select(app.func.count(app.Batch.id)).where(
+            app.Batch.client_key == cross_account_key))
+        assert key_count == 1, key_count
+    print("OK: clave simultánea entre cuentas distintas no duplica ni produce error 500.")
+
     # Con inventario activo, los bloqueos por producto siguen evitando la sobreventa.
     with app.SessionLocal() as db:
         setting = db.get(app.Setting, 1)
