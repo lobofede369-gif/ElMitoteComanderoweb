@@ -6,6 +6,7 @@ on:
       - "design/**"
       - "preview/**"
       - "fix/**"
+      - "demo/**"
   pull_request:
     branches:
       - main
@@ -41,8 +42,8 @@ jobs:
           sw = Path('static/sw.js').read_text(encoding='utf-8')
           assert '/static/theme-obsidian-titanium.css?v=1' in html
           assert '/static/theme-obsidian-modules.css?v=2' in html
-          assert '/static/app.js?v=28' in html
-          assert '/static/app.js?v=28' in sw
+          assert '/static/app.js?v=29' in html
+          assert '/static/app.js?v=29' in sw
           assert 'function setConnectionState(connected)' in app
           assert "syncWaiterReadyAlerts" in app
           assert '/static/cash-receipt.css?v=1' in html
@@ -58,12 +59,21 @@ jobs:
           waiter = Path('static/pos-ui-v3.js').read_text(encoding='utf-8')
           assert '/static/theme-service-fast.css?v=2' in html
           assert '/static/theme-service-fast.css?v=2' in sw
-          assert 'mitote-comandas-v32' in sw
+          assert 'mitote-comandas-demo-v1' in sw
           assert 'pos-search' in waiter and 'applyCatalogFilter()' in waiter
           assert 'obs.observe(content,{childList:true});' in waiter
           assert 'subtree:true' not in waiter
           assert '.table-choice-grid' in fast and '.pos-search-wrap' in fast
           assert '/static/theme-pin-login.css?v=1' in html
+          assert '/static/demo.css?v=1' in html
+          assert '/static/demo.css?v=1' in sw
+          assert 'data-demo-pin="111111"' in html
+          assert 'data-demo-pin="222222"' in html
+          assert 'data-demo-pin="333333"' in html
+          assert 'data-demo-pin="444444"' in html
+          assert 'data-demo-pin="555555"' in html
+          assert 'DEMO_MODE' in Path('app.py').read_text(encoding='utf-8')
+          assert 'function _seed_demo_data(db: Session)' in Path('app.py').read_text(encoding='utf-8')
           assert 'theme-pin-login.css?v=1' in sw
           assert 'id="login-pin-form"' in html
           assert 'id="login-pin"' in html
@@ -113,6 +123,7 @@ jobs:
           python -m scripts.test_menu_photo
           python -m scripts.test_owner_one_time
           python -m scripts.test_photo_menu_approved
+          python -m scripts.test_demo_seed
 
 
   postgres-integration:
