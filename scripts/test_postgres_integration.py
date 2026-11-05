@@ -215,7 +215,9 @@ with TestClient(app.app) as client:
     assert result.status_code == 200,result.text
     result=client.get("/api/preparation/tickets", headers=bearer("kitchen"))
     assert result.status_code == 200,result.text
-    assert result.json()["tickets"][0]["batch_ready"] is True
+    original_ticket = next(ticket for ticket in result.json()["tickets"]
+                           if ticket["batch_id"] == batch_id)
+    assert original_ticket["batch_ready"] is True
 
     reservation={"external_id":"ci-"+uuid4().hex,"name":"Reserva prueba",
         "phone":"","party_size":2,"scheduled_at":(app.now()+timedelta(days=1)).isoformat(),"note":""}
