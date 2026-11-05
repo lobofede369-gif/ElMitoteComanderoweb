@@ -47,6 +47,7 @@ window.addEventListener('online',async()=>{
     if(state.user&&!document.activeElement?.matches('input,textarea,select'))await render({preserveScroll:true});
   }catch{setConnectionState(false)}
 });
+setConnectionState(navigator.onLine);
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.style.borderColor=error?'#ff5777':'#ffd400';el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),4500)}
 let refreshPromise=null;
 function tokenExpiresSoon(token){try{const raw=token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');const part=raw+'='.repeat((4-raw.length%4)%4);const payload=JSON.parse(atob(part));return Number(payload.exp)*1000-Date.now()<45*60*1000}catch{return false}}
@@ -501,7 +502,7 @@ async function showInventory(){
       '<p>Existencias: <b>'+Number(p.stock)+'</b> · Control individual: <b>'+(p.inventory_enabled?'Sí':'No')+'</b></p>'+
       '<form id="inventory-cost-'+p.id+'" class="formrow"><label>Costo unitario real ($)<input name="unit_cost" type="number" min="0" step="0.01" value="'+(c?esc(c.unit_cost):'')+'" placeholder="Sin costo capturado"></label>'+
       '<div class="inline"><button class="outline small">Guardar costo</button>'+(c?'<button type="button" class="ghost small" data-action="clear-product-cost" data-id="'+p.id+'">Quitar costo</button>':'')+
-      '<button type="button" class="ghost small" data-action="edit-product" data-id="'+p.id+'">Existencias / configuración</button></div></form></div>';
+      '<button type="button" class="ghost small" data-action="restock" data-id="'+p.id+'">＋ Reponer</button><button type="button" class="ghost small" data-action="edit-product" data-id="'+p.id+'">Existencias / configuración</button></div></form></div>';
   }).join('');
   const wasteOptions=tracked.map(p=>'<option value="'+p.id+'">'+esc(p.name)+' · '+Number(p.stock)+' disponibles</option>').join('');
   const movementRows=movements.map(m=>'<div class="lineitem"><div class="row"><b>'+esc(m.label)+' · '+esc(m.product)+'</b><b>'+(m.delta>0?'+':'')+Number(m.delta)+'</b></div>'+
