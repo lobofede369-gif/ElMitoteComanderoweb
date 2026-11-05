@@ -265,6 +265,9 @@ try:
 
         root = Path(__file__).resolve().parents[1]
         js = (root / "static/app.js").read_text(encoding="utf-8")
+        features = (root / "static/features.js").read_text(encoding="utf-8")
+        sw = (root / "static/sw.js").read_text(encoding="utf-8")
+        html = (root / "static/index.html").read_text(encoding="utf-8")
         account_detail = js.split("async function accountDetailHtml", 1)[1].split(
             "async function refreshAccountPanel", 1
         )[0]
@@ -273,7 +276,12 @@ try:
         assert "load-account-history" in account_detail
         assert "api(`/accounts/${id}/history`)" not in account_detail
         assert "accountHistoryMarkup(rows)" in js
-        print("OK: deduplicación GET, invalidación al navegar e historial diferido.")
+        assert "prepClockTimer" in features
+        assert "document.hidden" in features
+        assert "mitote-comandas-v28" in sw
+        assert "/static/app.js?v=24" in sw and "/static/app.js?v=24" in html
+        assert "/static/features.js?v=3" in sw and "/static/features.js?v=3" in html
+        print("OK: deduplicación GET, historial diferido, cronómetros activos solo en pantalla y caché versionada.")
 
 finally:
     dbfile.unlink(missing_ok=True)
