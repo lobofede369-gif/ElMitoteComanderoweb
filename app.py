@@ -1416,13 +1416,41 @@ def dining_table_dict(db,t):
             'account_id':account.id if occupied else None,'account_name':account.name if occupied else None,
             'waiter':owner.display if owner else None}
 
+def dining_table_dict_many(db,tables):
+    """Resuelve ocupación, cuenta y mesero de todas las mesas con una consulta."""
+    if not tables:
+        return []
+    table_ids=[t.id for t in tables]
+    rows=db.execute(
+        select(TableOccupancy.table_id,Account.id,Account.name,Account.status,User.display)
+        .join(Account,Account.id==TableOccupancy.account_id)
+        .outerjoin(User,User.id==Account.owner_id)
+        .where(TableOccupancy.table_id.in_(table_ids))
+    ).all()
+    by_table={row[0]:row for row in rows}
+    result=[]
+    for table in tables:
+        row=by_table.get(table.id)
+        occupied=bool(row and row[3] in ('open','pending'))
+        result.append({
+            'id':table.id,'name':table.name,'area':table.area,'capacity':table.capacity,
+            'active':table.active,'sort_order':table.sort_order,
+            'status':'occupied' if occupied else 'available',
+            'account_id':row[1] if occupied else None,
+            'account_name':row[2] if occupied else None,
+            'waiter':row[4] if row else None
+        })
+    return result
+
+
 @app.get('/api/tables')
 def dining_tables(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier','waiter')
     q=select(DiningTable).order_by(DiningTable.area,DiningTable.sort_order,DiningTable.id)
     if user.role not in ('owner','admin'):
         q=q.where(DiningTable.active.is_(True))
-    return [dining_table_dict(db,t) for t in db.scalars(q)]
+    rows=db.scalars(q).all()
+    return dining_table_dict_many(db,rows)
 
 class DiningTableIn(BaseModel):
     name:str=Field(min_length=1,max_length=80)
