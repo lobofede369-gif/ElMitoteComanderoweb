@@ -119,17 +119,51 @@ with TestClient(app.app) as client:
     assert web_calls[-1][0]["kind"]=="ready_complete"
     assert post("kitchen",f"/api/preparation/items/{id2}/ready",{}).json()["duplicate"] is True
     assert len([x for x in web_calls if x[1]=="waiter"])==3
+    assert web_calls[-1][0]["event_id"].startswith("ready-")
+    assert fcm_calls[-1][0]["event_id"]==web_calls[-1][0]["event_id"]
+
+    # El registro persistente sobrevive el reinicio sin duplicar avisos.
+    with app.SessionLocal() as db:
+        rows=list(db.scalars(app.select(app.ReadyNotificationEvent).order_by(app.ReadyNotificationEvent.id)))
+        assert len(rows)==3,rows
+        assert len({e.event_key for e in rows})==3
+        assert all(e.attempted_at is not None for e in rows)
+        first_event_id=rows[0].id
+        remaining_ids=[e.id for e in rows[1:]]
+    app.bootstrap()
+    with app.SessionLocal() as db:
+        assert len(list(db.scalars(app.select(app.ReadyNotificationEvent))))==3
+
+    assert post("other_waiter",f"/api/waiter/ready-alerts/{first_event_id}/ack",{}).status_code==403
+    ack=post("waiter",f"/api/waiter/ready-alerts/{first_event_id}/ack",{})
+    assert ack.status_code==200,ack.text
+    again=post("waiter",f"/api/waiter/ready-alerts/{first_event_id}/ack",{})
+    assert again.status_code==200 and again.json()["duplicate"]
+    assert len(get("waiter","/api/waiter/ready-alerts").json())==2
+
+    # Cambio de mesero: las pendientes pasan al nuevo responsable.
+    transfer=post("owner",f"/api/accounts/{aid}/reassign",{
+        "owner_id":users["other_waiter"],"reason":"Cambio de responsable de mesa"})
+    assert transfer.status_code==200,transfer.text
+    assert get("waiter","/api/waiter/ready-alerts").json()==[]
+    pending=get("other_waiter","/api/waiter/ready-alerts")
+    assert pending.status_code==200 and len(pending.json())==2,pending.text
+    assert post("waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/ack",{}).status_code==403
+    assert post("other_waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/ack",{}).status_code==200
+    assert len(get("other_waiter","/api/waiter/ready-alerts").json())==1
 
     with app.SessionLocal() as db:
         period=db.scalar(app.select(app.CashPeriod).where(app.CashPeriod.closed_at.is_(None)))
         period.closed_at=app.now()
         db.commit()
     assert get("waiter","/api/waiter/ready-alerts").json()==[]
+    assert get("other_waiter","/api/waiter/ready-alerts").json()==[]
 
 js=Path("static/app.js").read_text()
 assert "syncWaiterReadyAlerts" in js
-assert "Pedidos listos para llevar a mesa" in js
+assert "Pedidos pendientes de entregar" in js
 assert "beep('ready')" in js
 assert "window.MitoteAndroid" in js
+assert "case 'ack-ready':" in js
 print("OK: mesero correcto, cocina, barra, pedido completo, idempotencia, pantalla, sonido y turno activo")
 dbfile.unlink(missing_ok=True)
