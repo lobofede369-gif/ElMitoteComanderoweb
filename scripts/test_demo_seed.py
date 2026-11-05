@@ -5,28 +5,16 @@ os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["SECRET_KEY"] = "demo-seed-test-secret-key-32-bytes-minimum"
 os.environ["ADMIN_PASSWORD"] = "demo-seed-test-admin-password"
 os.environ["ADMIN_USERNAME"] = "demo_propietario"
+os.environ["DEMO_MODE"] = "1"
 
 from sqlalchemy import select, func
 from app import (
-    Base, engine, SessionLocal, User, UserPin, Product, DiningTable,
+    bootstrap, SessionLocal, User, UserPin, Product, DiningTable,
     Account, Batch, StationTicket, Payment, CashPeriod, Audit,
     _seed_demo_data, _pin_lookup,
 )
 
-Base.metadata.create_all(engine)
-
-with SessionLocal() as db:
-    owner = User(
-        username="demo_propietario",
-        display="Propietario Demo",
-        role="owner",
-        password_hash="test-only-placeholder-hash",
-        active=True,
-    )
-    db.add(owner)
-    db.flush()
-    _seed_demo_data(db)
-    db.commit()
+bootstrap()
 
 with SessionLocal() as db:
     expected_pins = {
