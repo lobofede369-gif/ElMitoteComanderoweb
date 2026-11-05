@@ -263,5 +263,17 @@ try:
         )
         print(f"OK: 12 comandas de cocina con {len(statements)} consultas SELECT; cronómetros correctos.")
 
+        root = Path(__file__).resolve().parents[1]
+        js = (root / "static/app.js").read_text(encoding="utf-8")
+        account_detail = js.split("async function accountDetailHtml", 1)[1].split(
+            "async function refreshAccountPanel", 1
+        )[0]
+        assert "apiInflight:new Map()" in js
+        assert "state.apiInflight.clear()" in js
+        assert "load-account-history" in account_detail
+        assert "api(`/accounts/${id}/history`)" not in account_detail
+        assert "accountHistoryMarkup(rows)" in js
+        print("OK: deduplicación GET, invalidación al navegar e historial diferido.")
+
 finally:
     dbfile.unlink(missing_ok=True)
