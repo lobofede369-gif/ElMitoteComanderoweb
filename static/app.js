@@ -175,8 +175,11 @@ function logout(reason='manual'){
   $('#app').hidden=true;$('#login').hidden=false;stopAlarm();
 }
 function refreshNav(){const list=sections[state.user.role]||[];$('#nav').innerHTML=list.map(([id,icon,title])=>`<button class="navbtn ${state.screen===id?'active':''}" data-nav="${id}"><span style="font-size:1.15rem">${icon}</span>${title}</button>`).join('');$('#role-name').textContent=`${state.user.display} · ${labels[state.user.role]}`;$('#page-title').textContent=(list.find(x=>x[0]===state.screen)||list[0]||[])[2]||'Inicio';const back=$('#back');if(back)back.hidden=state.navStack.length===0;}
-async function start(){try{
-    state.user=await api('/me');
+async function start(authenticatedUser=null){try{
+    const validUser=authenticatedUser&&Number.isSafeInteger(Number(authenticatedUser.id))&&
+      typeof authenticatedUser.display==='string'&&sections[authenticatedUser.role]
+      ?authenticatedUser:null;
+    state.user=validUser||await api('/me');
     if(window.MitoteAndroid){try{window.MitoteAndroid.syncSession(state.token,state.user.role)}catch(e){}}
     restoreWorkState();
     $('#login').hidden=true;$('#app').hidden=false;
@@ -189,8 +192,12 @@ async function start(){try{
     state.navStack=[];
     history.replaceState({mitoteScreen:state.screen,mitoteStack:[]},'',location.pathname+location.search+'#'+state.screen);
     localStorage.setItem('mitote-screen',state.screen);
-    if(state.user.role==='waiter')await syncWaiterReadyAlerts(true).catch(()=>{});
-    refreshNav();await render({preserveScroll:false});listenEvents();syncPushOnLogin().catch(()=>{});
+    refreshNav();
+    // Mostrar primero la pantalla operativa; sincronizaciones secundarias no bloquean el acceso.
+    await render({preserveScroll:false});
+    listenEvents();
+    if(state.user.role==='waiter')syncWaiterReadyAlerts(true).catch(()=>{});
+    syncPushOnLogin().catch(()=>{});
   }catch(e){logout('expired');toast(e.message,true)}}
 async function go(screen,options={}){
   if(!state.user)return;
@@ -244,10 +251,26 @@ async function render(options={}){
     area.innerHTML=`<div class="note danger-note">${esc(e.message)}</div>`;toast(e.message,true);
   }
 }
-async function showAccounts(all){const arr=await api('/accounts');state.data.accounts=arr;const active=arr.filter(x=>x.status==='open'||x.status==='pending');const ready=all?[]:(state.data.readyAlerts||[]);const readyHtml=!all?'<div class="card waiter-ready-card"><div class="row"><h3>🔔 Pedidos pendientes de entregar</h3><button class="outline small" data-action="enable-sound">♪ Probar sonido</button></div>'+(
-ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+'</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+(x.complete?' · Todas las estaciones listas':'')+'</div></div><div class="row"><button class="outline small" data-action="open-account" data-id="'+Number(x.account_id)+'">Ver cuenta</button><button class="primary small" data-action="ack-ready" data-id="'+Number(x.event_id)+'">✓ Entregado</button></div></div>').join(''):'<p class="mini">No tienes avisos pendientes de entregar en este turno.</p>'
-)+'</div>':'';
-return `<div class="statgrid">${stat('Cuentas activas',active.length)}${stat('Por cobrar',active.filter(x=>x.status==='pending').length)}</div>${readyHtml}${!all?'<button class="primary" data-nav="new">＋ Abrir nueva cuenta</button>':''}<h2 class="section">${all?'Todas las cuentas':'Mis cuentas'}</h2><div class="cards">${active.map(a=>accountCard(a,all?'admin-account':'open-account')).join('')||'<div class="empty">Todavía no hay cuentas activas.</div>'}</div>${all?'<h2 class="section">Cuentas pagadas de este turno</h2><div class="cards">'+arr.filter(x=>x.status==='paid').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div><h2 class="section">Cuentas unidas recientemente</h2><div class="cards">'+arr.filter(x=>x.status==='merged').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div>':''}`}
+function waiterReadyAlertsHtml(){
+  const ready=state.data.readyAlerts||[];
+  return '<div class="card waiter-ready-card"><div class="row"><h3>🔔 Pedidos pendientes de entregar</h3><button class="outline small" data-action="enable-sound">♪ Probar sonido</button></div>'+
+    (ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+
+      esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+
+      '</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+
+      (x.complete?' · Todas las estaciones listas':'')+
+      '</div></div><div class="row"><button class="outline small" data-action="open-account" data-id="'+
+      Number(x.account_id)+'">Ver cuenta</button><button class="primary small" data-action="ack-ready" data-id="'+
+      Number(x.event_id)+'">✓ Entregado</button></div></div>').join(''):
+      '<p class="mini">No tienes avisos pendientes de entregar en este turno.</p>')+'</div>';
+}
+async function showAccounts(all){
+  const arr=await api('/accounts');
+  state.data.accounts=arr;
+  const active=arr.filter(x=>x.status==='open'||x.status==='pending');
+  const readyHtml=!all?waiterReadyAlertsHtml():'';
+  return `<div class="statgrid">${stat('Cuentas activas',active.length)}${stat('Por cobrar',active.filter(x=>x.status==='pending').length)}</div>${readyHtml}${!all?'<button class="primary" data-nav="new">＋ Abrir nueva cuenta</button>':''}<h2 class="section">${all?'Todas las cuentas':'Mis cuentas'}</h2><div class="cards">${active.map(a=>accountCard(a,all?'admin-account':'open-account')).join('')||'<div class="empty">Todavía no hay cuentas activas.</div>'}</div>${all?'<h2 class="section">Cuentas pagadas de este turno</h2><div class="cards">'+arr.filter(a=>a.status==='paid').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div><h2 class="section">Cuentas unidas recientemente</h2><div class="cards">'+arr.filter(a=>a.status==='merged').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div>':''}
+}
+
 function ticketLookupHtml(){return `<div class="card" style="margin-top:15px"><h3>Consultar ticket histórico</h3><p>Busca por folio, aunque la cuenta ya esté pagada.</p><form id="ticket-lookup" class="formrow"><label>Folio de cuenta<input type="number" min="1" name="id" required></label><button class="outline">Buscar ticket</button></form></div>`}
 async function showNew(){
   const tables=await api('/tables');state.data.tables=tables;
@@ -942,6 +965,11 @@ async function syncWaiterReadyAlerts(initial=false){
     }
     state.data.readyAlerts=items;
     try{sessionStorage.setItem(userKey,JSON.stringify([...state.waiterReadySeen].slice(-180)))}catch{}
+    // Actualizar solo el panel de avisos; no volver a cargar las cuentas.
+    if(initial&&state.screen==='accounts'){
+      const panel=$('.waiter-ready-card');
+      if(panel)panel.outerHTML=waiterReadyAlertsHtml();
+    }
   }finally{
     state.waiterReadyBusy=false;
     if(state.waiterReadyPending){state.waiterReadyPending=false;syncWaiterReadyAlerts().catch(()=>{});}
@@ -994,7 +1022,7 @@ async function loginSession(path,payload){
   if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:'Acceso incorrecto');
   state.token=d.token;localStorage.setItem('mitote-token',d.token);
   sessionStorage.removeItem('mitote-token');state.alarmArmed=true;
-  await start();
+  await start(d.user);
 }
 $('#login-pin-form').addEventListener('submit',async e=>{
   e.preventDefault();if(pinLoginBusy)return;loginError('');
@@ -1015,7 +1043,7 @@ $('#legacy-login-form').addEventListener('submit',async e=>{
     if(d.user?.role!=='owner')throw Error('La activación inicial solo está permitida al Propietario');
     state.token=d.token;localStorage.setItem('mitote-token',d.token);
     sessionStorage.removeItem('mitote-token');state.alarmArmed=true;
-    await start();
+    await start(d.user);
     if(state.user?.role==='owner'&&state.screen!=='users')await go('users');
   }catch(err){loginError(err.message);}
 });
