@@ -394,11 +394,7 @@ class FcmDevice(Base):
     updated_at = Column(DateTime(timezone=True), default=now, nullable=False)
 
 class ReadyNotificationEvent(Base):
-    """Registro persistente de aviso por estación y por comanda.
-
-    Se registra en la MISMA transacción que la transición a READY, de modo que
-    si Render se reinicia el aviso sigue en PostgreSQL.
-    """
+    """Evento persistente e idempotente de pedido listo, dirigido al mesero asignado."""
     __tablename__ = 'ready_notification_events'
     id = Column(Integer, primary_key=True)
     event_key = Column(String(90), nullable=False, unique=True)
@@ -411,6 +407,31 @@ class ReadyNotificationEvent(Base):
     created_at = Column(DateTime(timezone=True), default=now, nullable=False)
     attempted_at = Column(DateTime(timezone=True), nullable=True)
     acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ReadyNotificationDelivery(Base):
+    """Outbox por canal: reintenta fallos y evita perder eventos tras reinicios."""
+    __tablename__ = 'ready_notification_deliveries'
+    id = Column(Integer, primary_key=True)
+    event_id = Column(Integer, ForeignKey('ready_notification_events.id'), nullable=False, index=True)
+    channel = Column(String(12), nullable=False)
+    attempts = Column(Integer, default=0, nullable=False)
+    next_attempt_at = Column(DateTime(timezone=True), default=now, nullable=False, index=True)
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    resolved_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(300), default='', nullable=False)
+    __table_args__ = (UniqueConstraint('event_id', 'channel'),)
+
+
+def ensure_ready_delivery_rows(db, event):
+    for channel in ('webpush', 'fcm'):
+        row = db.scalar(select(ReadyNotificationDelivery).where(
+            ReadyNotificationDelivery.event_id == event.id,
+            ReadyNotificationDelivery.channel == channel))
+        if row is None:
+            db.add(ReadyNotificationDelivery(
+                event_id=event.id, channel=channel, next_attempt_at=now()))
 
 class InventoryMovement(Base):
     """Kardex inmutable de existencias: entradas, ventas, mermas y ajustes."""
@@ -512,54 +533,162 @@ def bootstrap():
                     ticket_id=ticket.id,batch_id=batch.id,account_id=account.id,
                     waiter_id=account.owner_id,station=ticket.station,complete=complete,
                     created_at=ticket.ready_at or now(),attempted_at=now()))
+        # Reanudar eventos antiguos que aún no habían iniciado su envío.
+        legacy_pending = db.scalars(select(ReadyNotificationEvent).where(
+            ReadyNotificationEvent.attempted_at.is_(None),
+            ReadyNotificationEvent.acknowledged_at.is_(None))).all()
+        for event in legacy_pending:
+            ensure_ready_delivery_rows(db, event)
         # Solo aplica menú cuando exista la aprobación explícita en Render.
         menu_photo_import.apply_approved_photo_menu_at_startup(db)
         db.commit()
 
-async def dispatch_ready_notification(event_id:int):
-    """Intenta enviar Web Push y FCM; la consulta del mesero es el respaldo durable."""
+def ready_retry_delay(attempts:int) -> timedelta:
+    """Backoff exponencial acotado: 20 s, 40 s... hasta 15 minutos."""
+    return timedelta(seconds=min(900, 20 * (2 ** min(max(attempts - 1, 0), 6))))
+
+
+def delivery_was_accepted(result) -> bool:
+    # None conserva compatibilidad con adaptadores de pruebas y conectores antiguos.
+    if result is None:
+        return True
+    return isinstance(result, dict) and int(result.get('accepted', 0) or 0) > 0
+
+
+async def dispatch_ready_delivery(delivery_id:int):
+    """Procesa un canal con bloqueo, reintento y persistencia del resultado."""
     with SessionLocal() as db:
-        row=db.execute(select(ReadyNotificationEvent).where(
-            ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
-        if not row or row.attempted_at is not None or row.acknowledged_at is not None:return
-        account=db.get(Account,row.account_id)
-        waiter=db.get(User,row.waiter_id)
-        if not account or not waiter or not waiter.active or waiter.role!='waiter':
+        candidate=db.get(ReadyNotificationDelivery, delivery_id)
+        if not candidate:
             return
-        # Marcar el intento ANTES del transporte evita notificaciones repetidas
-        # tras una ejecución concurrente. El evento siempre queda consultable.
-        row.attempted_at=now()
-        event_key=row.event_key
-        station_label='Cocina' if row.station=='kitchen' else 'Barra'
-        title='El Mitote · Pedido completo' if row.complete else f'El Mitote · {station_label} lista'
-        body=(f'Pedido completo para {account.name} · comanda #{row.batch_id}. ¡Listo para entregar!'
-              if row.complete else f'{station_label} terminó {account.name} · comanda #{row.batch_id}.')
+        event_id=candidate.event_id
+        event_ref=db.get(ReadyNotificationEvent, event_id)
+        if not event_ref:
+            candidate.resolved_at=now()
+            db.commit()
+            return
+        # El mismo orden de bloqueo que la reasignación evita carreras de destinatario.
+        account=db.execute(select(Account).where(
+            Account.id==event_ref.account_id).with_for_update()).scalar_one_or_none()
+        event=db.execute(select(ReadyNotificationEvent).where(
+            ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
+        row=db.execute(select(ReadyNotificationDelivery).where(
+            ReadyNotificationDelivery.id==delivery_id,
+            ReadyNotificationDelivery.resolved_at.is_(None),
+            ReadyNotificationDelivery.accepted_at.is_(None),
+            ReadyNotificationDelivery.next_attempt_at<=now()
+        ).with_for_update()).scalar_one_or_none()
+        if not row or not event:
+            return
+        if event.acknowledged_at is not None or not account or account.status not in ('open','pending'):
+            row.resolved_at=now()
+            db.commit()
+            return
+        if account.owner_id != event.waiter_id:
+            event.waiter_id=account.owner_id
+            event.attempted_at=None
+            row.attempts=0
+            row.accepted_at=None
+            row.resolved_at=None
+            row.last_error=''
+        waiter=db.get(User, account.owner_id)
+        if not waiter or not waiter.active or waiter.role!='waiter':
+            row.attempts+=1
+            row.last_attempt_at=now()
+            row.next_attempt_at=now()+ready_retry_delay(row.attempts)
+            row.last_error='La cuenta no tiene un mesero activo asignado'
+            db.commit()
+            return
+        event_key=event.event_key
+        station_label='Cocina' if event.station=='kitchen' else 'Barra'
+        title='El Mitote · Pedido completo' if event.complete else f'El Mitote · {station_label} lista'
+        body=(f'Pedido completo para {account.name} · comanda #{event.batch_id}. ¡Listo para entregar!'
+              if event.complete else f'{station_label} terminó {account.name} · comanda #{event.batch_id}.')
         payload={'title':title,'body':body,
                  'url':f'/?push=accounts&account={account.id}',
-                 'kind':'ready_complete' if row.complete else 'ready_station',
-                 'tag':f'mitote-{event_key}','event_id':event_key}
-        recipient=row.waiter_id
+                 'kind':'ready_complete' if event.complete else 'ready_station',
+                 'tag':f'mitote-{event_key}','event_id':event_key,
+                 'recipient_id':str(waiter.id)}
+        channel=row.channel
+        recipient=waiter.id
+        row.attempts+=1
+        row.last_attempt_at=now()
+        row.next_attempt_at=now()+ready_retry_delay(row.attempts)
         db.commit()
-    await push_to(payload,role='waiter',user_id=recipient)
-    await fcm_to(payload,role='waiter',user_id=recipient)
+
+    try:
+        result = (await push_to(payload,role='waiter',user_id=recipient)
+                  if channel=='webpush' else
+                  await fcm_to(payload,role='waiter',user_id=recipient))
+        accepted=delivery_was_accepted(result)
+        detail=''
+        if not accepted:
+            if isinstance(result,dict):
+                if not result.get('enabled',True):
+                    detail='Canal de notificación no configurado'
+                elif not result.get('registered',0):
+                    detail='No hay dispositivos registrados para el mesero'
+                else:
+                    detail='El proveedor no aceptó el envío'
+            else:
+                detail='No se pudo confirmar la aceptación del proveedor'
+    except Exception as exc:
+        accepted=False
+        detail=f'Error de transporte: {type(exc).__name__}'
+
+    with SessionLocal() as db:
+        row=db.execute(select(ReadyNotificationDelivery).where(
+            ReadyNotificationDelivery.id==delivery_id).with_for_update()).scalar_one_or_none()
+        if not row or row.resolved_at is not None:
+            return
+        event=db.get(ReadyNotificationEvent,row.event_id)
+        if event and event.attempted_at is None:
+            event.attempted_at=now()
+        if accepted:
+            row.accepted_at=now()
+            row.last_error=''
+        else:
+            row.last_error=detail[:300]
+        db.commit()
+
+
+async def dispatch_ready_notification(event_id:int):
+    """Despacha los canales pendientes sin bloquear ni perder el evento persistido."""
+    with SessionLocal() as db:
+        event=db.get(ReadyNotificationEvent,event_id)
+        if not event or event.acknowledged_at is not None:
+            return
+        ensure_ready_delivery_rows(db,event)
+        db.flush()
+        ids=db.scalars(select(ReadyNotificationDelivery.id).where(
+            ReadyNotificationDelivery.event_id==event_id,
+            ReadyNotificationDelivery.resolved_at.is_(None),
+            ReadyNotificationDelivery.accepted_at.is_(None),
+            ReadyNotificationDelivery.next_attempt_at<=now()
+        ).order_by(ReadyNotificationDelivery.channel)).all()
+        db.commit()
+    for delivery_id in ids:
+        await dispatch_ready_delivery(delivery_id)
 
 
 async def ready_notification_outbox_worker():
-    """Reanuda avisos confirmados en BD cuya entrega no alcanzó a iniciar."""
+    """Reintenta cada canal hasta que el proveedor lo acepte o el mesero confirme."""
     while True:
-        await asyncio.sleep(25)
+        await asyncio.sleep(10)
         try:
             with SessionLocal() as db:
-                ids=db.scalars(select(ReadyNotificationEvent.id).where(
-                    ReadyNotificationEvent.attempted_at.is_(None),
-                    ReadyNotificationEvent.acknowledged_at.is_(None)
-                ).order_by(ReadyNotificationEvent.id).limit(40)).all()
-            for event_id in ids:
-                await dispatch_ready_notification(event_id)
+                ids=db.scalars(select(ReadyNotificationDelivery.id).where(
+                    ReadyNotificationDelivery.resolved_at.is_(None),
+                    ReadyNotificationDelivery.accepted_at.is_(None),
+                    ReadyNotificationDelivery.next_attempt_at<=now()
+                ).order_by(ReadyNotificationDelivery.next_attempt_at,
+                           ReadyNotificationDelivery.id).limit(50)).all()
+            for delivery_id in ids:
+                await dispatch_ready_delivery(delivery_id)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception('Error reanudando avisos de pedidos listos')
+            log.exception('Error reanudando entregas de pedidos listos')
 
 
 @asynccontextmanager
@@ -840,6 +969,7 @@ def push_subscribe(data:PushSubscribeIn,db:Session=Depends(db_session),user:User
         row.user_id=user.id;row.p256dh=data.keys.p256dh;row.auth_key=data.keys.auth
     else:
         db.add(PushDevice(user_id=user.id,endpoint=data.endpoint,p256dh=data.keys.p256dh,auth_key=data.keys.auth))
+    wake_ready_deliveries(db,user.id,'webpush')
     db.commit()
     return {'ok':True}
 
@@ -850,6 +980,18 @@ def push_unsubscribe(data:PushUnsubscribeIn,db:Session=Depends(db_session),user:
     if row:db.delete(row);db.commit()
     return {'ok':True}
 
+def wake_ready_deliveries(db, user_id:int, channel:str):
+    rows=db.scalars(select(ReadyNotificationDelivery).join(
+        ReadyNotificationEvent,ReadyNotificationEvent.id==ReadyNotificationDelivery.event_id
+    ).where(ReadyNotificationEvent.waiter_id==user_id,
+            ReadyNotificationEvent.acknowledged_at.is_(None),
+            ReadyNotificationDelivery.channel==channel,
+            ReadyNotificationDelivery.accepted_at.is_(None),
+            ReadyNotificationDelivery.resolved_at.is_(None))).all()
+    for row in rows:
+        row.next_attempt_at=now()
+
+
 def _push_one(row,payload):
     try:
         webpush(subscription_info={'endpoint':row['endpoint'],
@@ -857,16 +999,18 @@ def _push_one(row,payload):
                 data=json.dumps(payload,ensure_ascii=False),
                 vapid_private_key=VAPID_PRIVATE_KEY,
                 vapid_claims={'sub':VAPID_SUBJECT},ttl=600,timeout=5)
-        return None
+        return True
     except WebPushException as exc:
         if exc.status_code in (404,410):return row['id']
         log.warning('Fallo push id=%s codigo=%s',row['id'],exc.status_code)
     except Exception:
         log.exception('Error de notificación push id=%s',row['id'])
-    return None
+    return False
+
 
 async def push_to(payload,role=None,user_id=None):
-    if not PUSH_ENABLED:return
+    if not PUSH_ENABLED:
+        return {'enabled':False,'registered':0,'accepted':0,'failed':0}
     try:
         with SessionLocal() as db:
             q=select(PushDevice).join(User,PushDevice.user_id==User.id).where(User.active.is_(True))
@@ -874,17 +1018,24 @@ async def push_to(payload,role=None,user_id=None):
             if user_id:q=q.where(User.id==user_id)
             rows=[{'id':d.id,'endpoint':d.endpoint,'p256dh':d.p256dh,'auth_key':d.auth_key}
                   for d in db.scalars(q)]
-        if not rows:return
+        if not rows:
+            return {'enabled':True,'registered':0,'accepted':0,'failed':0}
         results=await asyncio.gather(*(asyncio.to_thread(_push_one,r,payload) for r in rows),return_exceptions=True)
-        expired=[x for x in results if isinstance(x,int)]
+        expired=[x for x in results if isinstance(x,int) and not isinstance(x,bool)]
         if expired:
             with SessionLocal() as db:
                 for rid in expired:
                     d=db.get(PushDevice,rid)
                     if d:db.delete(d)
                 db.commit()
-    except Exception:
+        return {'enabled':True,'registered':len(rows),
+                'accepted':sum(x is True for x in results),
+                'failed':sum(x is False or isinstance(x,BaseException) for x in results),
+                'expired':len(expired)}
+    except Exception as exc:
         log.exception('No se pudieron distribuir notificaciones push')
+        return {'enabled':True,'registered':0,'accepted':0,'failed':1,
+                'error':type(exc).__name__}
 
 @app.post('/api/push/test')
 async def push_test(user:User=Depends(auth)):
@@ -911,6 +1062,7 @@ def fcm_register(data: FcmTokenIn, db: Session = Depends(db_session), user: User
         device.updated_at = now()
     else:
         db.add(FcmDevice(user_id=user.id, token=data.token))
+    wake_ready_deliveries(db,user.id,'fcm')
     db.commit()
     return {'ok': True}
 
@@ -931,21 +1083,23 @@ def _fcm_send_one(device, payload):
               'route': route,
               'kind': str(payload.get('kind','general'))[:32],
               'tag': str(payload.get('tag','mitote-aviso'))[:100],
-              'event_id': str(payload.get('event_id',''))[:90]},
+              'event_id': str(payload.get('event_id',''))[:90],
+              'recipient_id': str(payload.get('recipient_id',''))[:20]},
         android=messaging.AndroidConfig(priority='high', ttl=timedelta(minutes=10))
     )
     try:
         messaging.send(msg)
-        return None
+        return True
     except Exception as exc:
         if isinstance(exc, getattr(messaging, 'UnregisteredError', type(None))):
             return device['id']
         log.warning('FCM no pudo entregar al dispositivo %s: %s', device['id'], type(exc).__name__)
-        return None
+        return False
+
 
 async def fcm_to(payload, role=None, user_id=None):
     if not _firebase_ready():
-        return
+        return {'enabled':False,'registered':0,'accepted':0,'failed':0}
     try:
         with SessionLocal() as db:
             q = select(FcmDevice).join(User, FcmDevice.user_id == User.id).where(User.active.is_(True))
@@ -955,9 +1109,9 @@ async def fcm_to(payload, role=None, user_id=None):
                 q = q.where(User.id == user_id)
             devices = [{'id': x.id, 'token': x.token} for x in db.scalars(q)]
         if not devices:
-            return
+            return {'enabled':True,'registered':0,'accepted':0,'failed':0}
         results = await asyncio.gather(*(asyncio.to_thread(_fcm_send_one, d, payload) for d in devices), return_exceptions=True)
-        expired = [x for x in results if isinstance(x, int)]
+        expired = [x for x in results if isinstance(x, int) and not isinstance(x, bool)]
         if expired:
             with SessionLocal() as db:
                 for device_id in expired:
@@ -965,8 +1119,14 @@ async def fcm_to(payload, role=None, user_id=None):
                     if old:
                         db.delete(old)
                 db.commit()
-    except Exception:
+        return {'enabled':True,'registered':len(devices),
+                'accepted':sum(x is True for x in results),
+                'failed':sum(x is False or isinstance(x,BaseException) for x in results),
+                'expired':len(expired)}
+    except Exception as exc:
         log.exception('Fallo el envío FCM')
+        return {'enabled':True,'registered':0,'accepted':0,'failed':1,
+                'error':type(exc).__name__}
 
 @app.post('/api/fcm/test')
 async def fcm_test(db: Session = Depends(db_session), user: User = Depends(auth)):
@@ -1578,14 +1738,29 @@ async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session)
     dest=db.get(User,data.owner_id)
     if not dest or not dest.active or dest.role!='waiter':raise HTTPException(400,'El destino debe ser un mesero activo')
     old=a.owner_id;a.owner_id=dest.id
-    # Un aviso no confirmado debe seguir la cuenta hacia el nuevo mesero.
+    # Los avisos pendientes cambian de destinatario y vuelven a la cola de entrega.
     pending=db.scalars(select(ReadyNotificationEvent).where(
-        ReadyNotificationEvent.account_id==a.id,ReadyNotificationEvent.acknowledged_at.is_(None))).all()
+        ReadyNotificationEvent.account_id==a.id,
+        ReadyNotificationEvent.acknowledged_at.is_(None)).with_for_update()).all()
     for notice in pending:
         notice.waiter_id=dest.id
         notice.attempted_at=None
+        ensure_ready_delivery_rows(db,notice)
+        deliveries=db.scalars(select(ReadyNotificationDelivery).where(
+            ReadyNotificationDelivery.event_id==notice.id).with_for_update()).all()
+        for delivery in deliveries:
+            delivery.attempts=0
+            delivery.next_attempt_at=now()
+            delivery.last_attempt_at=None
+            delivery.accepted_at=None
+            delivery.resolved_at=None
+            delivery.last_error=''
     audit(db,user,'account.reassign',id=a.id,old=old,new=dest.id,reason=data.reason)
-    db.commit();await notify();return {'ok':True}
+    pending_ids=[notice.id for notice in pending]
+    db.commit();await notify()
+    for event_id in pending_ids:
+        await dispatch_ready_notification(event_id)
+    return {'ok':True}
 
 
 # --- Gestión avanzada de cuentas (Fase 2B) ---------------------------------
@@ -2204,8 +2379,16 @@ async def acknowledge_ready_alert(event_id:int,db:Session=Depends(db_session),us
     account=db.get(Account,row.account_id)
     if row.waiter_id!=user.id or not account or account.owner_id!=user.id:
         raise HTTPException(403,'Aviso no asignado a este mesero')
-    if row.acknowledged_at is not None:return {'ok':True,'duplicate':True}
+    deliveries=db.scalars(select(ReadyNotificationDelivery).where(
+        ReadyNotificationDelivery.event_id==row.id)).all()
+    if row.acknowledged_at is not None:
+        for delivery in deliveries:
+            delivery.resolved_at=delivery.resolved_at or now()
+        db.commit()
+        return {'ok':True,'duplicate':True}
     row.acknowledged_at=now()
+    for delivery in deliveries:
+        delivery.resolved_at=now()
     audit(db,user,'ready.ack',event_id=row.id,ticket_id=row.ticket_id,account_id=row.account_id)
     db.commit();await notify()
     return {'ok':True,'duplicate':False}
@@ -2240,6 +2423,7 @@ async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_sessio
             waiter_id=owner_id,station=station,complete=complete,
             created_at=t.ready_at)
         db.add(event);db.flush();event_id=event.id
+        ensure_ready_delivery_rows(db,event)
     db.commit();await notify()
     if event_id is not None:
         await dispatch_ready_notification(event_id)
