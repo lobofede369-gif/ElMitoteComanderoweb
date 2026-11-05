@@ -29,6 +29,24 @@ function clearPendingOperation(scope){
   if(!state.user)return;
   try{localStorage.removeItem('mitote-pending-'+state.user.id+'-'+scope);}catch{}
 }
+function setConnectionState(online){
+  const node=$('#connection');if(!node)return;
+  node.textContent=online?'● Conectado':'● Sin conexión';
+  node.classList.toggle('offline',!online);
+  node.title=online?'Conexión con el servidor disponible':'Los borradores se conservan en este dispositivo; las operaciones no se envían sin conexión';
+}
+window.addEventListener('offline',()=>{
+  setConnectionState(false);
+  if(state.user)toast('Sin conexión. El borrador queda guardado; no envíes pagos ni comandas hasta reconectar.',true);
+});
+window.addEventListener('online',async()=>{
+  try{
+    const response=await fetch('/api/health',{cache:'no-store'});
+    if(!response.ok)throw new Error('Servidor no disponible');
+    setConnectionState(true);
+    if(state.user&&!document.activeElement?.matches('input,textarea,select'))await render({preserveScroll:true});
+  }catch{setConnectionState(false)}
+});
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.style.borderColor=error?'#ff5777':'#ffd400';el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),4500)}
 let refreshPromise=null;
 function tokenExpiresSoon(token){try{const raw=token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');const part=raw+'='.repeat((4-raw.length%4)%4);const payload=JSON.parse(atob(part));return Number(payload.exp)*1000-Date.now()<45*60*1000}catch{return false}}
@@ -46,7 +64,23 @@ async function refreshSessionIfNeeded(){
   try{await refreshPromise}catch(e){if(e?.authExpired)throw e;/* Si el servidor falla temporalmente, intenta la operación con el token actual. */}finally{refreshPromise=null}
 }
 async function api(path,method='GET',body){
-  if(path!=='/auth/refresh')await refreshSessionIfNeeded();if(!navigator.onLine&&method!=='GET')throw Error('Sin conexión: operación bloqueada para evitar duplicados');const r=await fetch('/api'+path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer '+state.token},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});let data={};try{data=await r.json()}catch{}if(r.status===401){logout('expired');throw Error('Tu sesión venció o fue revocada. Vuelve a iniciar sesión.')}if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:'Error al procesar la operación');return data}
+  if(path!=='/auth/refresh')await refreshSessionIfNeeded();
+  if(!navigator.onLine&&method!=='GET')throw Error('Sin conexión: operación bloqueada para evitar duplicados. El borrador sigue guardado.');
+  let r;
+  try{
+    r=await fetch('/api'+path,{method,headers:{'Content-Type':'application/json',Authorization:'Bearer '+state.token},
+      body:body===undefined?undefined:JSON.stringify(body),cache:'no-store'});
+  }catch(error){
+    setConnectionState(false);
+    throw Error(method==='GET'?'No se pudo conectar con el servidor. Revisa Internet e inténtalo de nuevo.':
+      'Conexión interrumpida. No se confirmó la operación; conserva el borrador y vuelve a intentar al reconectar.');
+  }
+  let data={};try{data=await r.json()}catch{}
+  if(r.status===401){logout('expired');throw Error('Tu sesión venció o fue revocada. Vuelve a iniciar sesión.')}
+  setConnectionState(true);
+  if(!r.ok)throw Error(typeof data.detail==='string'?data.detail:'Error al procesar la operación');
+  return data;
+}
 async function fetchProtectedPdf(url){
   await refreshSessionIfNeeded();
   if(!navigator.onLine)throw Error('Se necesita internet para descargar cortes.');
@@ -186,6 +220,7 @@ async function render(options={}){
     switch(screen){case 'accounts':html=await showAccounts(false);break;case 'all':html=await showAccounts(true);break;case 'tables':html=await showTables();break;case 'new':html=await showNew();break;case 'orders':html=await showOrders();break;case 'station':html=await showPrepStation(false);break;case 'history':html=await showPrepStation(true);break;case 'notifications':html=await showNotifications();break;case 'tickets':html=await showPrepStation(false,true);break;case 'cashier':html=await showCashier();break;case 'cash':html=await showCash();break;case 'tips':html=await showTips();break;case 'products':html=await showProducts();break;case 'inventory':html=await showInventory();break;case 'users':html=await showUsers();break;case 'approvals':html=await showApprovals();break;case 'audit':html=await showAudit();break;case 'reservations':html=await showReservations();break;case 'prepconfig':html=await showPrepConfig();break;case 'analytics':html=await showAnalytics();break;case 'overview':html=await showOverview();break;default:html='<div class="empty">Sin pantalla</div>'}
     // Evita que una consulta lenta de la pantalla anterior reemplace la pantalla actual.
     if(seq!==state.renderSeq||screen!==state.screen)return;
+    if(!navigator.onLine)html='<div class="note danger-note"><b>Modo sin conexión.</b> Los borradores se guardan en este dispositivo, pero no se envían comandas, cobros ni cambios hasta recuperar Internet. Verifica el resultado en el servidor antes de repetir una operación.</div>'+html;
     area.innerHTML=html;area.removeAttribute('aria-busy');
     if(preserveScroll)window.scrollTo(0,scrollY);else window.scrollTo(0,0);
     $('#refresh')?.classList.remove('has-update');
@@ -452,7 +487,36 @@ async function showProducts(){
     <form id="promotion-add-${p.id}" class="formrow"><label>Nombre de promoción<input name="name" required maxlength="120" placeholder="Precio especial de fin de semana"></label><div class="formgrid"><label>Precio promocional ($)<input name="price" type="number" min="0" step="0.01"></label><label>O descuento (%)<input name="discount_percent" type="number" min="1" max="90"></label><label>Días (0=lun … 6=dom)<input name="weekdays" value="0,1,2,3,4,5,6" required></label><label>Hora inicial<input name="start_time" type="time" value="00:00" required></label><label>Hora final<input name="end_time" type="time" value="23:59" required></label><label>Fecha inicial (opcional)<input name="start_date" type="date"></label><label>Fecha final (opcional)<input name="end_date" type="date"></label></div><p class="mini">Completa solo precio promocional o porcentaje de descuento. Si dejas las fechas vacías, la promoción se repite según los días y horario.</p><button class="outline small">Crear promoción</button></form>
   </div></details>`).join('')||'<div class="empty">Todavía no hay productos registrados.</div>'}</div><div class="card" style="margin-top:16px"><h3>Productos eliminados</h3><p class="mini">Los productos eliminados desaparecen del menú, pero sus ventas e historial se conservan.</p><button class="outline small" data-action="list-archived-products">Consultar eliminados</button><div id="archived-products-list"></div></div>`;
 }
-async function showInventory(){const [s,ps]=await Promise.all([api('/settings'),api('/products')]);state.products=ps;return `<div class="card"><h3>Control general de inventario</h3><div class="row"><span>Estado actual</span>${pill(s.inventory_on?'open':'pending')}</div><p>${s.inventory_on?'Se descuentan unidades solo de productos con control individual activado.':'Desactivado: puedes vender sin descontar existencias. Los bloqueos manuales siguen vigentes.'}</p><button class="${s.inventory_on?'red':'primary'}" data-action="toggle-inventory" data-on="${!s.inventory_on}">${s.inventory_on?'Desactivar inventario general':'Activar tras revisar existencias'}</button></div><h2 class="section">Control por producto</h2><div class="cards">${ps.map(p=>`<div class="card"><div class="row"><h3>${esc(p.name)}</h3>${pill(p.status)}</div><p>Existencias registradas: <b>${p.stock}</b> · Control individual: <b>${p.inventory_enabled?'Sí':'No'}</b></p><div class="inline"><button class="outline small" data-action="edit-product" data-id="${p.id}">Configurar</button><button class="ghost small" data-action="restock" data-id="${p.id}">＋ Reponer</button></div></div>`).join('')||'<div class="empty">Agrega productos al menú para configurar su inventario.</div>'}</div>`}
+async function showInventory(){
+  const [settings,products,costs,movements]=await Promise.all([
+    api('/settings'),api('/products'),api('/inventory/costs'),api('/inventory/movements?limit=100')
+  ]);
+  state.products=products;
+  const costMap=new Map(costs.map(x=>[Number(x.product_id),x]));
+  const tracked=products.filter(p=>p.inventory_enabled);
+  const low=tracked.filter(p=>Number(p.stock)<=3);
+  const costForms=products.map(p=>{
+    const c=costMap.get(p.id);
+    return '<div class="card"><div class="row"><div><h3>'+esc(p.name)+'</h3><div class="mini">'+esc(p.category)+' · '+(p.station==='kitchen'?'Cocina':'Barra')+'</div></div>'+pill(p.status)+'</div>'+
+      '<p>Existencias: <b>'+Number(p.stock)+'</b> · Control individual: <b>'+(p.inventory_enabled?'Sí':'No')+'</b></p>'+
+      '<form id="inventory-cost-'+p.id+'" class="formrow"><label>Costo unitario real ($)<input name="unit_cost" type="number" min="0" step="0.01" value="'+(c?esc(c.unit_cost):'')+'" placeholder="Sin costo capturado"></label>'+
+      '<div class="inline"><button class="outline small">Guardar costo</button>'+(c?'<button type="button" class="ghost small" data-action="clear-product-cost" data-id="'+p.id+'">Quitar costo</button>':'')+
+      '<button type="button" class="ghost small" data-action="edit-product" data-id="'+p.id+'">Existencias / configuración</button></div></form></div>';
+  }).join('');
+  const wasteOptions=tracked.map(p=>'<option value="'+p.id+'">'+esc(p.name)+' · '+Number(p.stock)+' disponibles</option>').join('');
+  const movementRows=movements.map(m=>'<div class="lineitem"><div class="row"><b>'+esc(m.label)+' · '+esc(m.product)+'</b><b>'+(m.delta>0?'+':'')+Number(m.delta)+'</b></div>'+
+    '<div class="mini">'+Number(m.before)+' → '+Number(m.after)+' unidades · '+esc(m.actor)+' · '+(m.created_at?new Date(m.created_at).toLocaleString('es-MX'):'')+'</div>'+
+    '<div class="mini">'+esc(m.reason)+(m.batch_id?' · Comanda #'+Number(m.batch_id):'')+'</div></div>').join('');
+  return '<div class="card"><h3>Control general de inventario</h3><div class="row"><span>Estado actual</span>'+pill(settings.inventory_on?'open':'pending')+'</div>'+
+    '<p>'+(settings.inventory_on?'Se descuentan unidades al enviar comandas, solo en productos con control individual activo.':'Desactivado: no se descuentan existencias al vender.')+'</p>'+
+    '<button class="'+(settings.inventory_on?'red':'primary')+'" data-action="toggle-inventory" data-on="'+(!settings.inventory_on)+'">'+(settings.inventory_on?'Desactivar inventario general':'Activar tras revisar existencias')+'</button>'+
+    '<div class="statgrid">'+stat('Productos controlados',tracked.length)+stat('Stock bajo / agotado',low.length)+stat('Movimientos recientes',movements.length)+'</div></div>'+
+    '<h2 class="section">Control de existencias y costos</h2><div class="cards">'+(costForms||'<div class="empty">Agrega productos al menú para configurar existencias y costos.</div>')+'</div>'+
+    '<h2 class="section">Registrar merma</h2><div class="card">'+
+    (settings.inventory_on&&wasteOptions?'<form id="inventory-waste" class="formrow"><label>Producto<select name="product_id" required>'+wasteOptions+'</select></label><div class="formgrid"><label>Unidades perdidas<input name="quantity" type="number" min="1" max="10000" step="1" required></label><label>Motivo<input name="reason" minlength="3" maxlength="400" required placeholder="Caducidad, daño, preparación…"></label></div><button class="red">Registrar merma</button></form>':
+      '<p class="mini">Para registrar mermas, activa el inventario general y el control individual de al menos un producto.</p>')+'</div>'+
+    '<h2 class="section">Historial de movimientos</h2><div class="card">'+(movementRows||'<div class="empty">Todavía no hay movimientos de inventario registrados.</div>')+'</div>';
+}
 
 async function showUsers(){
   const users=await api('/users');state.data.users=users;
@@ -488,6 +552,28 @@ async function showApprovals(){const rs=await api('/requests');return `<div clas
 async function showAudit(){const rs=await api('/audit');return `<div class="card table-wrap"><table><thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Detalle</th></tr></thead><tbody>${rs.map(x=>`<tr><td>${esc(new Date(x.date).toLocaleString('es-MX'))}</td><td>${esc(x.actor)}</td><td>${esc(x.action)}</td><td class="mini">${esc(JSON.stringify(x.detail))}</td></tr>`).join('')}</tbody></table></div>`}
 async function showOverview(){
   const [as,ts,ps]=await Promise.all([api('/accounts'),api('/tickets'),api('/products')]);
+  let ownerPanel='';
+  if(state.user.role==='owner'){
+    const today=new Intl.DateTimeFormat('en-CA',{timeZone:'America/Mexico_City',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+    const [prep,metrics]=await Promise.all([
+      api('/preparation/tickets'),
+      api('/owner/analytics?start='+encodeURIComponent(today)+'&end='+encodeURIComponent(today)+'&scope=current')
+    ]);
+    const live=prep.tickets||[];
+    const activeAccounts=as.filter(a=>a.status==='open'||a.status==='pending');
+    const inProgress=live.filter(t=>t.status==='received'||t.status==='preparing').length;
+    const ready=live.filter(t=>t.status==='ready').length;
+    const delayed=live.filter(t=>t.batch_timing==='late'||(t.items||[]).some(i=>i.timing==='late'));
+    const lowStock=ps.filter(p=>p.status==='Stock bajo'||p.status==='Agotado');
+    const delayRows=delayed.slice(0,4).map(t=>'<div class="lineitem row"><div><b>'+esc(t.account)+' · Comanda #'+Number(t.batch_id)+'</b><div class="mini">'+(t.station==='kitchen'?'Cocina':'Barra')+' · '+esc(t.waiter)+' · '+(t.batch_timing==='late'?'Tiempo de comanda vencido':'Producto retrasado')+'</div></div></div>').join('');
+    const stockRows=lowStock.slice(0,4).map(p=>'<div class="lineitem row"><div><b>'+esc(p.name)+'</b><div class="mini">'+esc(p.category)+' · '+(p.status==='Agotado'?'Sin existencias':'Stock bajo')+' · '+Number(p.stock)+' unidad(es)</div></div></div>').join('');
+    ownerPanel='<div class="owner-live-panel">'+
+      '<div class="premium-dashboard-heading"><div><p class="premium-eyebrow">SEGUIMIENTO EN TIEMPO REAL</p><h2>Estado del servicio</h2><p>Indicadores del corte activo. Las propinas se mantienen fuera de ventas.</p></div><span class="premium-dashboard-live">● Datos del servidor</span></div>'+
+      '<div class="statgrid">'+stat('Ventas cobradas',money(metrics.sales))+stat('Cuentas activas',activeAccounts.length)+stat('En preparación',inProgress)+stat('Estaciones listas',ready)+stat('Comandas retrasadas',delayed.length)+stat('Stock bajo / agotado',lowStock.length)+'</div>'+
+      '<div class="grid2 owner-alert-grid"><div class="card"><h3>Atención de cocina y barra</h3>'+(delayRows||'<p class="mini">Sin comandas retrasadas.</p>')+'<button class="outline small" data-nav="tickets">Supervisar estaciones</button></div>'+
+      '<div class="card"><h3>Existencias que requieren revisión</h3>'+(stockRows||'<p class="mini">No hay productos con stock bajo.</p>')+'<button class="outline small" data-nav="inventory">Revisar inventario</button></div></div>'+
+      '<div class="note">Preparación media del turno: '+(metrics.prep_avg_minutes===null?'sin datos':Number(metrics.prep_avg_minutes)+' min')+'. El margen se calcula solo para productos con costo unitario real registrado.</div></div>';
+  }
   // Los accesos solo navegan a módulos ya existentes, sin alterar API o permisos.
   const drawings={
     list:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h9M8 13h9M8 17h6"/>',
@@ -509,20 +595,21 @@ async function showOverview(){
     ['cashier','Cobros','Pagos pendientes y descuentos','cash'],
     ['cash','Caja','Turnos, cortes y movimientos','cash'],
     ['products','Menú','Productos, variantes y promociones','food'],
-    ['inventory','Inventario','Existencias y reposiciones','box'],
+    ['inventory','Inventario','Existencias, costos y mermas','box'],
     ['users','Personal','Empleados y permisos','people'],
     ['tips','Propinas','Fondo común y repartos','tips'],
     ['approvals','Autorizaciones','Solicitudes y cancelaciones','shield'],
     ['audit','Auditoría','Registro de operaciones','audit']
   ];
   shortcuts.push(['reservations','Reservaciones','Confirmar llegadas y abrir cuentas','list'],['prepconfig','Tiempos','Límites de cocina y barra','kitchen']);
-  if(state.user.role==='owner')shortcuts.push(['analytics','Estadísticas','Ventas, productos y tiempos reales','cash']);
+  if(state.user.role==='owner')shortcuts.push(['analytics','Estadísticas','Ventas, costos y utilidad bruta estimada','cash']);
   return `<div class="premium-dashboard">
     <div class="premium-dashboard-heading">
       <div><p class="premium-eyebrow">CENTRO DE CONTROL</p><h2>Operación del restaurante</h2>
       <p>Revisa el servicio y entra directamente al módulo que necesitas.</p></div>
       <span class="premium-dashboard-live">● Información actualizada</span>
     </div>
+    ${ownerPanel}
     <div class="statgrid">${stat('Cuentas activas',as.filter(a=>a.status==='open'||a.status==='pending').length)}${stat('Por cobrar',as.filter(a=>a.status==='pending').length)}${stat('Comandas nuevas',ts.filter(t=>t.status==='new').length)}${stat('Productos',ps.length)}</div>
     <div class="premium-dashboard-heading premium-dashboard-second"><div><p class="premium-eyebrow">GESTIÓN Y ADMINISTRACIÓN</p><h2>Todos los módulos</h2></div></div>
     <div class="premium-shortcut-grid">
@@ -530,7 +617,7 @@ async function showOverview(){
     </div>
     <div class="grid2 premium-dashboard-footer">
       <div class="card"><h3>Operación en vivo</h3><p>Consulta cuentas abiertas y el estado de los pedidos.</p><button class="primary" data-nav="all">Supervisar cuentas</button></div>
-      <div class="card"><h3>Control de inventario</h3><p>Revisa existencias, productos bloqueados y reposiciones.</p><button class="outline" data-nav="inventory">Abrir inventario</button></div>
+      <div class="card"><h3>Control de inventario</h3><p>Revisa existencias, costos unitarios, mermas y reposiciones.</p><button class="outline" data-nav="inventory">Abrir inventario</button></div>
     </div>
   </div>`;
 }
@@ -585,7 +672,9 @@ case 'send-order':{
   if(action==='share-ticket')toast('Descarga iniciada. Comparte el archivo desde WhatsApp.');
   break;
 }
-case 'fcm-test':{const r=await api('/fcm/test','POST',{});toast(r.message||'Prueba solicitada');break}case 'toggle-inventory':{const on=btn.dataset.on==='true';if(on&&!confirm('Antes de activar inventario debes revisar y confirmar las existencias de TODOS los productos controlados. ¿Ya realizaste el recuento?'))return;await api('/settings','PUT',{inventory_on:on,confirmed_recount:on});toast('Configuración de inventario actualizada');await render();break}case 'restock':{const p=state.products.find(x=>x.id===id);const delta=Number(prompt(`¿Cuántas unidades agregar a ${p.name}?`,'5'));if(!Number.isInteger(delta)||delta<1)throw Error('Cantidad inválida');const reason=ask('Motivo de la reposición:');if(!reason)return;await api(`/products/${id}/restock`,'POST',{delta,reason,expected_version:p.version});toast('Existencias actualizadas');await render();break}case 'delete-category':{
+case 'fcm-test':{const r=await api('/fcm/test','POST',{});toast(r.message||'Prueba solicitada');break}case 'toggle-inventory':{const on=btn.dataset.on==='true';if(on&&!confirm('Antes de activar inventario debes revisar y confirmar las existencias de TODOS los productos controlados. ¿Ya realizaste el recuento?'))return;await api('/settings','PUT',{inventory_on:on,confirmed_recount:on});toast('Configuración de inventario actualizada');await render();break}case 'restock':{const p=state.products.find(x=>x.id===id);const delta=Number(prompt(`¿Cuántas unidades agregar a ${p.name}?`,'5'));if(!Number.isInteger(delta)||delta<1)throw Error('Cantidad inválida');const reason=ask('Motivo de la reposición:');if(!reason)return;await api(`/products/${id}/restock`,'POST',{delta,reason,expected_version:p.version});toast('Existencias actualizadas');await render();break}
+case 'clear-product-cost':{if(!confirm('¿Quitar el costo unitario de este producto? Los reportes históricos conservarán los costos que ya fueron guardados al enviar las comandas.'))return;await api(`/products/${id}/cost`,'PUT',{unit_cost:null});toast('Costo unitario retirado para futuras comandas');await render();break}
+case 'delete-category':{
   const name=btn.dataset.name,count=Number(btn.dataset.count);
   const target=prompt('Borrar la categoría "'+name+'". ¿A qué otra categoría mover sus '+count+' producto(s)?','General');
   if(target===null)return;
