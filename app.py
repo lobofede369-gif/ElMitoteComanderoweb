@@ -37,8 +37,8 @@ ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '')
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'propietario')
 DEMO_MODE = os.getenv('DEMO_MODE', '0').strip().lower() in ('1','true','yes','on')
 DEMO_SEED_VERSION = 1
-if DEMO_MODE and DATABASE_URL.startswith('sqlite:'):
-    raise RuntimeError('DEMO_MODE requiere una base PostgreSQL independiente.')
+if DEMO_MODE and not DATABASE_URL.startswith('sqlite:'):
+    raise RuntimeError('La demo debe usar SQLite local aislado; nunca debe conectarse a PostgreSQL de producción.')
 VAPID_PUBLIC_KEY = os.getenv('VAPID_PUBLIC_KEY', '').strip()
 VAPID_PRIVATE_KEY = os.getenv('VAPID_PRIVATE_KEY', '').strip()
 VAPID_SUBJECT = os.getenv('VAPID_SUBJECT', '').strip()
