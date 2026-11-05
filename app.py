@@ -1145,7 +1145,12 @@ class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:
 @app.get('/api/users')
 def users(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
-    return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,'active':u.active,'has_pin':db.get(UserPin,u.id) is not None} for u in db.scalars(select(User).order_by(User.id))]
+    rows=db.scalars(select(User).order_by(User.id)).all()
+    user_ids=[row.id for row in rows]
+    pin_ids=set(db.scalars(select(UserPin.user_id).where(
+        UserPin.user_id.in_(user_ids))).all()) if user_ids else set()
+    return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,
+             'active':u.active,'has_pin':u.id in pin_ids} for u in rows]
 @app.post('/api/users')
 async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner')
