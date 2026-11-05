@@ -235,7 +235,8 @@ with TestClient(app.app) as client:
     # Verificación PostgreSQL de archivado de productos y PDF inmutable por corte.
     with app.SessionLocal() as db:
         period_id=db.scalar(app.select(app.CashPeriod.id))
-        db.get(app.Account,account_id).status="paid"
+        for test_account_id in account_ids:
+            db.get(app.Account,test_account_id).status="paid"
         db.get(app.Account,aid).status="paid"
         pool=app.TipDistribution(period_id=period_id,created_by=users["admin"],
             total_cents=2000,participant_count=1,base_share_cents=2000,remainder_cents=0)
