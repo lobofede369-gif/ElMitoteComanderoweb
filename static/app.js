@@ -2,7 +2,7 @@
 const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
 const savedToken=localStorage.getItem('mitote-token')||sessionStorage.getItem('mitote-token')||'';
 if(savedToken)localStorage.setItem('mitote-token',savedToken);
-const state={token:savedToken,user:null,screen:'',account:null,draft:[],products:[],data:{},lastRefresh:0,alarmTimer:null,audio:null,alarmArmed:false,navStack:[],renderSeq:0,pendingRefresh:false,waiterReadyInitialized:false,waiterReadySeen:new Set(),waiterReadyBusy:false};
+const state={token:savedToken,user:null,screen:'',account:null,draft:[],products:[],data:{},lastRefresh:0,alarmTimer:null,audio:null,alarmArmed:false,navStack:[],renderSeq:0,pendingRefresh:false,waiterReadyInitialized:false,waiterReadySeen:new Set(),waiterReadyBusy:false,waiterReadyPending:false};
 const workKey=()=>state.user?`mitote-work-${state.user.id}`:'';
 function persistWorkState(){if(!state.user)return;try{localStorage.setItem(workKey(),JSON.stringify({account:state.account,draft:state.draft}));}catch{}}
 function restoreWorkState(){if(!state.user)return;try{const saved=JSON.parse(localStorage.getItem(workKey())||'{}');state.account=Number(saved.account)||null;state.draft=Array.isArray(saved.draft)?saved.draft.filter(x=>x&&Number.isInteger(Number(x.product_id))&&Number(x.qty)>0).map(x=>({product_id:Number(x.product_id),name:String(x.name||''),station:x.station==='bar'?'bar':'kitchen',qty:Math.min(100,Number(x.qty)),note:String(x.note||'').slice(0,300),variant_id:x.variant_id?Number(x.variant_id):null,variant_name:String(x.variant_name||''),modifier_option_ids:Array.isArray(x.modifier_option_ids)?x.modifier_option_ids.map(Number):[],modifier_names:Array.isArray(x.modifier_names)?x.modifier_names.map(String):[],prep_minutes:Math.max(0,Math.min(240,Number(x.prep_minutes??15))),release_after_minutes:Math.max(0,Math.min(240,Number(x.release_after_minutes??0))),unit_price:Number(x.unit_price)||0,promotion_name:String(x.promotion_name||'')})):[];}catch{state.account=null;state.draft=[];}}
@@ -198,7 +198,7 @@ async function render(options={}){
   }
 }
 async function showAccounts(all){const arr=await api('/accounts');state.data.accounts=arr;const active=arr.filter(x=>x.status==='open'||x.status==='pending');const ready=all?[]:(state.data.readyAlerts||[]);const readyHtml=!all?'<div class="card waiter-ready-card"><div class="row"><h3>🔔 Pedidos listos para llevar a mesa</h3><button class="outline small" data-action="enable-sound">♪ Probar sonido</button></div>'+(
-ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+'</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+(x.complete?' · Cocina y barra terminadas':'')+'</div></div><button class="outline small" data-action="open-account" data-id="'+Number(x.account_id)+'">Ver cuenta</button></div>').join(''):'<p class="mini">Aquí aparecerán las comandas que cocina o barra terminen durante este turno.</p>'
+ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+'</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+(x.complete?' · Todas las estaciones listas':'')+'</div></div><button class="outline small" data-action="open-account" data-id="'+Number(x.account_id)+'">Ver cuenta</button></div>').join(''):'<p class="mini">Aquí aparecerán las comandas que cocina o barra terminen durante este turno.</p>'
 )+'</div>':'';
 return `<div class="statgrid">${stat('Cuentas activas',active.length)}${stat('Por cobrar',active.filter(x=>x.status==='pending').length)}</div>${readyHtml}${!all?'<button class="primary" data-nav="new">＋ Abrir nueva cuenta</button>':''}<h2 class="section">${all?'Todas las cuentas':'Mis cuentas'}</h2><div class="cards">${active.map(a=>accountCard(a,all?'admin-account':'open-account')).join('')||'<div class="empty">Todavía no hay cuentas activas.</div>'}</div>${all?'<h2 class="section">Cuentas pagadas de este turno</h2><div class="cards">'+arr.filter(x=>x.status==='paid').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div><h2 class="section">Cuentas unidas recientemente</h2><div class="cards">'+arr.filter(x=>x.status==='merged').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div>':''}`}
 function ticketLookupHtml(){return `<div class="card" style="margin-top:15px"><h3>Consultar ticket histórico</h3><p>Busca por folio, aunque la cuenta ya esté pagada.</p><form id="ticket-lookup" class="formrow"><label>Folio de cuenta<input type="number" min="1" name="id" required></label><button class="outline">Buscar ticket</button></form></div>`}
@@ -797,6 +797,15 @@ async function disablePush(){
   if(sub){await api('/push/unsubscribe','POST',{endpoint:sub.endpoint});await sub.unsubscribe();}
   toast('Notificaciones desactivadas en este teléfono');
 }
+document.addEventListener('pointerdown',()=>{
+  // Los navegadores solo permiten audio después de una interacción del mesero.
+  if(!state.user||state.alarmArmed||window.MitoteAndroid)return;
+  state.alarmArmed=true;
+  try{
+    state.audio=state.audio||new(window.AudioContext||window.webkitAudioContext)();
+    if(state.audio.state==='suspended')state.audio.resume().catch(()=>{});
+  }catch{}
+},{passive:true});
 function stopAlarm(){clearInterval(state.alarmTimer);state.alarmTimer=null}
 function beep(kind='station'){
   if(document.hidden||!state.alarmArmed)return;
@@ -825,7 +834,8 @@ function beep(kind='station'){
 }
 function checkAlarm(){const isStation=['kitchen','bar'].includes(state.user?.role);const tickets=state.data.tickets||[];const pending=isStation&&tickets.some(t=>t.station===state.user.role&&t.status==='new');if(!pending){stopAlarm();return}if(!state.alarmTimer){beep('station');state.alarmTimer=setInterval(()=>beep('station'),8000)}}
 async function syncWaiterReadyAlerts(initial=false){
-  if(state.user?.role!=='waiter'||state.waiterReadyBusy)return;
+  if(state.user?.role!=='waiter')return;
+  if(state.waiterReadyBusy){state.waiterReadyPending=true;return;}
   state.waiterReadyBusy=true;
   try{
     const items=await api('/waiter/ready-alerts');
@@ -848,7 +858,10 @@ async function syncWaiterReadyAlerts(initial=false){
     }
     state.data.readyAlerts=items;
     try{sessionStorage.setItem(userKey,JSON.stringify([...state.waiterReadySeen].slice(-180)))}catch{}
-  }finally{state.waiterReadyBusy=false}
+  }finally{
+    state.waiterReadyBusy=false;
+    if(state.waiterReadyPending){state.waiterReadyPending=false;syncWaiterReadyAlerts().catch(()=>{});}
+  }
 }
 async function listenEvents(){while(state.user&&state.token){try{
   await refreshSessionIfNeeded();const token=state.token;
