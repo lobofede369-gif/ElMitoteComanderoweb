@@ -453,8 +453,9 @@ try:
         assert "accountHistoryMarkup(rows)" in js
         assert "prepClockTimer" in features
         assert "document.hidden" in features
-        assert "mitote-comandas-v31" in sw
-        assert "/static/app.js?v=27" in sw and "/static/app.js?v=27" in html
+        assert "mitote-comandas-v32" in sw
+        assert "/static/app.js?v=28" in sw and "/static/app.js?v=28" in html
+        assert "function setConnectionState(connected)" in js
         assert "/static/features.js?v=3" in sw and "/static/features.js?v=3" in html
         print("OK: deduplicación GET, historial diferido, cronómetros activos solo en pantalla y caché versionada.")
 

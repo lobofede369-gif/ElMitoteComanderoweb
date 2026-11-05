@@ -30,6 +30,12 @@ function clearPendingOperation(scope){
   try{localStorage.removeItem('mitote-pending-'+state.user.id+'-'+scope);}catch{}
 }
 function toast(message,error=false){const el=$('#toast');el.textContent=message;el.style.borderColor=error?'#ff5777':'#ffd400';el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),4500)}
+function setConnectionState(connected){
+  const el=$('#connection');
+  if(!el)return;
+  el.textContent=connected?'● Conectado':'● Sin conexión';
+  el.classList.toggle('off',!connected);
+}
 let refreshPromise=null;
 function tokenExpiresSoon(token){try{const raw=token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');const part=raw+'='.repeat((4-raw.length%4)%4);const payload=JSON.parse(atob(part));return Number(payload.exp)*1000-Date.now()<45*60*1000}catch{return false}}
 async function refreshSessionIfNeeded(){
