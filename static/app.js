@@ -248,9 +248,13 @@ function updateDraftUI(){
   if(bill)bill.disabled=state.draft.length>0;
 }
 async function showOrders(){
-  // Cargar cuentas y catálogo en paralelo, no uno detrás del otro.
-  // Cada respuesta mantiene el control de sesión existente en api().
-  const [arr,productResponse]=await Promise.all([api('/accounts'),api('/products')]);state.data.accounts=arr;
+  // Cargar las dependencias de la pantalla en paralelo y reutilizar el contexto
+  // de cuentas/mesas al construir el detalle, sin repetir las mismas peticiones.
+  const requests=[api('/accounts'),api('/products')];
+  if(state.user?.role==='owner')requests.push(api('/tables'));
+  const [arr,productResponse,tables]=await Promise.all(requests);
+  state.data.accounts=arr;
+  if(tables)state.data.tables=tables;
   const open=arr.filter(x=>x.status==='open');
   if(!open.length)return '<div class="empty">No tienes cuentas abiertas. Crea una para comenzar.</div><p><button class="primary" data-nav="new">Nueva cuenta</button></p>';
   if(!open.some(a=>a.id===state.account)){state.account=open[0].id;state.draft=[];persistWorkState()}
@@ -269,25 +273,8 @@ async function showOrders(){
   <div class="card" style="margin-top:15px"><button id="bill-btn" class="outline" data-action="bill" data-id="${a.id}" ${state.draft.length?'disabled':''}>Solicitar cuenta a caja</button><p class="mini">Envía o quita los productos pendientes antes de solicitar el cobro.</p></div>
   <h2 class="section">Detalle y solicitudes</h2>${await accountDetailHtml(a.id,false)}`;
 }
-async function accountDetailHtml(id,admin=false){
-  const a=await api('/accounts/'+id);
-  const canManage=['owner','admin','waiter'].includes(state.user?.role);
-  // Conservar acciones operativas de meseros; reservar la edición avanzada al Propietario.
-  const canEditAccount=state.user?.role==='owner';
-  const isAdmin=['owner','admin'].includes(state.user?.role);
-  let tables=[],accounts=[],history=[];
-  if(canEditAccount&&['open','pending'].includes(a.status)){
-    [tables,accounts,history]=await Promise.all([
-      api('/tables'),api('/accounts'),api(`/accounts/${id}/history`)
-    ]);
-  }else if(canManage){
-    history=await api(`/accounts/${id}/history`);
-  }
-  if(canEditAccount&&!state.data.users)state.data.users=await api('/users');
-  const availableTables=tables.filter(t=>t.active&&(t.status==='available'||t.id===a.table_id));
-  const otherAccounts=accounts.filter(x=>x.id!==a.id&&['open','pending'].includes(x.status));
-  const activeItems=a.items.filter(i=>i.qty>i.cancelled_qty);
-  const historyLabels={
+function accountHistoryMarkup(rows){
+  const labels={
     'account.rename':'Cambio de nombre',
     'account.table_transfer':'Cambio de mesa',
     'account.reassign':'Cambio de mesero',
@@ -299,7 +286,33 @@ async function accountDetailHtml(id,admin=false){
     'account.reopen_closed':'Cuenta reabierta',
     'account.close':'Cuenta cerrada'
   };
-  const historyHtml=history.length?`<div class="card"><h3>Historial de movimientos</h3>${history.slice(0,12).map(h=>`<div class="lineitem"><div class="row"><b>${esc(historyLabels[h.action]||h.action)}</b><span class="mini">${esc(h.date?new Date(h.date).toLocaleString('es-MX'):'')}</span></div><div class="mini">${esc(h.actor||'Sistema')} · ${esc(h.detail?.reason||h.detail?.product||'Movimiento registrado')}${h.detail?.target_account_id?` · Cuenta destino #${h.detail.target_account_id}`:''}${h.detail?.to_table?` · ${esc(h.detail.to_table)}`:''}</div></div>`).join('')}</div>`:'';
+  if(!rows.length)return '<p class="mini">No hay movimientos registrados para esta cuenta.</p>';
+  return rows.slice(0,12).map(h=>'<div class="lineitem"><div class="row"><b>'+
+    esc(labels[h.action]||h.action)+'</b><span class="mini">'+
+    esc(h.date?new Date(h.date).toLocaleString('es-MX'):'')+
+    '</span></div><div class="mini">'+esc(h.actor||'Sistema')+' · '+
+    esc(h.detail?.reason||h.detail?.product||'Movimiento registrado')+
+    (h.detail?.target_account_id?' · Cuenta destino #'+Number(h.detail.target_account_id):'')+
+    (h.detail?.to_table?' · '+esc(h.detail.to_table):'')+
+    '</div></div>').join('');
+}
+async function accountDetailHtml(id,admin=false){
+  const a=await api('/accounts/'+id);
+  const canManage=['owner','admin','waiter'].includes(state.user?.role);
+  // Conservar acciones operativas de meseros; reservar la edición avanzada al Propietario.
+  const canEditAccount=state.user?.role==='owner';
+  const isAdmin=['owner','admin'].includes(state.user?.role);
+  let tables=[],accounts=[];
+  if(canEditAccount&&['open','pending'].includes(a.status)){
+    tables=state.data.tables||await api('/tables');
+    accounts=state.data.accounts||await api('/accounts');
+  }
+  if(canEditAccount&&!state.data.users)state.data.users=await api('/users');
+  const availableTables=tables.filter(t=>t.active&&(t.status==='available'||t.id===a.table_id));
+  const otherAccounts=accounts.filter(x=>x.id!==a.id&&['open','pending'].includes(x.status));
+  const activeItems=a.items.filter(i=>i.qty>i.cancelled_qty);
+  // El historial se consulta solo cuando alguien lo solicita, no en cada apertura.
+  const historyHtml=canManage?`<div class="card"><div class="row"><h3>Historial de movimientos</h3><button class="outline small" data-action="load-account-history" data-id="${id}">Consultar historial</button></div><div id="account-history-${id}" class="mini">El historial se cargará cuando lo necesites.</div></div>`:'';
   const actionsHtml=canEditAccount&&['open','pending'].includes(a.status)?`
     <div class="card"><h3>Modificar cuenta</h3>
       <form id="account-rename-form" class="formrow">
@@ -545,6 +558,15 @@ case 'ack-ready':{
   state.data.readyAlerts=(state.data.readyAlerts||[]).filter(x=>x.event_id!==id);
   toast('Entrega confirmada');
   await render();
+  break;
+}
+case 'load-account-history':{
+  const accountId=Number(btn.dataset.id);
+  if(!Number.isSafeInteger(accountId)||accountId<1)throw Error('Cuenta inválida');
+  const rows=await api(`/accounts/${accountId}/history`);
+  const target=document.getElementById('account-history-'+accountId);
+  if(target)target.innerHTML=accountHistoryMarkup(rows);
+  btn.textContent='Actualizar historial';
   break;
 }
 case 'view-report':await showCashTicket(id);break;case 'period-detail':await showPeriodDetail(id);break;case 'hide-period-detail':{const el=$('#period-detail');if(el)el.innerHTML='';break}case 'void-account':{const reason=ask('Motivo para anular esta cuenta sin saldo:');if(!reason)return;if(!confirm('¿Confirmas la anulación? Esta acción quedará registrada.'))return;await api(`/accounts/${id}/void`,'POST',{reason});toast('Cuenta anulada y archivada');await go('all');break}case 'enable-sound':state.alarmArmed=true;beep('ready');toast('Sonido potente activado en esta pantalla');break;case 'reset-user':{const secret=ask(btn.dataset.role==='waiter'?'Nuevo PIN de 4 dígitos:':'Nueva contraseña (mínimo 8 caracteres):');if(!secret)return;await api(`/users/${id}`,'PATCH',{secret});toast('Clave cambiada; sesiones anteriores revocadas');await render();break}case 'toggle-user':{if(!confirm('¿Confirmar cambio de acceso?'))return;await api(`/users/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Acceso actualizado y sesiones revocadas');await render();break}case 'open-account':state.account=id;state.draft=[];await go('orders');break;case 'admin-account':{const a=await api('/accounts/'+id);if(!state.data.users)state.data.users=await api('/users');$('#content').innerHTML=`<button class="outline small" data-nav="all">← Volver</button><h2 class="section">Cuenta #${id}</h2>${await accountDetailHtml(id,true)}`;break}case 'remove-line':state.draft.splice(id,1);persistWorkState();updateDraftUI();toast('Producto retirado del borrador');break;
