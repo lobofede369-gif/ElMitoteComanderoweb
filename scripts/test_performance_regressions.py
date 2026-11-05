@@ -49,6 +49,19 @@ try:
         with app.SessionLocal() as db:
             owner_id = db.scalar(app.select(app.User.id).where(app.User.role == "owner"))
             staff_ids = []
+            test_pin = "641829"
+            pin_user = app.User(
+                username="perf_pin_login",
+                display="Mesero acceso perf", role="waiter",
+                active=True, password_hash="test-only",
+            )
+            db.add(pin_user)
+            db.flush()
+            db.add(app.UserPin(
+                user_id=pin_user.id, lookup=app._pin_lookup(test_pin),
+                pin_hash=app.ph.hash(test_pin),
+            ))
+            pin_login_user_id = pin_user.id
             for number in range(12):
                 staff = app.User(
                     username=f"perf_waiter_{number}",
@@ -103,6 +116,24 @@ try:
         def count_selects(conn, cursor, statement, parameters, context, executemany):
             if statement.lstrip().upper().startswith("SELECT"):
                 statements.append(statement)
+
+        # PIN correcto: una consulta SQL para PIN+usuario, sin segunda lectura.
+        event.listen(app.engine, "before_cursor_execute", count_selects)
+        try:
+            login_response = client.post("/api/login/pin", json={"pin": test_pin})
+        finally:
+            event.remove(app.engine, "before_cursor_execute", count_selects)
+        assert login_response.status_code == 200, login_response.text
+        login_data = login_response.json()
+        assert login_data["user"]["id"] == pin_login_user_id, login_data
+        assert login_data["user"]["role"] == "waiter", login_data
+        assert len(statements) == 1, (
+            "El login PIN debe resolver PIN y usuario en una consulta: "
+            + str(len(statements))
+        )
+        assert login_response.headers.get("X-Request-ID"), login_response.headers
+        assert login_response.headers.get("Server-Timing", "").startswith("app;dur="), login_response.headers
+        print("OK: login PIN válido con una consulta SQL y perfil devuelto.")
 
         event.listen(app.engine, "before_cursor_execute", count_selects)
         try:
@@ -330,7 +361,22 @@ try:
             "async function refreshAccountPanel", 1
         )[0]
         assert "apiInflight:new Map()" in js
+        start_flow = js.split("async function start(authenticatedUser=null)", 1)[1].split(
+            "async function go(", 1
+        )[0]
+        login_flow = js.split("async function loginSession", 1)[1].split(
+            "$('#login-pin-form').addEventListener", 1
+        )[0]
+        assert "await start(d.user)" in login_flow
+        assert "state.user=validUser||await api('/me')" in start_flow
+        assert "await syncWaiterReadyAlerts" not in start_flow
+        assert start_flow.index("await render({preserveScroll:false})") < start_flow.index(
+            "syncWaiterReadyAlerts(true).catch"
+        )
+        assert "function waiterReadyAlertsHtml()" in js
         app_source = (root / "app.py").read_text(encoding="utf-8")
+        assert ".join(User, User.id == UserPin.user_id)" in app_source
+        assert "slow_pin_login" in app_source
         assert "observe_request_performance" in app_source
         assert "slow_request" in app_source
         new_account_action = js.split("case 'new-account':", 1)[1].split("case 'reassign-form':", 1)[0]
