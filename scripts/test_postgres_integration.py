@@ -4,6 +4,9 @@ DATABASE_URL apunta únicamente al contenedor temporal de GitHub Actions.
 No utilizar esta prueba contra la base del restaurante.
 """
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -33,6 +36,13 @@ with TestClient(app.app) as client:
             db.add(row)
             db.flush()
             users[role] = row.id
+        for number in (2, 3):
+            row = app.User(username=f"postgres_waiter_{number}", display=f"waiter_{number}",
+                           role="waiter", active=True,
+                           password_hash=app.ph.hash("TestingOnlyPassword2026"))
+            db.add(row)
+            db.flush()
+            users[f"waiter_{number}"] = row.id
         users["owner"] = db.scalar(app.select(app.User.id).where(app.User.role == "owner"))
         db.add(app.CashPeriod(opening_cents=0))
         db.add(app.Product(name="Hamburguesa pruebas", category="Comida",
@@ -44,13 +54,52 @@ with TestClient(app.app) as client:
         product_id = db.scalar(app.select(app.Product.id))
         table_id = db.scalar(app.select(app.DiningTable.id))
 
-    def bearer(role):
-        token = app.jwt.encode({"sub": str(users[role]), "ver": 1,
+    def bearer_user(user_id):
+        token = app.jwt.encode({"sub": str(user_id), "ver": 1,
             "exp": app.now() + timedelta(minutes=30)}, app.SECRET_KEY, algorithm="HS256")
         return {"Authorization": "Bearer " + token}
 
+    def bearer(role):
+        return bearer_user(users[role])
+
     def post(role, path, payload):
         return client.post(path, json=payload, headers=bearer(role))
+
+    def post_user(user_id, path, payload):
+        return client.post(path, json=payload, headers=bearer_user(user_id))
+
+    # Tres transacciones de trabajo deben poder mantener FOR SHARE a la vez.
+    # El cierre conserva FOR UPDATE y debe esperar a que terminen las comandas.
+    barrier = threading.Barrier(4)
+    release_shared = threading.Event()
+    def hold_work_lock():
+        with app.SessionLocal() as db:
+            app.active_period_for_work(db)
+            barrier.wait(timeout=10)
+            if not release_shared.wait(timeout=10):
+                raise AssertionError("No se liberó el bloqueo compartido del turno")
+            db.rollback()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        holders = [pool.submit(hold_work_lock) for _ in range(3)]
+        try:
+            barrier.wait(timeout=10)
+            exclusive_acquired = threading.Event()
+            def take_exclusive_lock():
+                with app.SessionLocal() as db:
+                    app.active_period(db)
+                    exclusive_acquired.set()
+                    db.rollback()
+            exclusive = pool.submit(take_exclusive_lock)
+            time.sleep(0.2)
+            assert not exclusive_acquired.is_set(), "El cierre no esperó a las operaciones en curso"
+        finally:
+            release_shared.set()
+        for future in holders:
+            future.result(timeout=10)
+        exclusive.result(timeout=10)
+        assert exclusive_acquired.is_set(), "El bloqueo exclusivo no continuó tras liberar las comandas"
+    print("OK: tres envíos pueden compartir el turno; el cierre espera de forma segura.")
 
     r = client.put("/api/preparation/config", json={"batch_minutes":26,"warning_percent":80},headers=bearer("owner"))
     assert r.status_code == 200,r.text
@@ -65,6 +114,93 @@ with TestClient(app.app) as client:
     batch_id=r.json()["batch_id"]
     duplicate=post("waiter",f"/api/accounts/{account_id}/orders",payload)
     assert duplicate.status_code == 200 and duplicate.json()["duplicate"]
+
+    # Tres meseros distintos envían al mismo producto a la vez, con inventario global apagado.
+    waiter_ids = [users["waiter"], users["waiter_2"], users["waiter_3"]]
+    account_ids = [account_id]
+    for number, waiter_id in enumerate(waiter_ids[1:], start=2):
+        opened = post_user(waiter_id, "/api/accounts", {"name": f"Cuenta simultánea {number}", "table_id": None})
+        assert opened.status_code == 200, opened.text
+        account_ids.append(opened.json()["id"])
+    with app.SessionLocal() as db:
+        setting = db.get(app.Setting, 1)
+        setting.inventory_on = False
+        setting.inventory_reviewed = False
+        db.commit()
+    concurrent_payloads = [
+        {"client_key": uuid4().hex,
+         "items": [{"product_id": product_id, "qty": 1, "prep_minutes": 15}]}
+        for _ in range(3)
+    ]
+    def send_concurrent(index):
+        return post_user(waiter_ids[index],
+            f"/api/accounts/{account_ids[index]}/orders", concurrent_payloads[index])
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        concurrent_results = list(pool.map(send_concurrent, range(3)))
+    assert all(response.status_code == 200 for response in concurrent_results), [
+        (response.status_code, response.text) for response in concurrent_results]
+    concurrent_batch_ids = [response.json()["batch_id"] for response in concurrent_results]
+    assert len(set(concurrent_batch_ids)) == 3, concurrent_batch_ids
+    print("OK: tres meseros enviaron comandas simultáneas sin bloqueo global ni duplicados.")
+
+    # Dos toques simultáneos con la misma clave deben producir una sola comanda.
+    duplicate_payload = {"client_key": uuid4().hex,
+        "items": [{"product_id": product_id, "qty": 1, "prep_minutes": 15}]}
+    def send_duplicate(_):
+        return post_user(waiter_ids[0], f"/api/accounts/{account_ids[0]}/orders", duplicate_payload)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        duplicate_results = list(pool.map(send_duplicate, range(2)))
+    assert all(response.status_code == 200 for response in duplicate_results), [
+        (response.status_code, response.text) for response in duplicate_results]
+    assert len({response.json()["batch_id"] for response in duplicate_results}) == 1
+    assert sorted(response.json()["duplicate"] for response in duplicate_results) == [False, True]
+    print("OK: doble toque simultáneo produce una sola comanda idempotente.")
+
+    # Una clave reutilizada desde dos cuentas distintas debe rechazarse sin error 500.
+    cross_account_key = uuid4().hex
+    cross_payload = {"client_key": cross_account_key,
+        "items": [{"product_id": product_id, "qty": 1, "prep_minutes": 15}]}
+    def send_cross_account(index):
+        return post_user(waiter_ids[index],
+            f"/api/accounts/{account_ids[index]}/orders", cross_payload)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cross_results = list(pool.map(send_cross_account, (1, 2)))
+    assert sorted(response.status_code for response in cross_results) == [200, 409], [
+        (response.status_code, response.text) for response in cross_results]
+    with app.SessionLocal() as db:
+        key_count = db.scalar(app.select(app.func.count(app.Batch.id)).where(
+            app.Batch.client_key == cross_account_key))
+        assert key_count == 1, key_count
+    print("OK: clave simultánea entre cuentas distintas no duplica ni produce error 500.")
+
+    # Con inventario activo, los bloqueos por producto siguen evitando la sobreventa.
+    with app.SessionLocal() as db:
+        setting = db.get(app.Setting, 1)
+        setting.inventory_on = True
+        setting.inventory_reviewed = True
+        stocked = app.Product(name="Producto con stock concurrente", category="Pruebas",
+            station="kitchen", price_cents=5000, active=True, blocked=False,
+            inventory_enabled=True, stock=5, version=1)
+        db.add(stocked)
+        db.commit()
+        stocked_product_id = stocked.id
+    stock_payloads = [
+        {"client_key": uuid4().hex,
+         "items": [{"product_id": stocked_product_id, "qty": 2, "prep_minutes": 15}]}
+        for _ in range(3)
+    ]
+    def send_stocked(index):
+        return post_user(waiter_ids[index],
+            f"/api/accounts/{account_ids[index]}/orders", stock_payloads[index])
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        stock_results = list(pool.map(send_stocked, range(3)))
+    assert sorted(response.status_code for response in stock_results) == [200, 200, 409], [
+        (response.status_code, response.text) for response in stock_results]
+    with app.SessionLocal() as db:
+        remaining = db.get(app.Product, stocked_product_id).stock
+        assert remaining == 1, remaining
+    print("OK: inventario concurrente no permite sobreventa; stock final correcto.")
+
     with app.SessionLocal() as db:
         assert db.get(ext.BatchPrep, batch_id).minutes == 26
         item = db.scalar(app.select(app.OrderItem).where(app.OrderItem.batch_id == batch_id))
@@ -79,7 +215,9 @@ with TestClient(app.app) as client:
     assert result.status_code == 200,result.text
     result=client.get("/api/preparation/tickets", headers=bearer("kitchen"))
     assert result.status_code == 200,result.text
-    assert result.json()["tickets"][0]["batch_ready"] is True
+    original_ticket = next(ticket for ticket in result.json()["tickets"]
+                           if ticket["batch_id"] == batch_id)
+    assert original_ticket["batch_ready"] is True
 
     reservation={"external_id":"ci-"+uuid4().hex,"name":"Reserva prueba",
         "phone":"","party_size":2,"scheduled_at":(app.now()+timedelta(days=1)).isoformat(),"note":""}
@@ -116,7 +254,8 @@ with TestClient(app.app) as client:
     # Verificación PostgreSQL de archivado de productos y PDF inmutable por corte.
     with app.SessionLocal() as db:
         period_id=db.scalar(app.select(app.CashPeriod.id))
-        db.get(app.Account,account_id).status="paid"
+        for test_account_id in account_ids:
+            db.get(app.Account,test_account_id).status="paid"
         db.get(app.Account,aid).status="paid"
         pool=app.TipDistribution(period_id=period_id,created_by=users["admin"],
             total_cents=2000,participant_count=1,base_share_cents=2000,remainder_cents=0)

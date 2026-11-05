@@ -1267,7 +1267,7 @@ class SettingsIn(BaseModel): inventory_on:bool;confirmed_recount:bool=False
 @app.put('/api/settings')
 async def set_settings(data:SettingsIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
-    s=db.get(Setting,1)
+    s=db.execute(select(Setting).where(Setting.id==1).with_for_update()).scalar_one()
     if data.inventory_on and not s.inventory_on and not data.confirmed_recount:raise HTTPException(409,'Confirma el recuento de existencias antes de activar inventario')
     old=s.inventory_on;s.inventory_on=data.inventory_on;s.inventory_reviewed=data.confirmed_recount if data.inventory_on else False
     audit(db,user,'inventory.global',old=old,new=s.inventory_on);db.commit();await notify();return {'ok':True}
@@ -1649,7 +1649,7 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
     if previous:
         return duplicate_response(previous)
 
-    period=active_period(db)  # Locks the current shift against a concurrent close.
+    period=active_period_for_work(db)  # Shared lock: concurrent waiters may open accounts together.
     if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id==period.id)):
         raise HTTPException(409,'El reparto de propinas ya fue generado; el turno está en proceso de cierre. Abre un nuevo turno para continuar.')
     table=None
@@ -2190,15 +2190,25 @@ class OrderIn(BaseModel):
 @app.post('/api/accounts/{account_id}/orders')
 async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','waiter')
-    active_period(db)
+    period=active_period_for_work(db)
+    if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id==period.id)):
+        raise HTTPException(409,'El reparto de propinas ya fue generado; el turno está en proceso de cierre. Abre un nuevo turno para continuar.')
+    a=owner_account(db,user,account_id,allowed=None)
+    # Releer la clave después del bloqueo de cuenta: dos toques simultáneos no crean dos comandas.
     existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
     if existing:
         if existing.account_id!=account_id:raise HTTPException(409,'Identificador de envío ya utilizado')
         return {'batch_id':existing.id,'duplicate':True}
-    a=owner_account(db,user,account_id,('open',))
-    setting=db.get(Setting,1);need={}
+    if a.status!='open':raise HTTPException(409,'La cuenta ya no admite nuevas comandas')
+    # Lectura compartida del ajuste: permite varios envíos y bloquea cambios de inventario hasta confirmar.
+    setting=db.execute(select(Setting).where(Setting.id==1).with_for_update(read=True)).scalar_one()
+    need={}
     for line in data.items:need[line.product_id]=need.get(line.product_id,0)+line.qty
-    products={p.id:p for p in db.scalars(select(Product).where(Product.id.in_(need)).order_by(Product.id).with_for_update())}
+    product_query=select(Product).where(Product.id.in_(need)).order_by(Product.id)
+    # Con inventario activo se requiere bloqueo exclusivo para descontar existencias sin sobreventa.
+    # Sin inventario, FOR SHARE mantiene estable el catálogo y permite envíos simultáneos.
+    product_query=product_query.with_for_update() if setting.inventory_on else product_query.with_for_update(read=True)
+    products={p.id:p for p in db.scalars(product_query)}
     if len(products)!=len(need):raise HTTPException(400,'Hay productos inexistentes')
     for pid,qty in need.items():
         p=products[pid]
@@ -2241,7 +2251,17 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         prepared.append({'line':line,'product':p,'variant':variant,'options':modifier_snapshot,
                          'base_cents':promo_base,'modifier_cents':modifier_cents,'final_cents':final_price,
                          'promo_name':promo.name if promo else ''})
-    batch=Batch(account_id=a.id,sent_by=user.id,client_key=data.client_key);db.add(batch);db.flush()
+    batch=Batch(account_id=a.id,sent_by=user.id,client_key=data.client_key);db.add(batch)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
+        if existing and existing.account_id==account_id:
+            return {'batch_id':existing.id,'duplicate':True}
+        if existing:
+            raise HTTPException(409,'Identificador de envío ya utilizado')
+        raise
     mitote_extensions.snapshot_batch_policy(db,batch.id)
     for row in prepared:
         line=row['line'];p=row['product'];variant=row['variant']
@@ -2256,14 +2276,30 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         if setting.inventory_on and p.inventory_enabled:p.stock-=qty;p.version+=1
     for station in stations:db.add(StationTicket(batch_id=batch.id,station=station))
     audit(db,user,'order.send',account_id=a.id,batch_id=batch.id,stations=sorted(stations),items=len(prepared))
-    db.commit();await notify()
-    for station in sorted(stations):
-        await push_to({'title':'El Mitote · '+('Cocina' if station=='kitchen' else 'Barra'),
-                       'body':f'Nueva comanda #{batch.id} · {a.name}',
-                       'url':f'/?push=station&account={a.id}',
-                       'tag':f'mitote-order-{batch.id}-{station}'},role=station)
-        await fcm_to({'title':'El Mitote · '+('Cocina' if station=='kitchen' else 'Barra'),
-                      'body':f'Nueva comanda #{batch.id}','url':'/?push=station'},role=station)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # Última defensa para una clave repetida enviada desde cuentas distintas o en carrera.
+        existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
+        if existing and existing.account_id==account_id:
+            return {'batch_id':existing.id,'duplicate':True}
+        if existing:
+            raise HTTPException(409,'Identificador de envío ya utilizado')
+        raise
+    await notify()
+    async def dispatch_station(station):
+        station_title='Cocina' if station=='kitchen' else 'Barra'
+        payload={'title':'El Mitote · '+station_title,
+                 'body':f'Nueva comanda #{batch.id} · {a.name}',
+                 'url':f'/?push=station&account={a.id}',
+                 'tag':f'mitote-order-{batch.id}-{station}'}
+        fcm_payload={'title':'El Mitote · '+station_title,
+                     'body':f'Nueva comanda #{batch.id}','url':'/?push=station'}
+        await asyncio.gather(push_to(payload,role=station),
+                             fcm_to(fcm_payload,role=station),
+                             return_exceptions=True)
+    await asyncio.gather(*(dispatch_station(station) for station in sorted(stations)))
     return {'batch_id':batch.id,'duplicate':False}
 
 class RepeatOrderIn(BaseModel):
@@ -2272,7 +2308,7 @@ class RepeatOrderIn(BaseModel):
 
 @app.post('/api/accounts/{account_id}/items/{item_id}/repeat')
 async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Session=Depends(db_session),user:User=Depends(auth)):
-    allow(user,'owner','admin','waiter');active_period(db)
+    allow(user,'owner','admin','waiter');active_period_for_work(db)
     existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
     if existing:
         if existing.account_id!=account_id:raise HTTPException(409,'Identificador de envío ya utilizado')
@@ -2448,7 +2484,16 @@ async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_sessio
         await dispatch_ready_notification(event_id)
     return {'ok':True}
 
+def active_period_for_work(db):
+    """Bloqueo compartido del turno: admite varias comandas y bloquea el cierre."""
+    p=db.execute(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(
+        CashPeriod.id.desc()).with_for_update(read=True)).scalar_one_or_none()
+    if not p:raise HTTPException(409,'No hay un turno de caja abierto; administración debe abrir uno')
+    return p
+
+
 def active_period(db):
+    """Bloqueo exclusivo reservado para pagos, reparto y cierre de caja."""
     p=db.execute(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()).with_for_update()).scalar_one_or_none()
     if not p:raise HTTPException(409,'No hay un turno de caja abierto; administración debe abrir uno')
     return p
