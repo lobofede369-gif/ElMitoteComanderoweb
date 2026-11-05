@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, Column, Integer, String, Boolean, ForeignKey,
-                        DateTime, Text, LargeBinary, UniqueConstraint, select, func)
+                        DateTime, Text, LargeBinary, UniqueConstraint, Index, select, func)
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as PDFImage
@@ -420,6 +420,15 @@ class Audit(Base):
     detail=Column(Text,default='{}')
     created_at=Column(DateTime(timezone=True),default=now)
 
+# Índices de alto tráfico. Se crean también sobre tablas existentes durante bootstrap.
+PERFORMANCE_INDEXES = (
+    Index('ix_accounts_owner_created_at', Account.owner_id, Account.created_at),
+    Index('ix_accounts_created_at', Account.created_at),
+    Index('ix_batches_account_id', Batch.account_id),
+    Index('ix_order_items_batch_id', OrderItem.batch_id),
+    Index('ix_payments_account_id', Payment.account_id),
+)
+
 listeners=set()
 login_failures={}
 async def notify():
@@ -432,6 +441,10 @@ def audit(db,user,action,**data):
 
 def bootstrap():
     Base.metadata.create_all(engine)
+    # create_all no agrega índices a tablas ya creadas; checkfirst permite
+    # desplegar esta migración de forma idempotente en SQLite y PostgreSQL.
+    for performance_index in PERFORMANCE_INDEXES:
+        performance_index.create(bind=engine,checkfirst=True)
     with SessionLocal() as db:
         if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False))
         if not db.scalar(select(User).where(User.role=='owner')):
