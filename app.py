@@ -141,6 +141,17 @@ class Account(Base):
     created_at=Column(DateTime(timezone=True),default=now)
     closed_at=Column(DateTime(timezone=True))
 
+class AccountCreateKey(Base):
+    """Clave idempotente para evitar cuentas duplicadas tras reintentos de red."""
+    __tablename__='account_create_keys'
+    id=Column(Integer,primary_key=True)
+    user_id=Column(Integer,ForeignKey('users.id'),nullable=False)
+    client_key=Column(String(80),nullable=False)
+    account_id=Column(Integer,ForeignKey('accounts.id'),nullable=False)
+    request_hash=Column(String(64),nullable=False)
+    created_at=Column(DateTime(timezone=True),default=now,nullable=False)
+    __table_args__=(UniqueConstraint('user_id','client_key'),)
+
 class DiningTable(Base):
     __tablename__='restaurant_tables'
     id=Column(Integer,primary_key=True)
@@ -1532,10 +1543,34 @@ def accounts(db:Session=Depends(db_session),user:User=Depends(auth)):
 class AccountIn(BaseModel):
     name:Optional[str]=Field(default=None,max_length=120)
     table_id:Optional[int]=None
+    client_key:Optional[str]=Field(default=None,max_length=80)
 
 @app.post('/api/accounts')
 async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','waiter')
+    client_key=(data.client_key or '').strip()
+    payload={'name':(data.name or '').strip(),'table_id':data.table_id}
+    request_hash=hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+    def existing_create():
+        if not client_key:
+            return None
+        record=db.scalar(select(AccountCreateKey).where(
+            AccountCreateKey.user_id==user.id,
+            AccountCreateKey.client_key==client_key))
+        if not record:
+            return None
+        if not hmac.compare_digest(record.request_hash,request_hash):
+            raise HTTPException(409,'La clave de reintento ya fue utilizada con otros datos. Actualiza la pantalla antes de continuar.')
+        account=db.get(Account,record.account_id)
+        if not account:
+            raise HTTPException(409,'La cuenta asociada al reintento ya no está disponible.')
+        return account
+
+    previous=existing_create()
+    if previous:
+        return {'id':previous.id,'table_id':None,'duplicate':True}
+
     period=active_period(db)  # Locks the current shift against a concurrent close.
     if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id==period.id)):
         raise HTTPException(409,'El reparto de propinas ya fue generado; el turno está en proceso de cierre. Abre un nuevo turno para continuar.')
@@ -1543,8 +1578,12 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
     if data.table_id is not None:
         table=db.execute(select(DiningTable).where(DiningTable.id==data.table_id).with_for_update()).scalar_one_or_none()
         if not table or not table.active:raise HTTPException(404,'La mesa no existe o está desactivada')
-        if db.get(TableOccupancy,table.id):raise HTTPException(409,'Esta mesa ya está ocupada. Actualiza la lista de mesas.')
-    account_name=(data.name or '').strip()
+        if db.get(TableOccupancy,table.id):
+            previous=existing_create()
+            if previous:
+                return {'id':previous.id,'table_id':None,'duplicate':True}
+            raise HTTPException(409,'Esta mesa ya está ocupada. Actualiza la lista de mesas.')
+    account_name=payload['name']
     if not account_name and table:account_name=table.name
     if not account_name:raise HTTPException(400,'Escribe un nombre para la cuenta libre o selecciona una mesa')
     a=Account(name=account_name,owner_id=user.id)
@@ -1553,13 +1592,20 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
     if table:
         db.add(TableOccupancy(table_id=table.id,account_id=a.id,assigned_by=user.id))
         audit(db,user,'table.assign',table_id=table.id,table_name=table.name,account_id=a.id,waiter=user.display)
+    if client_key:
+        db.add(AccountCreateKey(user_id=user.id,client_key=client_key,
+            account_id=a.id,request_hash=request_hash))
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        previous=existing_create()
+        if previous:
+            return {'id':previous.id,'table_id':None,'duplicate':True}
         raise HTTPException(409,'La mesa acaba de ser ocupada por otro mesero. Actualiza las mesas.')
     await notify()
-    return {'id':a.id,'table_id':table.id if table else None}
+    return {'id':a.id,'table_id':table.id if table else None,'duplicate':False}
+
 class VoidAccountIn(BaseModel):
     reason:str=Field(min_length=3,max_length=400)
 
