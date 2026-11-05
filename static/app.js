@@ -2,7 +2,7 @@
 const $=s=>document.querySelector(s), $$=s=>Array.from(document.querySelectorAll(s));
 const savedToken=localStorage.getItem('mitote-token')||sessionStorage.getItem('mitote-token')||'';
 if(savedToken)localStorage.setItem('mitote-token',savedToken);
-const state={token:savedToken,user:null,screen:'',account:null,draft:[],products:[],data:{},lastRefresh:0,alarmTimer:null,audio:null,alarmArmed:false,navStack:[],renderSeq:0,pendingRefresh:false};
+const state={token:savedToken,user:null,screen:'',account:null,draft:[],products:[],data:{},lastRefresh:0,alarmTimer:null,audio:null,alarmArmed:false,navStack:[],renderSeq:0,pendingRefresh:false,waiterReadyInitialized:false,waiterReadySeen:new Set(),waiterReadyBusy:false};
 const workKey=()=>state.user?`mitote-work-${state.user.id}`:'';
 function persistWorkState(){if(!state.user)return;try{localStorage.setItem(workKey(),JSON.stringify({account:state.account,draft:state.draft}));}catch{}}
 function restoreWorkState(){if(!state.user)return;try{const saved=JSON.parse(localStorage.getItem(workKey())||'{}');state.account=Number(saved.account)||null;state.draft=Array.isArray(saved.draft)?saved.draft.filter(x=>x&&Number.isInteger(Number(x.product_id))&&Number(x.qty)>0).map(x=>({product_id:Number(x.product_id),name:String(x.name||''),station:x.station==='bar'?'bar':'kitchen',qty:Math.min(100,Number(x.qty)),note:String(x.note||'').slice(0,300),variant_id:x.variant_id?Number(x.variant_id):null,variant_name:String(x.variant_name||''),modifier_option_ids:Array.isArray(x.modifier_option_ids)?x.modifier_option_ids.map(Number):[],modifier_names:Array.isArray(x.modifier_names)?x.modifier_names.map(String):[],prep_minutes:Math.max(0,Math.min(240,Number(x.prep_minutes??15))),release_after_minutes:Math.max(0,Math.min(240,Number(x.release_after_minutes??0))),unit_price:Number(x.unit_price)||0,promotion_name:String(x.promotion_name||'')})):[];}catch{state.account=null;state.draft=[];}}
@@ -126,7 +126,7 @@ function logout(reason='manual'){
   }).catch(()=>{});}
   if(reason==='manual'&&window.MitoteAndroid){try{window.MitoteAndroid.clearSession()}catch(e){}}
   if(reason==='manual'&&state.user){try{localStorage.removeItem(workKey())}catch{}}
-  state.token='';state.user=null;state.screen='';state.navStack=[];
+  state.token='';state.user=null;state.screen='';state.navStack=[];state.waiterReadyInitialized=false;state.waiterReadySeen=new Set();
   localStorage.removeItem('mitote-token');sessionStorage.removeItem('mitote-token');localStorage.removeItem('mitote-screen');
   $('#app').hidden=true;$('#login').hidden=false;stopAlarm();
 }
@@ -145,6 +145,7 @@ async function start(){try{
     state.navStack=[];
     history.replaceState({mitoteScreen:state.screen,mitoteStack:[]},'',location.pathname+location.search+'#'+state.screen);
     localStorage.setItem('mitote-screen',state.screen);
+    if(state.user.role==='waiter')await syncWaiterReadyAlerts(true).catch(()=>{});
     refreshNav();await render({preserveScroll:false});listenEvents();syncPushOnLogin().catch(()=>{});
   }catch(e){logout('expired');toast(e.message,true)}}
 async function go(screen,options={}){
@@ -196,7 +197,10 @@ async function render(options={}){
     area.innerHTML=`<div class="note danger-note">${esc(e.message)}</div>`;toast(e.message,true);
   }
 }
-async function showAccounts(all){const arr=await api('/accounts');state.data.accounts=arr;const active=arr.filter(x=>x.status==='open'||x.status==='pending');return `<div class="statgrid">${stat('Cuentas activas',active.length)}${stat('Por cobrar',active.filter(x=>x.status==='pending').length)}</div>${!all?'<button class="primary" data-nav="new">＋ Abrir nueva cuenta</button>':''}<h2 class="section">${all?'Todas las cuentas':'Mis cuentas'}</h2><div class="cards">${active.map(a=>accountCard(a,all?'admin-account':'open-account')).join('')||'<div class="empty">Todavía no hay cuentas activas.</div>'}</div>${all?'<h2 class="section">Cuentas pagadas de este turno</h2><div class="cards">'+arr.filter(x=>x.status==='paid').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div><h2 class="section">Cuentas unidas recientemente</h2><div class="cards">'+arr.filter(x=>x.status==='merged').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div>':''}`}
+async function showAccounts(all){const arr=await api('/accounts');state.data.accounts=arr;const active=arr.filter(x=>x.status==='open'||x.status==='pending');const ready=all?[]:(state.data.readyAlerts||[]);const readyHtml=!all?'<div class="card waiter-ready-card"><div class="row"><h3>🔔 Pedidos listos para llevar a mesa</h3><button class="outline small" data-action="enable-sound">♪ Probar sonido</button></div>'+(
+ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+'</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+(x.complete?' · Cocina y barra terminadas':'')+'</div></div><button class="outline small" data-action="open-account" data-id="'+Number(x.account_id)+'">Ver cuenta</button></div>').join(''):'<p class="mini">Aquí aparecerán las comandas que cocina o barra terminen durante este turno.</p>'
+)+'</div>':'';
+return `<div class="statgrid">${stat('Cuentas activas',active.length)}${stat('Por cobrar',active.filter(x=>x.status==='pending').length)}</div>${readyHtml}${!all?'<button class="primary" data-nav="new">＋ Abrir nueva cuenta</button>':''}<h2 class="section">${all?'Todas las cuentas':'Mis cuentas'}</h2><div class="cards">${active.map(a=>accountCard(a,all?'admin-account':'open-account')).join('')||'<div class="empty">Todavía no hay cuentas activas.</div>'}</div>${all?'<h2 class="section">Cuentas pagadas de este turno</h2><div class="cards">'+arr.filter(x=>x.status==='paid').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div><h2 class="section">Cuentas unidas recientemente</h2><div class="cards">'+arr.filter(x=>x.status==='merged').slice(0,15).map(a=>accountCard(a,'admin-account')).join('')+'</div>':''}`}
 function ticketLookupHtml(){return `<div class="card" style="margin-top:15px"><h3>Consultar ticket histórico</h3><p>Busca por folio, aunque la cuenta ya esté pagada.</p><form id="ticket-lookup" class="formrow"><label>Folio de cuenta<input type="number" min="1" name="id" required></label><button class="outline">Buscar ticket</button></form></div>`}
 async function showNew(){
   const tables=await api('/tables');state.data.tables=tables;
@@ -535,7 +539,7 @@ function ask(message){const v=prompt(message);return v&&v.trim()?v.trim():null}
 async function act(action,btn){if(await mitoteFeatureAction(action,btn))return;const id=Number(btn.dataset.id);switch(action){case 'push-enable':await enablePush();await render();break;
 case 'push-test':await api('/push/test','POST',{});toast('Prueba enviada. Bloquea la pantalla para comprobar.');break;
 case 'push-disable':await disablePush();await render();break;
-case 'view-report':await showCashTicket(id);break;case 'period-detail':await showPeriodDetail(id);break;case 'hide-period-detail':{const el=$('#period-detail');if(el)el.innerHTML='';break}case 'void-account':{const reason=ask('Motivo para anular esta cuenta sin saldo:');if(!reason)return;if(!confirm('¿Confirmas la anulación? Esta acción quedará registrada.'))return;await api(`/accounts/${id}/void`,'POST',{reason});toast('Cuenta anulada y archivada');await go('all');break}case 'enable-sound':state.alarmArmed=true;beep();toast('Alarma habilitada mientras la aplicación permanezca abierta');break;case 'reset-user':{const secret=ask(btn.dataset.role==='waiter'?'Nuevo PIN de 4 dígitos:':'Nueva contraseña (mínimo 8 caracteres):');if(!secret)return;await api(`/users/${id}`,'PATCH',{secret});toast('Clave cambiada; sesiones anteriores revocadas');await render();break}case 'toggle-user':{if(!confirm('¿Confirmar cambio de acceso?'))return;await api(`/users/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Acceso actualizado y sesiones revocadas');await render();break}case 'open-account':state.account=id;state.draft=[];await go('orders');break;case 'admin-account':{const a=await api('/accounts/'+id);if(!state.data.users)state.data.users=await api('/users');$('#content').innerHTML=`<button class="outline small" data-nav="all">← Volver</button><h2 class="section">Cuenta #${id}</h2>${await accountDetailHtml(id,true)}`;break}case 'remove-line':state.draft.splice(id,1);persistWorkState();updateDraftUI();toast('Producto retirado del borrador');break;
+case 'view-report':await showCashTicket(id);break;case 'period-detail':await showPeriodDetail(id);break;case 'hide-period-detail':{const el=$('#period-detail');if(el)el.innerHTML='';break}case 'void-account':{const reason=ask('Motivo para anular esta cuenta sin saldo:');if(!reason)return;if(!confirm('¿Confirmas la anulación? Esta acción quedará registrada.'))return;await api(`/accounts/${id}/void`,'POST',{reason});toast('Cuenta anulada y archivada');await go('all');break}case 'enable-sound':state.alarmArmed=true;beep('ready');toast('Sonido potente activado en esta pantalla');break;case 'reset-user':{const secret=ask(btn.dataset.role==='waiter'?'Nuevo PIN de 4 dígitos:':'Nueva contraseña (mínimo 8 caracteres):');if(!secret)return;await api(`/users/${id}`,'PATCH',{secret});toast('Clave cambiada; sesiones anteriores revocadas');await render();break}case 'toggle-user':{if(!confirm('¿Confirmar cambio de acceso?'))return;await api(`/users/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Acceso actualizado y sesiones revocadas');await render();break}case 'open-account':state.account=id;state.draft=[];await go('orders');break;case 'admin-account':{const a=await api('/accounts/'+id);if(!state.data.users)state.data.users=await api('/users');$('#content').innerHTML=`<button class="outline small" data-nav="all">← Volver</button><h2 class="section">Cuenta #${id}</h2>${await accountDetailHtml(id,true)}`;break}case 'remove-line':state.draft.splice(id,1);persistWorkState();updateDraftUI();toast('Producto retirado del borrador');break;
 case 'repeat-item':{const accountId=Number(btn.dataset.account);const qty=Number(prompt('¿Cuántas unidades deseas repetir?','1'));if(!Number.isInteger(qty)||qty<1||qty>100)throw Error('Cantidad inválida');if(!confirm('Se enviará una nueva comanda con la misma presentación, extras y notas. ¿Continuar?'))return;await api(`/accounts/${accountId}/items/${id}/repeat`,'POST',{qty,client_key:key()});toast('Producto repetido y enviado a su estación');await refreshAccountPanel(accountId,['owner','admin'].includes(state.user.role));break;}
 case 'toggle-variant':await api(`/product-variants/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Presentación actualizada');await render();break;
 case 'toggle-option':await api(`/modifier-options/${id}`,'PATCH',{active:btn.dataset.active==='true'});toast('Modificador actualizado');await render();break;
@@ -740,7 +744,7 @@ function urlBase64ToUint8Array(s){
 }
 async function showNotifications(){
   if(window.MitoteAndroid){
-    return `<div class="card"><h3>🔔 Avisos Android</h3><p>Esta APK utiliza Firebase Cloud Messaging. No necesitas activar Web Push ni configurar VAPID.</p><p>Permite las notificaciones de Android cuando el sistema lo solicite. Si acabas de entrar, espera unos segundos para registrar el teléfono.</p><button class="primary" data-action="fcm-test">Enviar prueba Android</button></div>`;
+    return `<div class="card"><h3>🔔 Avisos Android</h3><p>Esta APK utiliza Firebase Cloud Messaging. No necesitas activar Web Push ni configurar VAPID.</p><p>Permite las notificaciones de Android cuando el sistema lo solicite. Si acabas de entrar, espera unos segundos para registrar el teléfono.</p><button class="primary" data-action="fcm-test">Enviar prueba Android</button><p class="mini">Los avisos reales tienen un sonido más fuerte en la nueva versión del APK. Activa el permiso de notificaciones y revisa el volumen de avisos de Android.</p></div>`;
   }
   const supported=location.protocol==='https:'&&'serviceWorker' in navigator&&'PushManager' in window&&'Notification' in window;
   if(!supported)return '<div class="note danger-note">Este navegador no permite notificaciones Web Push. Abre la aplicación en Chrome para Android mediante HTTPS.</div>';
@@ -755,7 +759,7 @@ async function showNotifications(){
   catch(e){serverDetail+=(serverDetail?'; ':'')+'Error del dispositivo: '+(e?.message||'desconocido');}
   return `<div class="card"><h3>🔔 Avisos en segundo plano</h3><p>Recibe notificaciones aunque estés usando otra aplicación o tengas el teléfono bloqueado.</p>
     <p><b>Servidor:</b> ${configured?'Configurado':'Sin configurar'}${serverDetail?`<br><b>Diagnóstico:</b> ${esc(serverDetail)}`:''}<br><b>Permiso Android:</b> ${esc(Notification.permission)}<br><b>Dispositivo:</b> ${subscribed?'Suscrito':'Sin suscripción'}</p>
-    <div class="inline"><button class="primary" data-action="push-enable" ${configured?'':'disabled'}>Activar notificaciones</button>
+    <div class="inline"><button class="outline" data-action="enable-sound">♪ Probar sonido fuerte</button><button class="primary" data-action="push-enable" ${configured?'':'disabled'}>Activar notificaciones</button>
     <button class="outline" data-action="push-test" ${subscribed?'':'disabled'}>Enviar prueba</button>
     <button class="ghost" data-action="push-disable" ${subscribed?'':'disabled'}>Desactivar aquí</button></div>
     <div class="note">Debes activar esta función una vez en cada teléfono. Android controla el sonido y puede retrasar avisos por ahorro de batería. La alarma repetitiva sigue funcionando con la aplicación abierta.</div></div>`;
@@ -794,14 +798,64 @@ async function disablePush(){
   toast('Notificaciones desactivadas en este teléfono');
 }
 function stopAlarm(){clearInterval(state.alarmTimer);state.alarmTimer=null}
-function beep(){if(document.hidden||!state.alarmArmed)return;try{state.audio=state.audio||new (window.AudioContext||window.webkitAudioContext)();if(state.audio.state==='suspended')state.audio.resume();const o=state.audio.createOscillator(),g=state.audio.createGain();o.type='square';o.frequency.value=780;g.gain.setValueAtTime(.0001,state.audio.currentTime);g.gain.exponentialRampToValueAtTime(.12,state.audio.currentTime+.02);g.gain.exponentialRampToValueAtTime(.0001,state.audio.currentTime+.28);o.connect(g);g.connect(state.audio.destination);o.start();o.stop(state.audio.currentTime+.3)}catch{}}
-function checkAlarm(){const isStation=['kitchen','bar'].includes(state.user?.role);const tickets=state.data.tickets||[];const pending=isStation&&tickets.some(t=>t.station===state.user.role&&t.status==='new');if(!pending){stopAlarm();return}if(!state.alarmTimer){beep();state.alarmTimer=setInterval(beep,8000)}}
+function beep(kind='station'){
+  if(document.hidden||!state.alarmArmed)return;
+  try{
+    state.audio=state.audio||new (window.AudioContext||window.webkitAudioContext)();
+    const ctx=state.audio;
+    if(ctx.state==='suspended')ctx.resume().catch(()=>{});
+    const notes=kind==='ready'?[740,980,1174,980]:[660,880,660,990];
+    const time=ctx.currentTime+.025;
+    const output=ctx.createDynamicsCompressor();
+    output.threshold.value=-20;output.knee.value=18;output.ratio.value=4;
+    output.attack.value=.005;output.release.value=.2;output.connect(ctx.destination);
+    notes.forEach((freq,i)=>{
+      const start=time+i*.19,stop=start+.16;
+      const osc=ctx.createOscillator(),gain=ctx.createGain();
+      osc.type='square';osc.frequency.setValueAtTime(freq,start);
+      const peak=kind==='ready'?.24:.20;
+      gain.gain.setValueAtTime(.0001,start);
+      gain.gain.exponentialRampToValueAtTime(peak,start+.014);
+      gain.gain.setValueAtTime(peak*.68,start+.075);
+      gain.gain.exponentialRampToValueAtTime(.0001,stop);
+      osc.connect(gain);gain.connect(output);
+      osc.start(start);osc.stop(stop+.015);
+    });
+  }catch(e){}
+}
+function checkAlarm(){const isStation=['kitchen','bar'].includes(state.user?.role);const tickets=state.data.tickets||[];const pending=isStation&&tickets.some(t=>t.station===state.user.role&&t.status==='new');if(!pending){stopAlarm();return}if(!state.alarmTimer){beep('station');state.alarmTimer=setInterval(()=>beep('station'),8000)}}
+async function syncWaiterReadyAlerts(initial=false){
+  if(state.user?.role!=='waiter'||state.waiterReadyBusy)return;
+  state.waiterReadyBusy=true;
+  try{
+    const items=await api('/waiter/ready-alerts');
+    if(state.user?.role!=='waiter')return;
+    const userKey='mitote-ready-seen-'+state.user.id;
+    let remembered=[];
+    try{remembered=JSON.parse(sessionStorage.getItem(userKey)||'[]');if(!Array.isArray(remembered))remembered=[]}catch{}
+    if(!state.waiterReadyInitialized||initial){
+      state.waiterReadySeen=new Set(remembered.filter(x=>typeof x==='string'));
+      for(const x of items)state.waiterReadySeen.add(x.id);
+      state.waiterReadyInitialized=true;
+    }else{
+      const arrivals=items.filter(x=>!state.waiterReadySeen.has(x.id)).reverse();
+      for(const row of arrivals){
+        state.waiterReadySeen.add(row.id);
+        toast((row.complete?'✅ Pedido completo: ':'🔔 '+row.station_name+' lista: ')+row.account+' · Comanda #'+row.batch_id);
+        // En la APK el FCM nativo reproduce el sonido: evita tocarlo dos veces.
+        if(!window.MitoteAndroid)beep('ready');
+      }
+    }
+    state.data.readyAlerts=items;
+    try{sessionStorage.setItem(userKey,JSON.stringify([...state.waiterReadySeen].slice(-180)))}catch{}
+  }finally{state.waiterReadyBusy=false}
+}
 async function listenEvents(){while(state.user&&state.token){try{
   await refreshSessionIfNeeded();const token=state.token;
   const res=await fetch('/api/events',{headers:{Authorization:'Bearer '+token},cache:'no-store'});
   if(res.status===401){logout('expired');break}if(!res.ok)throw Error('Sin eventos');
   const reader=res.body.getReader();const decoder=new TextDecoder();let pending='';
-  while(state.token===token&&state.user){const {done,value}=await reader.read();if(done)break;pending+=decoder.decode(value,{stream:true});const parts=pending.split('\n\n');pending=parts.pop();if(parts.some(x=>x.includes('data: refresh'))){if(Date.now()-state.lastRefresh>1400){state.lastRefresh=Date.now();const editing=document.activeElement?.matches('input,textarea,select');if(state.user?.role==='waiter'&&state.screen==='orders'){state.pendingRefresh=true;$('#refresh')?.classList.add('has-update')}else if(!editing)await render({preserveScroll:true})}}}
+  while(state.token===token&&state.user){const {done,value}=await reader.read();if(done)break;pending+=decoder.decode(value,{stream:true});const parts=pending.split('\n\n');pending=parts.pop();if(parts.some(x=>x.includes('data: refresh'))){if(state.user?.role==='waiter')syncWaiterReadyAlerts().catch(()=>{});if(Date.now()-state.lastRefresh>1400){state.lastRefresh=Date.now();const editing=document.activeElement?.matches('input,textarea,select');if(state.user?.role==='waiter'&&state.screen==='orders'){state.pendingRefresh=true;$('#refresh')?.classList.add('has-update')}else if(!editing)await render({preserveScroll:true})}}}
  }catch{}if(!state.user)break;await new Promise(r=>setTimeout(r,3500))}}
 // La pantalla principal solo muestra un teclado numérico. Los perfiles se obtienen del servidor.
 const recoveryMode=new URLSearchParams(location.search).get('recuperar')==='1';
