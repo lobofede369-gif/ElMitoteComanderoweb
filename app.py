@@ -1,4 +1,4 @@
-"""El Mitote Comandas - independent restaurant PWA API.
+"""PERSEO POS - independent restaurant point-of-sale demo API.
 
 Run: ADMIN_PASSWORD='strong secret' SECRET_KEY='long random string' uvicorn app:app --reload
 Do not deploy without PostgreSQL, HTTPS and changing bootstrap credentials.
@@ -43,7 +43,7 @@ VAPID_PUBLIC_KEY = os.getenv('VAPID_PUBLIC_KEY', '').strip()
 VAPID_PRIVATE_KEY = os.getenv('VAPID_PRIVATE_KEY', '').strip()
 VAPID_SUBJECT = os.getenv('VAPID_SUBJECT', '').strip()
 PUSH_ENABLED = bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and (VAPID_SUBJECT.startswith('mailto:') or VAPID_SUBJECT.startswith('https://')))
-log = logging.getLogger('mitote.push')
+log = logging.getLogger('perseo.push')
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv('FIREBASE_SERVICE_ACCOUNT_JSON', '').strip()
 _firebase_initialized = False
 
@@ -695,7 +695,7 @@ async def dispatch_ready_notification(event_id:int):
         row.attempted_at=now()
         event_key=row.event_key
         station_label='Cocina' if row.station=='kitchen' else 'Barra'
-        title='El Mitote · Pedido completo' if row.complete else f'El Mitote · {station_label} lista'
+        title='PERSEO POS · Pedido completo' if row.complete else f'PERSEO POS · {station_label} lista'
         body=(f'Pedido completo para {account.name} · comanda #{row.batch_id}. ¡Listo para entregar!'
               if row.complete else f'{station_label} terminó {account.name} · comanda #{row.batch_id}.')
         payload={'title':title,'body':body,
@@ -738,7 +738,7 @@ async def lifespan(app):
             task.cancel()
         await asyncio.gather(prep_worker,ready_worker,return_exceptions=True)
 
-app=FastAPI(title='El Mitote Comandas',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
+app=FastAPI(title='PERSEO POS',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory='static'),name='static')
 
 @app.get('/api/demo/info')
@@ -1229,7 +1229,7 @@ async def push_test(user:User=Depends(auth)):
     last=_push_tests.get(user.id,0)
     if time.monotonic()-last<12:raise HTTPException(429,'Espera unos segundos para repetir la prueba')
     _push_tests[user.id]=time.monotonic()
-    await push_to({'title':'El Mitote · Prueba de notificación',
+    await push_to({'title':'PERSEO POS · Prueba de notificación',
                    'body':'Las notificaciones están activadas en este dispositivo.',
                    'url':'/','tag':f'mitote-test-{user.id}'},user_id=user.id)
     return {'ok':True,'message':'Prueba enviada a tus dispositivos registrados'}
@@ -1262,7 +1262,7 @@ def _fcm_send_one(device, payload):
     route = 'station' if 'push=station' in payload.get('url','') else ('accounts' if 'push=accounts' in payload.get('url','') else '')
     msg = messaging.Message(
         token=device['token'],
-        data={'title': str(payload.get('title','El Mitote Comandas'))[:100],
+        data={'title': str(payload.get('title','PERSEO POS'))[:100],
               'body': str(payload.get('body','Nuevo aviso'))[:180],
               'route': route,
               'kind': str(payload.get('kind','general'))[:32],
@@ -1316,7 +1316,7 @@ async def fcm_test(db: Session = Depends(db_session), user: User = Depends(auth)
     if time.monotonic() - last < 15:
         raise HTTPException(429, 'Espera 15 segundos para repetir la prueba')
     _push_tests[('fcm', user.id)] = time.monotonic()
-    await fcm_to({'title': 'El Mitote · Prueba Android', 'body': 'Avisos FCM configurados.', 'url': '/'}, user_id=user.id)
+    await fcm_to({'title': 'PERSEO POS · Prueba Android', 'body': 'Avisos FCM configurados.', 'url': '/'}, user_id=user.id)
     return {'ok': True, 'devices': count, 'message': 'Solicitud de envío realizada; confirma la recepción en Android'}
 
 @app.get('/api/events')
@@ -2473,11 +2473,11 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
     await notify()
     async def dispatch_station(station):
         station_title='Cocina' if station=='kitchen' else 'Barra'
-        payload={'title':'El Mitote · '+station_title,
+        payload={'title':'PERSEO POS · '+station_title,
                  'body':f'Nueva comanda #{batch.id} · {a.name}',
                  'url':f'/?push=station&account={a.id}',
                  'tag':f'mitote-order-{batch.id}-{station}'}
-        fcm_payload={'title':'El Mitote · '+station_title,
+        fcm_payload={'title':'PERSEO POS · '+station_title,
                      'body':f'Nueva comanda #{batch.id}','url':'/?push=station'}
         await asyncio.gather(push_to(payload,role=station),
                              fcm_to(fcm_payload,role=station),
@@ -2518,8 +2518,8 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
     db.add(StationTicket(batch_id=batch.id,station=item.station))
     audit(db,user,'order.repeat',account_id=account.id,source_item_id=item.id,new_item_id=new_item.id,qty=data.qty,batch_id=batch.id)
     db.commit();await notify()
-    await push_to({'title':'El Mitote · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · {account.name}','url':'/?push=station','tag':f'mitote-order-{batch.id}-{item.station}'},role=item.station)
-    await fcm_to({'title':'El Mitote · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · Comanda #{batch.id}','url':'/?push=station'},role=item.station)
+    await push_to({'title':'PERSEO POS · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · {account.name}','url':'/?push=station','tag':f'mitote-order-{batch.id}-{item.station}'},role=item.station)
+    await fcm_to({'title':'PERSEO POS · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · Comanda #{batch.id}','url':'/?push=station'},role=item.station)
     return {'batch_id':batch.id,'duplicate':False}
 
 @app.post('/api/accounts/{account_id}/request-bill')
@@ -3117,11 +3117,8 @@ def build_account_pdf(db,account,prebill=False):
     bold=ParagraphStyle('bold',parent=normal,fontName='Helvetica-Bold')
     story=[]
     from xml.sax.saxutils import escape as xml_escape
-    logo_path='static/assets/logo.png'
-    if os.path.exists(logo_path):
-        story.append(PDFImage(logo_path,width=125,height=65,kind='proportional'))
-    story.append(Paragraph('<b>EL MITOTE RESTAURANTE</b>',center))
-    story.append(Paragraph('Carretera Progreso Ixmiquilpan<br/>Xochitlán, Hidalgo, C. P. 42740<br/>Tel. 772 200 3943',center))
+    story.append(Paragraph('<b>PERSEO POS</b>',center))
+    story.append(Paragraph('Restaurante Demo · Datos ficticios',center))
     story.append(Spacer(1,8))
     heading='PRE-CUENTA' if prebill else 'TICKET DE CONSUMO'
     story.append(Paragraph(f'<b>{heading} · Cuenta #{account.id}</b>',center))
@@ -3284,7 +3281,7 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     distribution=db.scalar(select(TipDistribution).where(TipDistribution.period_id==p.id))
     distribution_data=tip_distribution_dict(db,distribution)
     buf=io.BytesIO();doc=SimpleDocTemplate(buf,pagesize=(420,620),leftMargin=25,rightMargin=25,topMargin=25,bottomMargin=25)
-    style=getSampleStyleSheet();story=[Paragraph('<b>EL MITOTE RESTAURANTE</b>',style['Heading2']),Paragraph('Corte general de caja · Folio #'+str(p.id),style['Heading3'])]
+    style=getSampleStyleSheet();story=[Paragraph('<b>PERSEO POS</b>',style['Heading2']),Paragraph('Corte general de caja · Folio #'+str(p.id),style['Heading3'])]
     cashier_totals={}
     for payment in payments:
         cashier=db.get(User,payment.cashier_id)
