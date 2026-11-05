@@ -102,6 +102,14 @@ async function showAnalytics(){
     '<div class="prep-bar-row"><span>'+esc(x[key])+'</span><div class="prep-bar-track"><div style="width:'+
     Math.round(Number(x.amount)/max*100)+'%"></div></div><b>'+money(x.amount)+'</b></div>').join('')+'</div>'};
   const hours=r.sales_by_hour.filter(x=>Number(x.amount)>0);
+  const profitPanel=r.costs_available?
+    '<div class="statgrid">'+stat('Costo directo registrado',money(r.estimated_cost))+stat('Utilidad bruta estimada',money(r.estimated_gross_profit))+
+    stat('Margen bruto estimado',r.estimated_margin_percent+'%')+stat('Cobertura de costos',r.cost_coverage_percent+'%')+'</div>'+
+    '<div class="note">La utilidad y el margen solo consideran las unidades que tienen costo unitario capturado al enviar la comanda. No incluyen nómina, renta, servicios ni otros gastos; tampoco sustituyen la conciliación de descuentos.</div>':
+    '<div class="note">Aún no hay costos unitarios capturados para las ventas de este periodo. En Inventario, registra el costo real por unidad; las próximas comandas guardarán una instantánea sin alterar ventas anteriores.</div>';
+  const productRows=r.products.map(p=>'<div class="lineitem"><div class="row"><b>'+esc(p.name)+'</b><b>'+Number(p.quantity)+' uds.</b></div>'+
+    '<div class="mini">Venta bruta de comanda: '+money(p.estimated_gross)+' · Cobertura de costo: '+Number(p.cost_coverage_percent||0)+'%</div>'+
+    '<div class="mini">'+(p.estimated_cost===null?'Costo no capturado':('Costo de unidades costeadas: '+money(p.estimated_cost)+' · Utilidad bruta de esas unidades: '+money(p.estimated_gross_profit)))+'</div></div>').join('');
   return '<div class="card"><div class="prep-actions"><button class="'+(analyticsScope==='current'?'primary':'outline')+' small" data-action="analytics-current">Turno activo</button>'+
     '<button class="'+(analyticsScope==='history'?'primary':'outline')+' small" data-action="analytics-history">Consultar otros cortes</button></div>'+
     (analyticsScope==='history'?'<form id="analytics-period" class="formrow"><div class="formgrid">'+
@@ -111,15 +119,16 @@ async function showAnalytics(){
       'No hay turno de caja abierto. Las ventas anteriores están en el historial de cortes.')+'</p>')+'</div>'+
     '<div class="statgrid">'+stat('Ventas cobradas',money(r.sales))+stat('Cuentas con cobros',r.paid_accounts)+
     stat('Ticket promedio',money(r.average_ticket))+stat('Preparación media',r.prep_avg_minutes===null?'Sin datos':r.prep_avg_minutes+' min')+'</div>'+
+    '<h2 class="section">Costos y rentabilidad</h2>'+profitPanel+
     '<h2 class="section">Ventas por día</h2><div class="card">'+bars(r.sales_by_day,'label')+'</div>'+
     '<h2 class="section">Horarios de mayor venta</h2><div class="card">'+(hours.length?bars(hours,'label'):'<div class="empty">Sin ventas en el periodo</div>')+'</div>'+
     '<h2 class="section">Métodos de pago</h2><div class="card">'+
     ['cash','card','transfer'].map(k=>'<div class="row"><span>'+({cash:'Efectivo',card:'Tarjeta',transfer:'Transferencia'})[k]+'</span><b>'+money(r.methods[k])+'</b></div>').join('')+'</div>'+
-    '<h2 class="section">Productos más vendidos</h2><div class="card">'+
-    (r.products.map(p=>'<div class="row"><span>'+esc(p.name)+'</span><b>'+p.quantity+' uds.</b></div>').join('')||'<p>Sin ventas de productos registradas.</p>')+'</div>'+
+    '<h2 class="section">Productos más vendidos y margen</h2><div class="card">'+
+    (productRows||'<p>Sin ventas de productos registradas.</p>')+'</div>'+
     '<h2 class="section">Rotación de mesas</h2><div class="card">'+
     (r.table_rotation.map(x=>'<div class="row"><span>'+esc(x.table)+'</span><b>'+x.accounts_opened+' asignaciones</b></div>').join('')||'<p>Sin asignaciones registradas.</p>')+'</div>'+
-    '<div class="note">Las propinas no forman parte de las ventas. Los costos y márgenes se mostrarán cuando existan costos reales registrados. Los productos se agrupan por fecha de comanda y los ingresos por fecha de cobro.</div>';
+    '<div class="note">Las propinas no forman parte de las ventas. Los productos se agrupan por fecha de comanda y los ingresos por fecha de cobro. Los costos se congelan por línea al enviar cada comanda; modificar un costo solo afecta pedidos futuros.</div>';
 }
 
 async function mitoteFeatureAction(action,btn){
@@ -153,6 +162,26 @@ async function mitoteFeatureAction(action,btn){
 }
 async function mitoteFeatureForm(form){
   const d=Object.fromEntries(new FormData(form).entries());
+  if(form.id.startsWith('inventory-cost-')){
+    const productId=Number(form.id.slice('inventory-cost-'.length));
+    if(!Number.isSafeInteger(productId)||productId<1)throw Error('Producto inválido');
+    const value=String(d.unit_cost??'').trim();
+    if(value!==''&&(!Number.isFinite(Number(value))||Number(value)<0))throw Error('El costo debe ser un importe válido');
+    await api('/products/'+productId+'/cost','PUT',{unit_cost:value===''?null:value});
+    toast(value===''?'Costo unitario retirado':'Costo unitario guardado para próximas comandas');
+    await render();return true;
+  }
+  if(form.id==='inventory-waste'){
+    const productId=Number(d.product_id);
+    const product=(state.products||[]).find(p=>p.id===productId);
+    if(!product)throw Error('Actualiza el inventario y vuelve a seleccionar el producto');
+    const quantity=Number(d.quantity);
+    if(!Number.isInteger(quantity)||quantity<1)throw Error('La cantidad de merma debe ser un entero positivo');
+    if(!confirm('¿Registrar '+quantity+' unidad(es) de merma de '+product.name+'? Esta salida quedará en el historial.'))return true;
+    await api('/inventory/waste','POST',{product_id:productId,quantity,reason:d.reason,expected_version:product.version});
+    toast('Merma registrada y existencias actualizadas');
+    await render();return true;
+  }
   if(form.id==='prep-policy'){
     await api('/preparation/config','PUT',{batch_minutes:Number(d.batch_minutes),warning_percent:Number(d.warning_percent)});
     toast('Tiempos de preparación actualizados');await render();return true;
