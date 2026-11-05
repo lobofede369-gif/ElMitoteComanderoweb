@@ -3179,7 +3179,7 @@ def account_prebill_pdf(account_id:int,db:Session=Depends(db_session),user:User=
     account=owner_account(db,user,account_id,allowed=None)
     payload=build_account_pdf(db,account,prebill=True)
     return Response(content=payload,media_type='application/pdf',
-        headers={'Content-Disposition':f'inline; filename="ElMitote_PreCuenta_{account.id}.pdf"','Cache-Control':'no-store'})
+        headers={'Content-Disposition':f'inline; filename="PERSEO_POS_PreCuenta_{account.id}.pdf"','Cache-Control':'no-store'})
 
 @app.get('/api/accounts/{account_id}/ticket.pdf')
 def ticket_pdf(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -3187,7 +3187,7 @@ def ticket_pdf(account_id:int,db:Session=Depends(db_session),user:User=Depends(a
     account=owner_account(db,user,account_id,allowed=None)
     payload=build_account_pdf(db,account,prebill=False)
     return Response(content=payload,media_type='application/pdf',
-        headers={'Content-Disposition':f'attachment; filename="ElMitote_Ticket_{account.id}.pdf"','Cache-Control':'no-store'})
+        headers={'Content-Disposition':f'attachment; filename="PERSEO_POS_Ticket_{account.id}.pdf"','Cache-Control':'no-store'})
 
 def period_summary(db,p):
     archived=db.get(CashCutArchive,p.id)
@@ -3268,7 +3268,7 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     archived=db.get(CashCutArchive,p.id)
     if archived:
         return Response(content=archived.pdf_blob,media_type='application/pdf',
-            headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"',
+            headers={'Content-Disposition':f'attachment; filename="PERSEO_POS_Corte_{p.id}.pdf"',
                      'Cache-Control':'no-store'})
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
     totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
@@ -3339,7 +3339,7 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
     story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
     doc.build(story)
-    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
+    return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="PERSEO_POS_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
 # Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
 import mitote_extensions  # noqa: E402
 import menu_photo_import  # noqa: E402
