@@ -282,13 +282,18 @@ async function render(options={}){
 function waiterReadyAlertsHtml(){
   const ready=state.data.readyAlerts||[];
   return '<div class="card waiter-ready-card"><div class="row"><h3>🔔 Pedidos pendientes de entregar</h3><button class="outline small" data-action="enable-sound">♪ Probar sonido</button></div>'+
-    (ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+
-      esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+
-      '</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+
-      (x.complete?' · Todas las estaciones listas':'')+
-      '</div></div><div class="row"><button class="outline small" data-action="open-account" data-id="'+
-      Number(x.account_id)+'">Ver cuenta</button><button class="primary small" data-action="ack-ready" data-id="'+
-      Number(x.event_id)+'">✓ Entregado</button></div></div>').join(''):
+    (ready.length?ready.slice(0,14).map(x=>{
+      const status=x.acknowledged?'Recibido · pendiente de entrega':'Pendiente de confirmar recepción';
+      const action=x.acknowledged?'deliver-ready':'ack-ready';
+      const label=x.acknowledged?'✓ Entregado':'✓ Recibido';
+      return '<div class="lineitem row"><div><b>'+
+        esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+
+        '</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+
+        (x.complete?' · Todas las estaciones listas':'')+
+        '</div><div class="mini">'+status+'</div></div><div class="row"><button class="outline small" data-action="open-account" data-id="'+
+        Number(x.account_id)+'">Ver cuenta</button><button class="primary small" data-action="'+action+'" data-id="'+
+        Number(x.event_id)+'">'+label+'</button></div></div>';
+    }).join(''):
       '<p class="mini">No tienes avisos pendientes de entregar en este turno.</p>')+'</div>';
 }
 async function showAccounts(all){
@@ -685,8 +690,16 @@ case 'push-disable':await disablePush();await render();break;
 case 'ack-ready':{
   if(!Number.isInteger(id)||id<1)throw Error('Aviso inválido');
   await api('/waiter/ready-alerts/'+id+'/ack','POST',{});
+  state.data.readyAlerts=(state.data.readyAlerts||[]).map(x=>x.event_id===id?{...x,acknowledged:true,received_at:new Date().toISOString()}:x);
+  toast('Recepción confirmada. Marca Entregado cuando lo hayas llevado a la mesa.');
+  await render();
+  break;
+}
+case 'deliver-ready':{
+  if(!Number.isInteger(id)||id<1)throw Error('Aviso inválido');
+  await api('/waiter/ready-alerts/'+id+'/deliver','POST',{});
   state.data.readyAlerts=(state.data.readyAlerts||[]).filter(x=>x.event_id!==id);
-  toast('Entrega confirmada');
+  toast('Entrega al cliente confirmada y registrada');
   await render();
   break;
 }
