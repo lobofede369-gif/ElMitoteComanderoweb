@@ -453,8 +453,9 @@ try:
         assert "accountHistoryMarkup(rows)" in js
         assert "prepClockTimer" in features
         assert "document.hidden" in features
-        assert "perseo-pos-demo-v2" in sw
-        assert "/static/app.js?v=30" in sw and "/static/app.js?v=30" in html
+        assert "perseo-pos-demo-v4" in sw
+        assert "/static/app.js?v=32" in sw and "/static/app.js?v=32" in html
+        assert "/static/perseo-dashboard.css?v=2" in sw and "/static/perseo-dashboard.css?v=2" in html
         assert "function setConnectionState(connected)" in js
         assert "/static/features.js?v=3" in sw and "/static/features.js?v=3" in html
         print("OK: deduplicación GET, historial diferido, cronómetros activos solo en pantalla y caché versionada.")
