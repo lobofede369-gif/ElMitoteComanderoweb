@@ -62,6 +62,9 @@ with TestClient(app.app) as client:
             app.ReadyNotificationEvent.event_key=="ready-legacy-migration"))
         assert legacy is not None and legacy.attempt_count==0
         assert legacy.provider_accepted_at is None and legacy.delivered_at is None
+        # El evento sintético solo valida la migración; no forma parte del flujo funcional.
+        db.delete(legacy)
+        db.commit()
         cash_columns={x["name"] for x in app.inspect(app.engine).get_columns("cash_movements")}
         assert "client_key" in cash_columns
         users={}
