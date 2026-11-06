@@ -447,12 +447,6 @@ PERFORMANCE_INDEXES = (
     Index('ix_order_items_batch_id', OrderItem.batch_id),
     Index('ix_payments_account_id', Payment.account_id),
     Index('uq_cash_movements_client_key', CashMovement.client_key, unique=True),
-    # Una sola caja abierta incluso si dos administradores intentan abrirla a la vez.
-    # El índice usa una expresión constante porque NULLs distintos no se comparan
-    # como duplicados en un índice único convencional.
-    Index('uq_cash_periods_single_open', text('(1)'), unique=True,
-          postgresql_where=CashPeriod.closed_at.is_(None),
-          sqlite_where=CashPeriod.closed_at.is_(None)),
 )
 
 listeners=set()
@@ -503,6 +497,13 @@ def bootstrap():
     # desplegar esta migración de forma idempotente en SQLite y PostgreSQL.
     for performance_index in PERFORMANCE_INDEXES:
         performance_index.create(bind=engine,checkfirst=True)
+    # Índice parcial de expresión constante: evita dos cajas abiertas incluso bajo
+    # concurrencia. El DDL es común a SQLite y PostgreSQL.
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            'CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_periods_single_open '
+            'ON cash_periods ((1)) WHERE closed_at IS NULL'
+        )
     with SessionLocal() as db:
         if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False))
         if not db.scalar(select(User).where(User.role=='owner')):
