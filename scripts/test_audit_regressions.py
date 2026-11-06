@@ -63,6 +63,17 @@ with TestClient(app.app) as client:
             raise AssertionError("La base permitió dos turnos de caja abiertos")
         assert db.scalar(app.select(app.func.count(app.CashPeriod.id)).where(
             app.CashPeriod.closed_at.is_(None)))==1
+
+    movement_payload={"client_key":"cash-move-test-123456","kind":"in",
+                      "amount":"5.00","reason":"Ingreso de prueba"}
+    movement=client.post("/api/cash/movements",headers=headers,json=movement_payload)
+    assert movement.status_code==200 and not movement.json()["duplicate"],movement.text
+    movement_retry=client.post("/api/cash/movements",headers=headers,json=movement_payload)
+    assert movement_retry.status_code==200 and movement_retry.json()["duplicate"],movement_retry.text
+    changed_movement={**movement_payload,"amount":"6.00"}
+    movement_conflict=client.post("/api/cash/movements",headers=headers,json=changed_movement)
+    assert movement_conflict.status_code==409,movement_conflict.text
+
     product_payload={"name":"Producto auditado","category":"Pruebas","station":"kitchen",
                      "price":"10.00","stock":3,"inventory_enabled":True}
     created=client.post("/api/products",headers=headers,json=product_payload)
