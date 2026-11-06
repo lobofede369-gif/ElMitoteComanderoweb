@@ -21,8 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, Column, Integer, String, Boolean, ForeignKey,
-                        DateTime, Text, LargeBinary, UniqueConstraint, Index, select, func,
-                        inspect, or_)
+                        DateTime, Text, LargeBinary, UniqueConstraint, Index, select, func)
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as PDFImage
@@ -351,66 +350,6 @@ class CashMovement(Base):
     status=Column(String(20),default='pending')
     created_at=Column(DateTime(timezone=True),default=now)
 
-class IdempotencyRecord(Base):
-    """Respuesta durable para que los reintentos no repitan operaciones críticas."""
-    __tablename__='idempotency_records'
-    id=Column(Integer,primary_key=True)
-    user_id=Column(Integer,ForeignKey('users.id'),nullable=False)
-    scope=Column(String(40),nullable=False)
-    client_key=Column(String(100),nullable=False)
-    request_hash=Column(String(64),nullable=False)
-    response_json=Column(Text,default='{}',nullable=False)
-    created_at=Column(DateTime(timezone=True),default=now,nullable=False)
-    __table_args__=(UniqueConstraint('user_id','scope','client_key'),)
-
-
-def idempotency_digest(payload):
-    canonical=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(',',':'),default=str)
-    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
-
-
-def claim_idempotency(db,user,scope,client_key,payload):
-    """Claim a request key inside the same transaction as its business operation."""
-    if not client_key:
-        return None,None
-    digest=idempotency_digest(payload)
-    lookup=lambda: db.scalar(select(IdempotencyRecord).where(
-        IdempotencyRecord.user_id==user.id,
-        IdempotencyRecord.scope==scope,
-        IdempotencyRecord.client_key==client_key
-    ))
-    existing=lookup()
-    if existing:
-        if existing.request_hash!=digest:
-            raise HTTPException(409,'La clave de operación ya fue utilizada con datos diferentes.')
-        try:
-            return None,json.loads(existing.response_json or '{}')
-        except (TypeError,ValueError):
-            raise HTTPException(409,'La operación existe, pero su respuesta guardada no es válida. Contacta a administración.')
-    record=IdempotencyRecord(user_id=user.id,scope=scope,client_key=client_key,
-                             request_hash=digest,response_json='{}')
-    db.add(record)
-    try:
-        db.flush()
-    except IntegrityError:
-        db.rollback()
-        existing=lookup()
-        if existing and existing.request_hash==digest:
-            try:
-                return None,json.loads(existing.response_json or '{}')
-            except (TypeError,ValueError):
-                raise HTTPException(409,'La operación existe, pero su respuesta guardada no es válida.')
-        if existing:
-            raise HTTPException(409,'La clave de operación ya fue utilizada con datos diferentes.')
-        raise HTTPException(409,'No se pudo reservar la clave de operación. Actualiza e inténtalo de nuevo.')
-    return record,None
-
-
-def complete_idempotency(record,response):
-    if record is not None:
-        record.response_json=json.dumps(response,ensure_ascii=False,sort_keys=True)
-
-
 class TipDistribution(Base):
     __tablename__='tip_distributions'
     id=Column(Integer,primary_key=True)
@@ -482,18 +421,7 @@ class ReadyNotificationEvent(Base):
     complete = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), default=now, nullable=False)
     attempted_at = Column(DateTime(timezone=True), nullable=True)
-    attempt_count = Column(Integer, default=0, nullable=False)
-    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
-    last_error = Column(String(240), nullable=True)
-    delivered_at = Column(DateTime(timezone=True), nullable=True)
     acknowledged_at = Column(DateTime(timezone=True), nullable=True)
-
-READY_NOTIFICATION_RETRY_INDEX = Index(
-    'ix_ready_notification_retry',
-    ReadyNotificationEvent.acknowledged_at,
-    ReadyNotificationEvent.delivered_at,
-    ReadyNotificationEvent.next_attempt_at,
-)
 
 class Audit(Base):
     __tablename__='audit'
@@ -524,29 +452,6 @@ def audit(db,user,action,**data):
 
 def bootstrap():
     Base.metadata.create_all(engine)
-    # Migración aditiva para instalaciones existentes. No elimina ni reescribe
-    # movimientos; agrega únicamente el estado necesario para reintentos push.
-    with engine.begin() as conn:
-        columns = {column['name'] for column in inspect(conn).get_columns('ready_notification_events')}
-        additions = {
-            'attempt_count': 'INTEGER NOT NULL DEFAULT 0',
-            'next_attempt_at': 'TIMESTAMP WITH TIME ZONE NULL',
-            'last_error': 'VARCHAR(240) NULL',
-            'delivered_at': 'TIMESTAMP WITH TIME ZONE NULL',
-        }
-        for column_name, column_type in additions.items():
-            if column_name not in columns:
-                conn.exec_driver_sql(
-                    f'ALTER TABLE ready_notification_events ADD COLUMN {column_name} {column_type}'
-                )
-        # Un intento anterior no debe volver a sonar después de actualizar.
-        conn.exec_driver_sql(
-            'UPDATE ready_notification_events '
-            'SET delivered_at = attempted_at, '
-            'attempt_count = CASE WHEN attempt_count < 1 THEN 1 ELSE attempt_count END '
-            'WHERE attempted_at IS NOT NULL AND delivered_at IS NULL'
-        )
-    READY_NOTIFICATION_RETRY_INDEX.create(bind=engine, checkfirst=True)
     # create_all no agrega índices a tablas ya creadas; checkfirst permite
     # desplegar esta migración de forma idempotente en SQLite y PostgreSQL.
     for performance_index in PERFORMANCE_INDEXES:
@@ -595,43 +500,24 @@ def bootstrap():
                 db.add(ReadyNotificationEvent(event_key=f'ready-{ticket.id}',
                     ticket_id=ticket.id,batch_id=batch.id,account_id=account.id,
                     waiter_id=account.owner_id,station=ticket.station,complete=complete,
-                    created_at=ticket.ready_at or now(),attempted_at=now(),
-                    attempt_count=1,delivered_at=now()))
+                    created_at=ticket.ready_at or now(),attempted_at=now()))
         # Solo aplica menú cuando exista la aprobación explícita en Render.
         menu_photo_import.apply_approved_photo_menu_at_startup(db)
         db.commit()
 
 async def dispatch_ready_notification(event_id:int):
-    """Envía a los canales disponibles y reintenta si ninguno acepta el aviso."""
-    max_attempts=12
+    """Intenta enviar Web Push y FCM; la consulta del mesero es el respaldo durable."""
     with SessionLocal() as db:
         row=db.execute(select(ReadyNotificationEvent).where(
             ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
-        stamp=now()
-        if not row or row.acknowledged_at is not None or row.delivered_at is not None:
-            return
-        if (row.attempt_count or 0)>=max_attempts:
-            return
-        if row.next_attempt_at is not None and row.next_attempt_at>stamp:
-            return
+        if not row or row.attempted_at is not None or row.acknowledged_at is not None:return
         account=db.get(Account,row.account_id)
-        recipient_id=account.owner_id if account else row.waiter_id
-        waiter=db.get(User,recipient_id) if recipient_id else None
+        waiter=db.get(User,row.waiter_id)
         if not account or not waiter or not waiter.active or waiter.role!='waiter':
-            row.attempt_count=(row.attempt_count or 0)+1
-            row.attempted_at=stamp
-            row.last_error='La cuenta no tiene un mesero activo asignado.'
-            row.next_attempt_at=(stamp+timedelta(minutes=5)) if row.attempt_count<max_attempts else None
-            db.commit()
             return
-        # El destinatario actual se recalcula al enviar; una reasignación no
-        # deja el aviso atrapado en el dispositivo del mesero anterior.
-        row.waiter_id=recipient_id
-        row.attempt_count=(row.attempt_count or 0)+1
-        attempt=row.attempt_count
-        row.attempted_at=stamp
-        # Lease para impedir que otra instancia del servidor envíe el mismo evento.
-        row.next_attempt_at=stamp+timedelta(minutes=2)
+        # Marcar el intento ANTES del transporte evita notificaciones repetidas
+        # tras una ejecución concurrente. El evento siempre queda consultable.
+        row.attempted_at=now()
         event_key=row.event_key
         station_label='Cocina' if row.station=='kitchen' else 'Barra'
         title='El Mitote · Pedido completo' if row.complete else f'El Mitote · {station_label} lista'
@@ -640,52 +526,22 @@ async def dispatch_ready_notification(event_id:int):
         payload={'title':title,'body':body,
                  'url':f'/?push=accounts&account={account.id}',
                  'kind':'ready_complete' if row.complete else 'ready_station',
-                 'tag':f'mitote-{event_key}','event_id':event_key,
-                 'recipient_id':str(recipient_id)}
+                 'tag':f'mitote-{event_key}','event_id':event_key}
+        recipient=row.waiter_id
         db.commit()
-
-    results=await asyncio.gather(
-        push_to(payload,role='waiter',user_id=recipient_id),
-        fcm_to(payload,role='waiter',user_id=recipient_id),
-        return_exceptions=True
-    )
-    normalized=[x if isinstance(x,dict) else {
-        'sent':0,'failed':1,'error':type(x).__name__
-    } for x in results]
-    delivered=sum(int(x.get('sent') or 0) for x in normalized)>0
-    errors=[str(x.get('error')) for x in normalized if x.get('error')]
-    with SessionLocal() as db:
-        row=db.execute(select(ReadyNotificationEvent).where(
-            ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
-        if not row:
-            return
-        if delivered:
-            row.delivered_at=now()
-            row.next_attempt_at=None
-            row.last_error=None
-        else:
-            row.last_error=('; '.join(errors) or 'Ningún dispositivo confirmó la aceptación del aviso.')[:240]
-            if (row.attempt_count or 0)>=max_attempts:
-                row.next_attempt_at=None
-            else:
-                delay=min(900,20*(2**min(max(0,attempt-1),6)))
-                row.next_attempt_at=now()+timedelta(seconds=delay)
-        db.commit()
+    await push_to(payload,role='waiter',user_id=recipient)
+    await fcm_to(payload,role='waiter',user_id=recipient)
 
 
 async def ready_notification_outbox_worker():
-    """Reintenta avisos pendientes con backoff y sin duplicar envíos concurrentes."""
+    """Reanuda avisos confirmados en BD cuya entrega no alcanzó a iniciar."""
     while True:
-        await asyncio.sleep(20)
+        await asyncio.sleep(25)
         try:
-            stamp=now()
             with SessionLocal() as db:
                 ids=db.scalars(select(ReadyNotificationEvent.id).where(
-                    ReadyNotificationEvent.acknowledged_at.is_(None),
-                    ReadyNotificationEvent.delivered_at.is_(None),
-                    ReadyNotificationEvent.attempt_count<12,
-                    or_(ReadyNotificationEvent.next_attempt_at.is_(None),
-                        ReadyNotificationEvent.next_attempt_at<=stamp)
+                    ReadyNotificationEvent.attempted_at.is_(None),
+                    ReadyNotificationEvent.acknowledged_at.is_(None)
                 ).order_by(ReadyNotificationEvent.id).limit(40)).all()
             for event_id in ids:
                 await dispatch_ready_notification(event_id)
@@ -1154,20 +1010,16 @@ def _push_one(row,payload):
                 data=json.dumps(payload,ensure_ascii=False),
                 vapid_private_key=VAPID_PRIVATE_KEY,
                 vapid_claims={'sub':VAPID_SUBJECT},ttl=600,timeout=5)
-        return {'ok':True,'expired_id':None,'error':None}
+        return None
     except WebPushException as exc:
-        if exc.status_code in (404,410):
-            return {'ok':False,'expired_id':row['id'],'error':f'HTTP {exc.status_code}'}
+        if exc.status_code in (404,410):return row['id']
         log.warning('Fallo push id=%s codigo=%s',row['id'],exc.status_code)
-        return {'ok':False,'expired_id':None,'error':f'HTTP {exc.status_code or "desconocido"}'}
-    except Exception as exc:
+    except Exception:
         log.exception('Error de notificación push id=%s',row['id'])
-        return {'ok':False,'expired_id':None,'error':type(exc).__name__}
-
+    return None
 
 async def push_to(payload,role=None,user_id=None):
-    if not PUSH_ENABLED:
-        return {'enabled':False,'devices':0,'sent':0,'failed':0,'error':'Web Push no configurado'}
+    if not PUSH_ENABLED:return
     try:
         with SessionLocal() as db:
             q=select(PushDevice).join(User,PushDevice.user_id==User.id).where(User.active.is_(True))
@@ -1175,24 +1027,17 @@ async def push_to(payload,role=None,user_id=None):
             if user_id:q=q.where(User.id==user_id)
             rows=[{'id':d.id,'endpoint':d.endpoint,'p256dh':d.p256dh,'auth_key':d.auth_key}
                   for d in db.scalars(q)]
-        if not rows:
-            return {'enabled':True,'devices':0,'sent':0,'failed':0,'error':'Sin dispositivos Web Push registrados'}
+        if not rows:return
         results=await asyncio.gather(*(asyncio.to_thread(_push_one,r,payload) for r in rows),return_exceptions=True)
-        normalized=[x if isinstance(x,dict) else {'ok':False,'expired_id':None,'error':type(x).__name__} for x in results]
-        expired=[x['expired_id'] for x in normalized if x.get('expired_id') is not None]
+        expired=[x for x in results if isinstance(x,int)]
         if expired:
             with SessionLocal() as db:
                 for rid in expired:
                     d=db.get(PushDevice,rid)
                     if d:db.delete(d)
                 db.commit()
-        sent=sum(1 for x in normalized if x.get('ok'))
-        errors=[x.get('error') for x in normalized if x.get('error')]
-        return {'enabled':True,'devices':len(rows),'sent':sent,'failed':len(rows)-sent,
-                'error':'; '.join(errors[:3]) if errors else None}
-    except Exception as exc:
+    except Exception:
         log.exception('No se pudieron distribuir notificaciones push')
-        return {'enabled':True,'devices':0,'sent':0,'failed':1,'error':type(exc).__name__}
 
 @app.post('/api/push/test')
 async def push_test(user:User=Depends(auth)):
@@ -1239,23 +1084,21 @@ def _fcm_send_one(device, payload):
               'route': route,
               'kind': str(payload.get('kind','general'))[:32],
               'tag': str(payload.get('tag','mitote-aviso'))[:100],
-              'event_id': str(payload.get('event_id',''))[:90],
-              'recipient_id': str(payload.get('recipient_id',''))[:40]},
+              'event_id': str(payload.get('event_id',''))[:90]},
         android=messaging.AndroidConfig(priority='high', ttl=timedelta(minutes=10))
     )
     try:
         messaging.send(msg)
-        return {'ok':True,'expired_id':None,'error':None}
+        return None
     except Exception as exc:
         if isinstance(exc, getattr(messaging, 'UnregisteredError', type(None))):
-            return {'ok':False,'expired_id':device['id'],'error':'Token FCM no registrado'}
+            return device['id']
         log.warning('FCM no pudo entregar al dispositivo %s: %s', device['id'], type(exc).__name__)
-        return {'ok':False,'expired_id':None,'error':type(exc).__name__}
-
+        return None
 
 async def fcm_to(payload, role=None, user_id=None):
     if not _firebase_ready():
-        return {'enabled':False,'devices':0,'sent':0,'failed':0,'error':'Firebase Cloud Messaging no configurado'}
+        return
     try:
         with SessionLocal() as db:
             q = select(FcmDevice).join(User, FcmDevice.user_id == User.id).where(User.active.is_(True))
@@ -1265,10 +1108,9 @@ async def fcm_to(payload, role=None, user_id=None):
                 q = q.where(User.id == user_id)
             devices = [{'id': x.id, 'token': x.token} for x in db.scalars(q)]
         if not devices:
-            return {'enabled':True,'devices':0,'sent':0,'failed':0,'error':'Sin dispositivos FCM registrados'}
+            return
         results = await asyncio.gather(*(asyncio.to_thread(_fcm_send_one, d, payload) for d in devices), return_exceptions=True)
-        normalized=[x if isinstance(x,dict) else {'ok':False,'expired_id':None,'error':type(x).__name__} for x in results]
-        expired = [x['expired_id'] for x in normalized if x.get('expired_id') is not None]
+        expired = [x for x in results if isinstance(x, int)]
         if expired:
             with SessionLocal() as db:
                 for device_id in expired:
@@ -1276,13 +1118,8 @@ async def fcm_to(payload, role=None, user_id=None):
                     if old:
                         db.delete(old)
                 db.commit()
-        sent=sum(1 for x in normalized if x.get('ok'))
-        errors=[x.get('error') for x in normalized if x.get('error')]
-        return {'enabled':True,'devices':len(devices),'sent':sent,'failed':len(devices)-sent,
-                'error':'; '.join(errors[:3]) if errors else None}
-    except Exception as exc:
+    except Exception:
         log.exception('Fallo el envío FCM')
-        return {'enabled':True,'devices':0,'sent':0,'failed':1,'error':type(exc).__name__}
 
 @app.post('/api/fcm/test')
 async def fcm_test(db: Session = Depends(db_session), user: User = Depends(auth)):
@@ -1987,7 +1824,6 @@ class AccountSplitIn(BaseModel):
     name: Optional[str] = Field(default=None, max_length=120)
     table_id: Optional[int] = None
     reason: str = Field(min_length=3, max_length=400)
-    client_key: Optional[str] = Field(default=None, min_length=8, max_length=100)
 
 class AccountReopenClosedIn(BaseModel):
     reason: str = Field(min_length=3, max_length=400)
@@ -2172,12 +2008,6 @@ async def merge_accounts(account_id: int, data: AccountMergeIn,
 async def split_account(account_id: int, data: AccountSplitIn,
                         db: Session = Depends(db_session), user: User = Depends(auth)):
     allow(user, 'owner')
-    request_payload={'account_id':account_id,**data.dict(exclude={'client_key'})}
-    idempotency_record,replay=claim_idempotency(
-        db,user,'account-split',data.client_key,request_payload)
-    if replay is not None:
-        replay['duplicate']=True
-        return replay
     source = owner_account(db, user, account_id, ('open', 'pending'))
     account_manager_access(user, source)
     if db.scalar(select(AccountDiscount.id).where(AccountDiscount.account_id==source.id,AccountDiscount.status=='applied').limit(1)):
@@ -2288,17 +2118,14 @@ async def split_account(account_id: int, data: AccountSplitIn,
           qty=data.qty, original_qty=original_qty, remaining_qty=item.qty, reason=data.reason)
     audit(db, user, 'account.split_in', account_id=target.id,
           source_account_id=source.id, product=item.name, qty=data.qty, reason=data.reason)
-    result={'ok': True, 'source_account_id': source.id, 'target_account_id': target.id,
-            'new_account': data.target_account_id is None, 'split_item_id': split_item.id,
-            'duplicate':False}
-    complete_idempotency(idempotency_record,result)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'No se pudo dividir la cuenta. Actualiza e inténtalo de nuevo.')
     await notify()
-    return result
+    return {'ok': True, 'source_account_id': source.id, 'target_account_id': target.id,
+            'new_account': data.target_account_id is None, 'split_item_id': split_item.id}
 
 @app.post('/api/accounts/{account_id}/reopen-closed')
 async def reopen_closed_account(account_id: int, data: AccountReopenClosedIn,
@@ -2468,9 +2295,7 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
                  'url':f'/?push=station&account={a.id}',
                  'tag':f'mitote-order-{batch.id}-{station}'}
         fcm_payload={'title':'El Mitote · '+station_title,
-                     'body':f'Nueva comanda #{batch.id}','url':'/?push=station',
-                     'tag':f'mitote-order-{batch.id}-{station}',
-                     'event_id':f'order-{batch.id}-{station}'}
+                     'body':f'Nueva comanda #{batch.id}','url':'/?push=station'}
         await asyncio.gather(push_to(payload,role=station),
                              fcm_to(fcm_payload,role=station),
                              return_exceptions=True)
@@ -2511,10 +2336,7 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
     audit(db,user,'order.repeat',account_id=account.id,source_item_id=item.id,new_item_id=new_item.id,qty=data.qty,batch_id=batch.id)
     db.commit();await notify()
     await push_to({'title':'El Mitote · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · {account.name}','url':'/?push=station','tag':f'mitote-order-{batch.id}-{item.station}'},role=item.station)
-    await fcm_to({'title':'El Mitote · '+('Cocina' if item.station=='kitchen' else 'Barra'),
-                  'body':f'Producto repetido · Comanda #{batch.id}','url':'/?push=station',
-                  'tag':f'mitote-repeat-{batch.id}-{item.station}',
-                  'event_id':f'order-repeat-{batch.id}-{item.station}'},role=item.station)
+    await fcm_to({'title':'El Mitote · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · Comanda #{batch.id}','url':'/?push=station'},role=item.station)
     return {'batch_id':batch.id,'duplicate':False}
 
 @app.post('/api/accounts/{account_id}/request-bill')
@@ -2919,38 +2741,12 @@ def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
             'expected':amount(expected),'movements':[{'id':m.id,'kind':m.kind,'amount':amount(m.cents),'reason':m.reason,'status':m.status} for m in moves],
             'blocking_count':int(blocking_count),'blocking_accounts':blocking_data,
             'can_close':blocking_count==0 and not any(m.status=='pending' for m in moves)}
-class MovementIn(BaseModel):
-    kind:Literal['in','out']
-    amount:Decimal=Field(gt=0)
-    reason:str=Field(min_length=3,max_length=400)
-    client_key:Optional[str]=Field(default=None,min_length=8,max_length=100)
-
+class MovementIn(BaseModel):kind:Literal['in','out'];amount:Decimal=Field(gt=0);reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/cash/movements')
 async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depends(auth)):
-    allow(user,'owner','admin','cashier')
-    payload={'kind':data.kind,'amount':format(data.amount,'f'),'reason':data.reason}
-    idempotency_record,replay=claim_idempotency(
-        db,user,'cash-movement',data.client_key,payload)
-    if replay is not None:
-        replay['duplicate']=True
-        return replay
-    p=active_period(db)
-    movement_cents=cents(data.amount)
-    m=CashMovement(period_id=p.id,requester_id=user.id,kind=data.kind,cents=movement_cents,
-        reason=data.reason,status='approved' if user.role in ('owner','admin') else 'pending',
-        approved_by=user.id if user.role in ('owner','admin') else None)
-    db.add(m)
-    db.flush()
-    audit(db,user,'cash.movement.request',kind=m.kind,cents=m.cents)
-    result={'id':m.id,'status':m.status,'duplicate':False}
-    complete_idempotency(idempotency_record,result)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(409,'No se pudo registrar el movimiento. Actualiza e inténtalo de nuevo.')
-    await notify()
-    return result
+    allow(user,'owner','admin','cashier');p=active_period(db)
+    m=CashMovement(period_id=p.id,requester_id=user.id,kind=data.kind,cents=cents(data.amount),reason=data.reason,status='approved' if user.role in ('owner','admin') else 'pending',approved_by=user.id if user.role in ('owner','admin') else None)
+    db.add(m);audit(db,user,'cash.movement.request',kind=m.kind,cents=m.cents);db.commit();await notify();return {'id':m.id,'status':m.status}
 class MoveDecision(BaseModel):approve:bool
 @app.post('/api/cash/movements/{movement_id}/decide')
 async def move_decide(movement_id:int,data:MoveDecision,db:Session=Depends(db_session),user:User=Depends(auth)):
