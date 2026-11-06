@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, Column, Integer, String, Boolean, ForeignKey,
-                        DateTime, Text, LargeBinary, UniqueConstraint, Index, select, func, inspect, or_)
+                        DateTime, Text, LargeBinary, UniqueConstraint, Index, select, func, inspect, or_, text)
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as PDFImage
@@ -445,6 +445,12 @@ PERFORMANCE_INDEXES = (
     Index('ix_batches_account_id', Batch.account_id),
     Index('ix_order_items_batch_id', OrderItem.batch_id),
     Index('ix_payments_account_id', Payment.account_id),
+    # Una sola caja abierta incluso si dos administradores intentan abrirla a la vez.
+    # El índice usa una expresión constante porque NULLs distintos no se comparan
+    # como duplicados en un índice único convencional.
+    Index('uq_cash_periods_single_open', text('(1)'), unique=True,
+          postgresql_where=CashPeriod.closed_at.is_(None),
+          sqlite_where=CashPeriod.closed_at.is_(None)),
 )
 
 listeners=set()
@@ -470,6 +476,10 @@ def bootstrap():
             'last_error':'VARCHAR(240) NULL',
             'delivered_at':'TIMESTAMP WITH TIME ZONE NULL',
         }
+        # Esta limpieza solo corresponde a la primera actualización del esquema.
+        # Ejecutarla en cada arranque borraba el estado de entrega de eventos nuevos
+        # y volvía a enviar notificaciones ya aceptadas por FCM/Web Push.
+        legacy_outbox_schema=any(name not in columns for name in additions)
         for column_name,column_type in additions.items():
             if column_name not in columns:
                 conn.exec_driver_sql(
@@ -479,12 +489,11 @@ def bootstrap():
             'UPDATE ready_notification_events SET delivered_at=acknowledged_at '
             'WHERE acknowledged_at IS NOT NULL AND delivered_at IS NULL'
         )
-        # Los intentos antiguos no guardaban el resultado del proveedor; se reintentan
-        # una vez que el outbox esté activo. La deduplicación móvil usa event_id estable.
-        conn.exec_driver_sql(
-            'UPDATE ready_notification_events SET attempt_count=0, next_attempt_at=NULL, '
-            'provider_accepted_at=NULL WHERE acknowledged_at IS NULL AND delivered_at IS NULL'
-        )
+        if legacy_outbox_schema:
+            conn.exec_driver_sql(
+                'UPDATE ready_notification_events SET attempt_count=0, next_attempt_at=NULL, '
+                'provider_accepted_at=NULL WHERE acknowledged_at IS NULL AND delivered_at IS NULL'
+            )
     # create_all no agrega índices a tablas ya creadas; checkfirst permite
     # desplegar esta migración de forma idempotente en SQLite y PostgreSQL.
     for performance_index in PERFORMANCE_INDEXES:
@@ -697,7 +706,15 @@ def sw(): return FileResponse('static/sw.js',media_type='application/javascript'
 @app.get('/manifest.webmanifest')
 def manifest(): return FileResponse('static/manifest.webmanifest',media_type='application/manifest+json')
 @app.get('/api/health')
-def health(): return {'ok':True}
+def health():
+    """Health check real: no declara saludable la app si PostgreSQL no responde."""
+    try:
+        with engine.connect() as connection:
+            connection.execute(text('SELECT 1'))
+    except Exception:
+        http_log.exception('health_check_failed')
+        raise HTTPException(503,'Base de datos no disponible')
+    return {'ok':True,'database':'ok'}
 
 def db_session():
     with SessionLocal() as db: yield db
@@ -2800,6 +2817,9 @@ async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:
     if existing:
         if existing.account_id!=account_id:raise HTTPException(409,'Clave de pago reutilizada')
         return {'ok':True,'duplicate':True}
+    # Orden de bloqueo consistente con send_order: primero el turno y después la
+    # cuenta. Evita el deadlock caja↔mesero cuando ambos operan la misma cuenta.
+    p=active_period(db)
     a=owner_account(db,user,account_id,('pending',))
     # Segunda lectura tras bloquear la cuenta para evitar reintentos simultáneos.
     existing=db.scalar(select(Payment).where(Payment.client_key==f'{data.client_key}-0'))
@@ -2834,7 +2854,6 @@ async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:
             if reserved+alloc.qty>item.qty-item.cancelled_qty:raise HTTPException(409,f'Cantidad de {item.name} ya asignada')
             expected+=alloc.qty*item.price_cents
         if expected!=payment_total:raise HTTPException(409,'Los importes deben coincidir con los productos asignados')
-    p=active_period(db)
     if any(tip_value>0 for line,value,tip_value,received in normalized) and db.scalar(
         select(TipDistribution.id).where(TipDistribution.period_id==p.id)
     ):
@@ -2950,7 +2969,16 @@ class OpenPeriodIn(BaseModel):opening:Decimal=Field(ge=0)
 async def open_cash(data:OpenPeriodIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
     if db.scalar(select(CashPeriod.id).where(CashPeriod.closed_at.is_(None))):raise HTTPException(409,'Ya existe un periodo abierto')
-    p=CashPeriod(opening_cents=cents(data.opening));db.add(p);audit(db,user,'cash.open',opening=p.opening_cents);db.commit();await notify();return {'id':p.id}
+    p=CashPeriod(opening_cents=cents(data.opening))
+    db.add(p)
+    audit(db,user,'cash.open',opening=p.opening_cents)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409,'Ya existe un periodo de caja abierto. Actualiza la pantalla.')
+    await notify()
+    return {'id':p.id}
 
 class TipDistributionIn(BaseModel):
     user_ids:list[int]=Field(min_length=1,max_length=100)
