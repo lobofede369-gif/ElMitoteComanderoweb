@@ -5,11 +5,32 @@ Prueba offline con SQLite efímero. No toca Render ni envía push reales.
 import os
 import asyncio
 import tempfile
+import sqlite3
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
 dbfile=Path(tempfile.gettempdir())/("mitote-ready-alerts-"+uuid4().hex+".sqlite")
+# Simula el esquema anterior para comprobar la migración aditiva desde producción.
+with sqlite3.connect(dbfile) as legacy:
+    legacy.execute("""CREATE TABLE ready_notification_events (
+        id INTEGER PRIMARY KEY, event_key VARCHAR(90) NOT NULL UNIQUE,
+        ticket_id INTEGER NOT NULL UNIQUE, batch_id INTEGER NOT NULL,
+        account_id INTEGER NOT NULL, waiter_id INTEGER NOT NULL,
+        station VARCHAR(12) NOT NULL, complete BOOLEAN NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL, attempted_at DATETIME,
+        acknowledged_at DATETIME
+    )""")
+    legacy.execute("""CREATE TABLE cash_movements (
+        id INTEGER PRIMARY KEY, period_id INTEGER NOT NULL,
+        requester_id INTEGER NOT NULL, approved_by INTEGER,
+        kind VARCHAR(10) NOT NULL, cents INTEGER NOT NULL,
+        reason VARCHAR(400) NOT NULL, status VARCHAR(20) DEFAULT 'pending',
+        created_at DATETIME
+    )""")
+    legacy.execute("""INSERT INTO ready_notification_events
+        (event_key,ticket_id,batch_id,account_id,waiter_id,station,complete,created_at,attempted_at)
+        VALUES ('ready-legacy-migration',999,999,999,999,'kitchen',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""")
 os.environ["DATABASE_URL"]="sqlite:///"+str(dbfile)
 os.environ["ADMIN_USERNAME"]="owner_ready_test"
 os.environ["ADMIN_PASSWORD"]="OnlyForTests_2026"
@@ -37,6 +58,12 @@ app.fcm_to=mock_fcm
 
 with TestClient(app.app) as client:
     with app.SessionLocal() as db:
+        legacy=db.scalar(app.select(app.ReadyNotificationEvent).where(
+            app.ReadyNotificationEvent.event_key=="ready-legacy-migration"))
+        assert legacy is not None and legacy.attempt_count==0
+        assert legacy.provider_accepted_at is None and legacy.delivered_at is None
+        cash_columns={x["name"] for x in app.inspect(app.engine).get_columns("cash_movements")}
+        assert "client_key" in cash_columns
         users={}
         for role in ("waiter","kitchen","bar","admin"):
             user=app.User(username="ready_"+role,display="Test "+role,
