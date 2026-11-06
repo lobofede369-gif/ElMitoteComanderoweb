@@ -630,27 +630,41 @@ async function showApprovals(){const rs=await api('/requests');return `<div clas
 async function showAudit(){const rs=await api('/audit');return `<div class="card table-wrap"><table><thead><tr><th>Fecha</th><th>Usuario</th><th>Acción</th><th>Detalle</th></tr></thead><tbody>${rs.map(x=>`<tr><td>${esc(new Date(x.date).toLocaleString('es-MX'))}</td><td>${esc(x.actor)}</td><td>${esc(x.action)}</td><td class="mini">${esc(JSON.stringify(x.detail))}</td></tr>`).join('')}</tbody></table></div>`}
 async function showOverview(){
   const data=await api('/overview');
-  // El panel utiliza métricas agregadas; los listados completos se cargan al abrir cada módulo.
-  // Los accesos solo navegan a módulos ya existentes, sin alterar API o permisos.
+  let analytics=null;
+  if(state.user.role==='owner'){
+    const now=new Date();
+    const localDate=d=>new Intl.DateTimeFormat('en-CA',{timeZone:'America/Mexico_City',year:'numeric',month:'2-digit',day:'2-digit'}).format(d);
+    const end=localDate(now);
+    const start=localDate(new Date(now.getTime()-29*86400000));
+    try{
+      analytics=await api('/owner/analytics?start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end)+'&scope=history');
+    }catch(error){
+      analytics=null;
+    }
+  }
   const drawings={
-    list:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h9M8 13h9M8 17h6"/>',
+    chart:'<path d="M4 19V5M4 19h17"/><path d="m7 15 4-4 3 2 6-7"/><circle cx="7" cy="15" r="1"/><circle cx="11" cy="11" r="1"/><circle cx="14" cy="13" r="1"/><circle cx="20" cy="6" r="1"/>',
+    receipt:'<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
+    wallet:'<rect x="3" y="6" width="18" height="14" rx="2"/><path d="M3 9h18M15 14h3"/><path d="M6 6V4h12"/>',
+    box:'<path d="m12 2 9 5-9 5-9-5zM3 7v10l9 5 9-5V7M12 12v10"/>',
+    list:'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h8M8 13h8M8 17h5"/>',
     table:'<rect x="3" y="5" width="18" height="5" rx="1"/><path d="M6 10v10M18 10v10M3 16h18"/>',
-    food:'<path d="M4 3v9a3 3 0 0 0 6 0V3M7 3v18M18 3c-3 4-3 8 0 10h2V3M18 13v8"/>',
     kitchen:'<path d="M6 14a4 4 0 0 1-2-7 5 5 0 0 1 8-2 5 5 0 0 1 8 2 4 4 0 0 1-2 7v6H6z"/><path d="M6 17h12"/>',
     cash:'<rect x="2" y="5" width="20" height="14" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M5 9h1M18 15h1"/>',
-    box:'<path d="m12 2 9 5-9 5-9-5zM3 7v10l9 5 9-5V7M12 12v10"/>',
+    food:'<path d="M4 3v9a3 3 0 0 0 6 0V3M7 3v18M18 3c-3 4-3 8 0 10h2V3M18 13v8"/>',
     people:'<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M18 14a5 5 0 0 1 3 5v1"/>',
     tips:'<circle cx="12" cy="12" r="9"/><path d="M15 9c-1-2-6-2-6 1 0 3 6 1 6 4 0 3-5 3-6 1M12 6v12"/>',
     shield:'<path d="M12 2 4 6v6c0 5 3 8 8 10 5-2 8-5 8-10V6z"/><path d="m9 12 2 2 4-4"/>',
     audit:'<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h6"/>'
   };
   const icon=name=>'<svg viewBox="0 0 24 24" width="25" height="25" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+drawings[name]+'</svg>';
+  const kpi=(label,value,note,iconName)=>'<article class="perseo-kpi"><span class="perseo-kpi-icon">'+icon(iconName)+'</span><div class="perseo-kpi-copy"><span class="perseo-kpi-label">'+esc(label)+'</span><strong class="perseo-kpi-value">'+esc(value)+'</strong><small>'+esc(note)+'</small></div></article>';
   const shortcuts=[
     ['all','Cuentas','Cuentas abiertas y seguimiento','list'],
     ['tables','Mesas','Configuración y disponibilidad','table'],
     ['tickets','Estaciones','Comandas de cocina y barra','kitchen'],
     ['cashier','Cobros','Pagos pendientes y descuentos','cash'],
-    ['cash','Caja','Turnos, cortes y movimientos','cash'],
+    ['cash','Caja','Turnos, cortes y movimientos','wallet'],
     ['products','Menú','Productos, variantes y promociones','food'],
     ['inventory','Inventario','Existencias y reposiciones','box'],
     ['users','Personal','Empleados y permisos','people'],
@@ -659,23 +673,91 @@ async function showOverview(){
     ['audit','Auditoría','Registro de operaciones','audit']
   ];
   shortcuts.push(['reservations','Reservaciones','Confirmar llegadas y abrir cuentas','list'],['prepconfig','Tiempos','Límites de cocina y barra','kitchen']);
-  if(state.user.role==='owner')shortcuts.push(['analytics','Estadísticas','Ventas, productos y tiempos reales','cash']);
-  return `<div class="premium-dashboard">
-    <div class="premium-dashboard-heading">
-      <div><p class="premium-eyebrow">CENTRO DE CONTROL</p><h2>Operación del restaurante</h2>
-      <p>Revisa el servicio y entra directamente al módulo que necesitas.</p></div>
-      <span class="premium-dashboard-live">● Información actualizada</span>
-    </div>
-    <div class="statgrid">${stat('Cuentas activas',data.active_accounts)}${stat('Por cobrar',data.pending_accounts)}${stat('Comandas nuevas',data.new_tickets)}${stat('Productos',data.products)}</div>
-    <div class="premium-dashboard-heading premium-dashboard-second"><div><p class="premium-eyebrow">GESTIÓN Y ADMINISTRACIÓN</p><h2>Todos los módulos</h2></div></div>
-    <div class="premium-shortcut-grid">
-    ${shortcuts.map(([id,label,desc,drawing])=>`<button type="button" class="premium-shortcut" data-nav="${id}" aria-label="Abrir ${label}"><span class="premium-shortcut-icon">${icon(drawing)}</span><strong>${label}</strong><small>${desc}</small><span class="premium-shortcut-arrow" aria-hidden="true">›</span></button>`).join('')}
-    </div>
-    <div class="grid2 premium-dashboard-footer">
-      <div class="card"><h3>Operación en vivo</h3><p>Consulta cuentas abiertas y el estado de los pedidos.</p><button class="primary" data-nav="all">Supervisar cuentas</button></div>
-      <div class="card"><h3>Control de inventario</h3><p>Revisa existencias, productos bloqueados y reposiciones.</p><button class="outline" data-nav="inventory">Abrir inventario</button></div>
-    </div>
-  </div>`;
+  if(state.user.role==='owner')shortcuts.push(['analytics','Estadísticas','Ventas, productos y tiempos reales','chart']);
+
+  let metrics='';
+  let charts='';
+  if(analytics){
+    metrics='<div class="perseo-kpi-grid">'+
+      kpi('Ventas últimos 30 días',money(analytics.sales),'Ingresos cobrados · MXN','chart')+
+      kpi('Cuentas cobradas',String(analytics.paid_accounts||0),'Operaciones completadas','receipt')+
+      kpi('Ticket promedio',money(analytics.average_ticket),'Promedio por cuenta','wallet')+
+      kpi('Productos activos',String(data.products||0),'Catálogo disponible','box')+
+      '</div>';
+    const rows=(analytics.sales_by_day||[]).slice(-30).map(x=>({label:String(x.label||''),value:Number(x.amount)||0}));
+    const chartW=760,chartH=250,left=58,right=744,top=18,bottom=190;
+    const maxValue=Math.max(1,...rows.map(x=>x.value));
+    const xAt=i=>rows.length<=1?(left+right)/2:left+(i/(rows.length-1))*(right-left);
+    const yAt=v=>bottom-(v/maxValue)*(bottom-top);
+    const coords=rows.map((p,i)=>({x:xAt(i),y:yAt(p.value),label:p.label,value:p.value}));
+    const linePath=coords.map((p,i)=>(i?'L ':'M ')+p.x.toFixed(1)+' '+p.y.toFixed(1)).join(' ');
+    const areaPath=coords.length?'M '+coords[0].x.toFixed(1)+' '+bottom+' '+coords.map(p=>'L '+p.x.toFixed(1)+' '+p.y.toFixed(1)).join(' ')+' L '+coords[coords.length-1].x.toFixed(1)+' '+bottom+' Z':'';
+    const compact=n=>new Intl.NumberFormat('es-MX',{notation:'compact',maximumFractionDigits:1}).format(n);
+    const grid=[0,.25,.5,.75,1].map(t=>{
+      const y=bottom-t*(bottom-top),v=maxValue*t;
+      return '<line x1="'+left+'" y1="'+y.toFixed(1)+'" x2="'+right+'" y2="'+y.toFixed(1)+'" stroke="#e7edf5" stroke-width="1"/>'+
+        '<text x="48" y="'+(y+4).toFixed(1)+'" text-anchor="end" fill="#7b8ba3" font-size="11">'+esc(compact(v))+'</text>';
+    }).join('');
+    const xIndices=rows.length?[...new Set([0,Math.floor((rows.length-1)/2),rows.length-1])]:[];
+    const xLabels=xIndices.map(i=>{
+      const label=rows[i].label;
+      let formatted=label;
+      try{formatted=new Date(label+'T12:00:00').toLocaleDateString('es-MX',{day:'numeric',month:'short'});}catch{}
+      return '<text x="'+xAt(i).toFixed(1)+'" y="218" text-anchor="middle" fill="#7b8ba3" font-size="11">'+esc(formatted)+'</text>';
+    }).join('');
+    const dots=coords.map(p=>'<circle cx="'+p.x.toFixed(1)+'" cy="'+p.y.toFixed(1)+'" r="4" fill="#fff" stroke="#1769e8" stroke-width="2.5"><title>'+esc(p.label)+' · '+esc(money(p.value))+'</title></circle>').join('');
+    const chartSvg='<svg class="perseo-sales-svg" viewBox="0 0 '+chartW+' '+chartH+'" role="img" aria-label="Gráfica de ventas por día">'+
+      '<defs><linearGradient id="perseo-sales-area" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stop-color="#2478ed" stop-opacity=".24"/><stop offset="100%" stop-color="#2478ed" stop-opacity=".015"/></linearGradient></defs>'+
+      grid+(coords.length?'<path d="'+areaPath+'" fill="url(#perseo-sales-area)"/><path d="'+linePath+'" fill="none" stroke="#1769e8" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>'+dots:'')+xLabels+'</svg>';
+    const noSales=rows.every(x=>x.value===0);
+    const methods=[
+      {key:'cash',label:'Efectivo',value:Number(analytics.methods?.cash)||0,color:'#1769e8'},
+      {key:'card',label:'Tarjeta',value:Number(analytics.methods?.card)||0,color:'#19b7a5'},
+      {key:'transfer',label:'Transferencia',value:Number(analytics.methods?.transfer)||0,color:'#f59e0b'}
+    ];
+    const totalMethods=methods.reduce((sum,x)=>sum+x.value,0);
+    const circumference=2*Math.PI*47;
+    let offset=0;
+    const rings=methods.map(m=>{
+      const length=totalMethods?(m.value/totalMethods)*circumference:0;
+      const markup='<circle cx="60" cy="60" r="47" fill="none" stroke="'+m.color+'" stroke-width="14" stroke-dasharray="'+length.toFixed(2)+' '+(circumference-length).toFixed(2)+'" stroke-dashoffset="'+(-offset).toFixed(2)+'" transform="rotate(-90 60 60)"/>';
+      offset+=length;
+      return markup;
+    }).join('');
+    const dominant=methods.slice().sort((a,b)=>b.value-a.value)[0];
+    const dominantPct=totalMethods?Math.round(dominant.value/totalMethods*100):0;
+    const donut='<div class="perseo-donut-layout"><svg class="perseo-donut-svg" viewBox="0 0 120 120" role="img" aria-label="Distribución de métodos de pago">'+
+      '<circle cx="60" cy="60" r="47" fill="none" stroke="#e8eef6" stroke-width="14"/>'+rings+
+      '<text x="60" y="57" text-anchor="middle" fill="#142b4d" font-size="19" font-weight="800">'+dominantPct+'%</text>'+
+      '<text x="60" y="72" text-anchor="middle" fill="#718096" font-size="8">'+(totalMethods?esc(dominant.label):'Sin ventas')+'</text></svg>'+
+      '<div class="perseo-payment-legend">'+methods.map(m=>{
+        const pct=totalMethods?Math.round(m.value/totalMethods*100):0;
+        return '<div class="perseo-legend-row"><i style="background:'+m.color+'"></i><span>'+m.label+'</span><strong>'+money(m.value)+'</strong><small>'+pct+'%</small></div>';
+      }).join('')+'</div></div>';
+    const topProducts=(analytics.products||[]).slice(0,5);
+    const maxQty=Math.max(1,...topProducts.map(p=>Number(p.quantity)||0));
+    const productRows=topProducts.map(p=>{
+      const qty=Number(p.quantity)||0;
+      return '<div class="perseo-product-row"><div class="perseo-product-meta"><span>'+esc(p.name)+'</span><strong>'+qty+' uds.</strong></div><div class="perseo-product-track"><i style="width:'+Math.round(qty/maxQty*100)+'%"></i></div></div>';
+    }).join('')||'<div class="perseo-chart-empty">Aún no hay productos vendidos en este periodo.</div>';
+    charts='<div class="perseo-chart-grid">'+
+      '<section class="perseo-panel"><div class="perseo-panel-head"><div><span class="perseo-panel-kicker">RENDIMIENTO COMERCIAL</span><h3>Ventas últimos 30 días</h3><p>Ingresos registrados por fecha de cobro</p></div><span class="perseo-panel-badge">MXN</span></div>'+
+      chartSvg+(noSales?'<p class="perseo-chart-empty">Todavía no hay ventas registradas en este periodo.</p>':'')+'</section>'+
+      '<section class="perseo-panel"><div class="perseo-panel-head"><div><span class="perseo-panel-kicker">RESUMEN DE COBROS</span><h3>Métodos de pago</h3><p>Distribución de los ingresos recibidos</p></div></div>'+
+      donut+'</section></div>'+
+      '<section class="perseo-panel perseo-products-panel"><div class="perseo-panel-head"><div><span class="perseo-panel-kicker">DESEMPEÑO DEL CATÁLOGO</span><h3>Productos más vendidos</h3><p>Unidades registradas en comandas del periodo</p></div></div>'+
+      '<div class="perseo-products-list">'+productRows+'</div></section>';
+  }else{
+    metrics='<div class="statgrid">'+stat('Cuentas activas',data.active_accounts)+stat('Por cobrar',data.pending_accounts)+stat('Comandas nuevas',data.new_tickets)+stat('Productos',data.products)+'</div>';
+    charts='<section class="perseo-panel"><div class="perseo-panel-head"><div><span class="perseo-panel-kicker">CENTRO DE CONTROL</span><h3>Resumen operativo</h3><p>Las estadísticas comerciales detalladas están disponibles en el perfil Propietario.</p></div></div></section>';
+  }
+  return '<div class="perseo-dashboard">'+
+    '<section class="perseo-dashboard-intro"><div><span class="perseo-panel-kicker">PERSEO POS · CENTRO DE CONTROL</span><h2>Dashboard</h2><p>Resumen general del sistema POS. Consulta el rendimiento y accede a cada módulo.</p></div><span class="perseo-dashboard-live">● Sistema operativo</span></section>'+
+    metrics+charts+
+    '<section class="perseo-modules-section"><div class="perseo-section-heading"><div><span class="perseo-panel-kicker">GESTIÓN Y ADMINISTRACIÓN</span><h2>Módulos del sistema</h2><p>Accede a las herramientas de operación de tu negocio.</p></div></div>'+
+    '<div class="premium-shortcut-grid">'+shortcuts.map(([id,label,desc,drawing])=>'<button type="button" class="premium-shortcut" data-nav="'+id+'" aria-label="Abrir '+label+'"><span class="premium-shortcut-icon">'+icon(drawing)+'</span><strong>'+label+'</strong><small>'+desc+'</small><span class="premium-shortcut-arrow" aria-hidden="true">›</span></button>').join('')+'</div></section>'+
+    '<div class="grid2 premium-dashboard-footer"><div class="card"><h3>Operación en vivo</h3><p>Consulta cuentas abiertas y el estado de los pedidos.</p><button class="primary" data-nav="all">Supervisar cuentas</button></div><div class="card"><h3>Control de inventario</h3><p>Revisa existencias, productos bloqueados y reposiciones.</p><button class="outline" data-nav="inventory">Abrir inventario</button></div></div>'+
+  '</div>';
 }
 function formObj(form){return Object.fromEntries(new FormData(form).entries())}
 function ask(message){const v=prompt(message);return v&&v.trim()?v.trim():null}
