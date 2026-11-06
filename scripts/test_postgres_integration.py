@@ -30,6 +30,19 @@ with TestClient(app.app) as client:
     assert health.status_code==200 and health.json()=={"ok":True,"database":"ok"},health.text
     # create_all no debe modificar tablas ya existentes ni fallar al repetirse
     app.Base.metadata.create_all(app.engine)
+
+    # Simula el esquema previo en PostgreSQL y valida la migración aditiva real.
+    with app.engine.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX IF EXISTS uq_cash_movements_client_key")
+        conn.exec_driver_sql("ALTER TABLE cash_movements DROP COLUMN client_key")
+        for column in ("provider_accepted_at","attempt_count","next_attempt_at","last_error","delivered_at"):
+            conn.exec_driver_sql(f"ALTER TABLE ready_notification_events DROP COLUMN {column}")
+    app.bootstrap()
+    cash_columns={x["name"] for x in app.inspect(app.engine).get_columns("cash_movements")}
+    ready_columns={x["name"] for x in app.inspect(app.engine).get_columns("ready_notification_events")}
+    assert "client_key" in cash_columns
+    assert {"provider_accepted_at","attempt_count","next_attempt_at","last_error","delivered_at"} <= ready_columns
+
     with app.SessionLocal() as db:
         users = {}
         for role in ("waiter", "kitchen", "admin", "cashier"):
