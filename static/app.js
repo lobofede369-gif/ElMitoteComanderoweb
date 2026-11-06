@@ -6,7 +6,7 @@ const state={token:savedToken,user:null,screen:'',account:null,draft:[],products
 const workKey=()=>state.user?`mitote-work-${state.user.id}`:'';
 function persistWorkState(){if(!state.user)return;try{localStorage.setItem(workKey(),JSON.stringify({account:state.account,draft:state.draft}));}catch{}}
 function restoreWorkState(){if(!state.user)return;try{const saved=JSON.parse(localStorage.getItem(workKey())||'{}');state.account=Number(saved.account)||null;state.draft=Array.isArray(saved.draft)?saved.draft.filter(x=>x&&Number.isInteger(Number(x.product_id))&&Number(x.qty)>0).map(x=>({product_id:Number(x.product_id),name:String(x.name||''),station:x.station==='bar'?'bar':'kitchen',qty:Math.min(100,Number(x.qty)),note:String(x.note||'').slice(0,300),variant_id:x.variant_id?Number(x.variant_id):null,variant_name:String(x.variant_name||''),modifier_option_ids:Array.isArray(x.modifier_option_ids)?x.modifier_option_ids.map(Number):[],modifier_names:Array.isArray(x.modifier_names)?x.modifier_names.map(String):[],prep_minutes:Math.max(0,Math.min(240,Number(x.prep_minutes??15))),release_after_minutes:Math.max(0,Math.min(240,Number(x.release_after_minutes??0))),unit_price:Number(x.unit_price)||0,promotion_name:String(x.promotion_name||'')})):[];}catch{state.account=null;state.draft=[];}}
-const sections={waiter:[['accounts','▤','Mis cuentas'],['new','＋','Nueva cuenta'],['orders','♨','Comandas'],['notifications','🔔','Avisos']],kitchen:[['station','♨','Cocina'],['history','▤','Historial'],['notifications','🔔','Avisos']],bar:[['station','◉','Barra'],['history','▤','Historial'],['notifications','🔔','Avisos']],cashier:[['cashier','＄','Cobros'],['cash','▣','Caja']],admin:[['overview','▦','Resumen'],['all','▤','Cuentas'],['tables','▦','Mesas'],['approvals','✓','Autorizaciones'],['tickets','♨','Estaciones'],['cashier','＄','Cobros'],['cash','▣','Caja'],['tips','♧','Propinas'],['products','☷','Menú'],['inventory','▣','Inventario'],['users','♙','Personal'],['audit','≡','Auditoría'],['reservations','▣','Reservaciones'],['prepconfig','◷','Tiempos']],owner:[['overview','▦','Resumen'],['all','▤','Cuentas'],['tables','▦','Mesas'],['approvals','✓','Autorizaciones'],['tickets','♨','Estaciones'],['cashier','＄','Cobros'],['cash','▣','Caja'],['tips','♧','Propinas'],['products','☷','Menú'],['inventory','▣','Inventario'],['users','♙','Personal'],['audit','≡','Auditoría'],['reservations','▣','Reservaciones'],['prepconfig','◷','Tiempos'],['analytics','▥','Estadísticas']]};
+const sections={waiter:[['accounts','▤','Mis cuentas'],['new','＋','Nueva cuenta'],['orders','♨','Comandas'],['notifications','🔔','Avisos']],kitchen:[['station','♨','Cocina'],['history','▤','Historial'],['notifications','🔔','Avisos']],bar:[['station','◉','Barra'],['history','▤','Historial'],['notifications','🔔','Avisos']],cashier:[['cashier','＄','Cobros'],['cash','▣','Caja']],admin:[['overview','▦','Dashboard'],['all','▤','Cuentas'],['tables','▦','Mesas'],['approvals','✓','Autorizaciones'],['tickets','♨','Estaciones'],['cashier','＄','Cobros'],['cash','▣','Caja'],['tips','♧','Propinas'],['products','☷','Menú'],['inventory','▣','Inventario'],['users','♙','Personal'],['audit','≡','Auditoría'],['reservations','▣','Reservaciones'],['prepconfig','◷','Tiempos']],owner:[['overview','▦','Dashboard'],['all','▤','Cuentas'],['tables','▦','Mesas'],['approvals','✓','Autorizaciones'],['tickets','♨','Estaciones'],['cashier','＄','Cobros'],['cash','▣','Caja'],['tips','♧','Propinas'],['products','☷','Menú'],['inventory','▣','Inventario'],['users','♙','Personal'],['audit','≡','Auditoría'],['reservations','▣','Reservaciones'],['prepconfig','◷','Tiempos'],['analytics','▥','Estadísticas']]};
 const labels={owner:'Propietario',admin:'Administrador',cashier:'Caja',waiter:'Mesero',kitchen:'Cocina',bar:'Barra'};
 const statuses={open:'Abierta',pending:'Pendiente de cobro',paid:'Pagada',new:'Nueva',cancelled:'Anulada',merged:'Unida a otra cuenta',received:'Recibida',preparing:'Preparando',ready:'Lista',approved:'Aprobada',rejected:'Rechazada',occupied:'Ocupada',available:'Disponible',inactive:'Inactiva'};
 const money=n=>Number(n||0).toLocaleString('es-MX',{style:'currency',currency:'MXN'});
@@ -633,9 +633,14 @@ async function showOverview(){
   let analytics=null;
   if(state.user.role==='owner'){
     const now=new Date();
-    const localDate=d=>new Intl.DateTimeFormat('en-CA',{timeZone:'America/Mexico_City',year:'numeric',month:'2-digit',day:'2-digit'}).format(d);
+    const localDate=d=>{
+      const parts=new Intl.DateTimeFormat('en-US',{timeZone:'America/Mexico_City',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(d);
+      const values=Object.fromEntries(parts.map(part=>[part.type,part.value]));
+      return values.year+'-'+values.month+'-'+values.day;
+    };
     const end=localDate(now);
-    const start=localDate(new Date(now.getTime()-29*86400000));
+    const [year,month,day]=end.split('-').map(Number);
+    const start=new Date(Date.UTC(year,month-1,day-29)).toISOString().slice(0,10);
     try{
       analytics=await api('/owner/analytics?start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end)+'&scope=history');
     }catch(error){
@@ -682,7 +687,7 @@ async function showOverview(){
       kpi('Ventas últimos 30 días',money(analytics.sales),'Ingresos cobrados · MXN','chart')+
       kpi('Cuentas cobradas',String(analytics.paid_accounts||0),'Operaciones completadas','receipt')+
       kpi('Ticket promedio',money(analytics.average_ticket),'Promedio por cuenta','wallet')+
-      kpi('Productos activos',String(data.products||0),'Catálogo disponible','box')+
+      kpi('Productos en catálogo',String(data.products||0),'Productos no archivados','box')+
       '</div>';
     const rows=(analytics.sales_by_day||[]).slice(-30).map(x=>({label:String(x.label||''),value:Number(x.amount)||0}));
     const chartW=760,chartH=250,left=58,right=744,top=18,bottom=190;
@@ -746,13 +751,14 @@ async function showOverview(){
       '<section class="perseo-panel"><div class="perseo-panel-head"><div><span class="perseo-panel-kicker">RESUMEN DE COBROS</span><h3>Métodos de pago</h3><p>Distribución de los ingresos recibidos</p></div></div>'+
       donut+'</section></div>'+
       '<section class="perseo-panel perseo-products-panel"><div class="perseo-panel-head"><div><span class="perseo-panel-kicker">DESEMPEÑO DEL CATÁLOGO</span><h3>Productos más vendidos</h3><p>Unidades registradas en comandas del periodo</p></div></div>'+
-      '<div class="perseo-products-list">'+productRows+'</div></section>';
+      '<div class="perseo-products-list">'+productRows+'</div></section>'+
+      '<p class="perseo-data-note">'+esc(analytics.note||'Los cobros se agrupan por fecha de pago y los productos por fecha de comanda.')+'</p>';
   }else{
     metrics='<div class="statgrid">'+stat('Cuentas activas',data.active_accounts)+stat('Por cobrar',data.pending_accounts)+stat('Comandas nuevas',data.new_tickets)+stat('Productos',data.products)+'</div>';
     charts='<section class="perseo-panel"><div class="perseo-panel-head"><div><span class="perseo-panel-kicker">CENTRO DE CONTROL</span><h3>Resumen operativo</h3><p>Las estadísticas comerciales detalladas están disponibles en el perfil Propietario.</p></div></div></section>';
   }
   return '<div class="perseo-dashboard">'+
-    '<section class="perseo-dashboard-intro"><div><span class="perseo-panel-kicker">PERSEO POS · CENTRO DE CONTROL</span><h2>Dashboard</h2><p>Resumen general del sistema POS. Consulta el rendimiento y accede a cada módulo.</p></div><span class="perseo-dashboard-live">● Sistema operativo</span></section>'+
+    '<section class="perseo-dashboard-intro"><div><span class="perseo-panel-kicker">PERSEO POS · CENTRO DE CONTROL</span><h2>Tu operación, de un vistazo</h2><p>Resumen general del sistema POS. Consulta el rendimiento y accede a cada módulo.</p></div><span class="perseo-dashboard-live">● Sistema operativo</span></section>'+
     metrics+charts+
     '<section class="perseo-modules-section"><div class="perseo-section-heading"><div><span class="perseo-panel-kicker">GESTIÓN Y ADMINISTRACIÓN</span><h2>Módulos del sistema</h2><p>Accede a las herramientas de operación de tu negocio.</p></div></div>'+
     '<div class="premium-shortcut-grid">'+shortcuts.map(([id,label,desc,drawing])=>'<button type="button" class="premium-shortcut" data-nav="'+id+'" aria-label="Abrir '+label+'"><span class="premium-shortcut-icon">'+icon(drawing)+'</span><strong>'+label+'</strong><small>'+desc+'</small><span class="premium-shortcut-arrow" aria-hidden="true">›</span></button>').join('')+'</div></section>'+

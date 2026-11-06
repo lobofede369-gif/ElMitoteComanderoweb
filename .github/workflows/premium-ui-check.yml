@@ -42,8 +42,8 @@ jobs:
           sw = Path('static/sw.js').read_text(encoding='utf-8')
           assert '/static/theme-obsidian-titanium.css?v=1' in html
           assert '/static/theme-obsidian-modules.css?v=2' in html
-          assert '/static/app.js?v=30' in html
-          assert '/static/app.js?v=30' in sw
+          assert '/static/app.js?v=32' in html
+          assert '/static/app.js?v=32' in sw
           assert 'function setConnectionState(connected)' in app
           assert "syncWaiterReadyAlerts" in app
           assert '/static/cash-receipt.css?v=1' in html
@@ -59,7 +59,7 @@ jobs:
           waiter = Path('static/pos-ui-v3.js').read_text(encoding='utf-8')
           assert '/static/theme-service-fast.css?v=2' in html
           assert '/static/theme-service-fast.css?v=2' in sw
-          assert 'perseo-pos-demo-v2' in sw
+          assert 'perseo-pos-demo-v4' in sw
           assert 'pos-search' in waiter and 'applyCatalogFilter()' in waiter
           assert 'obs.observe(content,{childList:true});' in waiter
           assert 'subtree:true' not in waiter
@@ -81,6 +81,17 @@ jobs:
           assert 'prefers-reduced-motion' in fast
           assert '#login[hidden],#app[hidden]' in css
           assert 'premium-shortcut-grid' in modules
+          dashboard = Path('static/perseo-dashboard.css').read_text(encoding='utf-8')
+          assert '/static/perseo-dashboard.css?v=2' in html
+          assert '/static/perseo-dashboard.css?v=2' in sw
+          assert 'perseo-pos-demo-v4' in sw
+          assert "['overview','▦','Dashboard']" in app
+          assert 'Productos en catálogo' in app
+          assert 'formatToParts' in app
+          assert '--pos-yellow:#1769e8' in dashboard
+          assert '#content>.section,.section' in dashboard
+          assert 'body:not(.pos-waiter) .navbtn' in dashboard
+          assert dashboard.count('{') == dashboard.count('}')
           assert 'function showOverview()' in app
           for section in ('all', 'tables', 'tickets', 'cashier', 'cash',
                           'products', 'inventory', 'users', 'tips', 'approvals', 'audit'):
@@ -90,7 +101,7 @@ jobs:
                        'showProducts', 'showInventory', 'showUsers',
                        'showApprovals', 'showAudit', 'showOverview'):
               assert 'function '+name+'(' in app, name
-          for path in (Path('static/theme-obsidian-titanium.css'), Path('static/theme-obsidian-modules.css'), Path('static/theme-luxury-motion.css'), Path('static/theme-service-fast.css'), Path('static/theme-pin-login.css')):
+          for path in (Path('static/perseo-dashboard.css'), Path('static/theme-obsidian-titanium.css'), Path('static/theme-obsidian-modules.css'), Path('static/theme-luxury-motion.css'), Path('static/theme-service-fast.css'), Path('static/theme-pin-login.css')):
               text = path.read_text(encoding='utf-8')
               assert text.count('{') == text.count('}'), path
           assert "const canEditAccount=state.user?.role==='owner'" in app
