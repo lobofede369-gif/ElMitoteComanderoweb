@@ -15,6 +15,8 @@ import app
 from fastapi.testclient import TestClient
 
 with TestClient(app.app) as client:
+    health=client.get("/api/health")
+    assert health.status_code==200 and health.json()=={"ok":True,"database":"ok"},health.text
     login=client.post("/api/login",json={"username":"dueno_pruebas","secret":"ClaveAnterior_Dueno_2026!"})
     assert login.status_code==200,login.text
     token=login.json()["token"]
@@ -48,6 +50,19 @@ with TestClient(app.app) as client:
 
     opening=client.post("/api/cash/open",headers=headers,json={"opening":"100.00"})
     assert opening.status_code==200,opening.text
+    duplicate_open=client.post("/api/cash/open",headers=headers,json={"opening":"200.00"})
+    assert duplicate_open.status_code==409,duplicate_open.text
+    # La restricción también vive en PostgreSQL/SQLite: no depende solo del endpoint.
+    with app.SessionLocal() as db:
+        db.add(app.CashPeriod(opening_cents=5000))
+        try:
+            db.commit()
+        except app.IntegrityError:
+            db.rollback()
+        else:
+            raise AssertionError("La base permitió dos turnos de caja abiertos")
+        assert db.scalar(app.select(app.func.count(app.CashPeriod.id)).where(
+            app.CashPeriod.closed_at.is_(None)))==1
     product_payload={"name":"Producto auditado","category":"Pruebas","station":"kitchen",
                      "price":"10.00","stock":3,"inventory_enabled":True}
     created=client.post("/api/products",headers=headers,json=product_payload)
