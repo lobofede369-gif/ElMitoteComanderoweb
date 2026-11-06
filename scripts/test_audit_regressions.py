@@ -135,8 +135,10 @@ with TestClient(app.app) as client:
         closed_account=client.post(f"/api/accounts/{aid}/close",headers=headers,json={})
         assert closed_account.status_code==200,closed_account.text
     shift=client.post("/api/cash/close",headers=headers,json={
-        "counted":"120.00","note":"Turno <detalle & información> validado"})
+        "counted":"125.00","note":"Turno <detalle & información> validado"})
     assert shift.status_code==200,shift.text
+    movement_after_close=client.post("/api/cash/movements",headers=headers,json=movement_payload)
+    assert movement_after_close.status_code==200 and movement_after_close.json()["duplicate"],movement_after_close.text
     report=client.get(f"/api/cash/periods/{shift.json()['id']}/report.pdf",headers=headers)
     assert report.status_code==200 and report.content.startswith(b"%PDF"),report.text[:200]
 
