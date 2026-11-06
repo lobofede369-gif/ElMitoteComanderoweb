@@ -3,6 +3,7 @@
 Prueba offline con SQLite efímero. No toca Render ni envía push reales.
 """
 import os
+import asyncio
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -20,10 +21,17 @@ from fastapi.testclient import TestClient
 
 web_calls=[]
 fcm_calls=[]
+failure={'active':False}
 async def mock_web(payload,role=None,user_id=None):
     web_calls.append((payload,role,user_id))
+    if failure['active']:
+        return {'enabled':True,'devices':1,'sent':0,'failed':1,'error':'fallo simulado'}
+    return {'enabled':True,'devices':1,'sent':1,'failed':0,'error':None}
 async def mock_fcm(payload,role=None,user_id=None):
     fcm_calls.append((payload,role,user_id))
+    if failure['active']:
+        return {'enabled':True,'devices':1,'sent':0,'failed':1,'error':'fallo simulado'}
+    return {'enabled':True,'devices':1,'sent':1,'failed':0,'error':None}
 app.push_to=mock_web
 app.fcm_to=mock_fcm
 
@@ -76,6 +84,8 @@ with TestClient(app.app) as client:
     assert event.status_code==200,event.text
     assert len(event.json())==1 and event.json()[0]["station"]=="kitchen"
     assert event.json()[0]["complete"] is False
+    assert event.json()[0]["acknowledged"] is False
+    assert event.json()[0]["delivered"] is False
     assert get("other_waiter","/api/waiter/ready-alerts").json()==[]
     assert len([x for x in web_calls if x[1]=="waiter"])==1
     assert web_calls[-1][0]["kind"]=="ready_station"
@@ -128,6 +138,8 @@ with TestClient(app.app) as client:
         assert len(rows)==3,rows
         assert len({e.event_key for e in rows})==3
         assert all(e.attempted_at is not None for e in rows)
+        assert all(e.provider_accepted_at is not None for e in rows)
+        assert all(e.attempt_count==1 for e in rows)
         first_event_id=rows[0].id
         remaining_ids=[e.id for e in rows[1:]]
     app.bootstrap()
@@ -139,18 +151,70 @@ with TestClient(app.app) as client:
     assert ack.status_code==200,ack.text
     again=post("waiter",f"/api/waiter/ready-alerts/{first_event_id}/ack",{})
     assert again.status_code==200 and again.json()["duplicate"]
+    still_pending=get("waiter","/api/waiter/ready-alerts").json()
+    assert len(still_pending)==3
+    first_row=next(x for x in still_pending if x["event_id"]==first_event_id)
+    assert first_row["acknowledged"] is True and first_row["delivered"] is False
+    assert post("waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/deliver",{}).status_code==409
+    delivered=post("waiter",f"/api/waiter/ready-alerts/{first_event_id}/deliver",{})
+    assert delivered.status_code==200 and delivered.json()["delivered"]
+    delivered_again=post("waiter",f"/api/waiter/ready-alerts/{first_event_id}/deliver",{})
+    assert delivered_again.status_code==200 and delivered_again.json()["duplicate"]
     assert len(get("waiter","/api/waiter/ready-alerts").json())==2
 
-    # Cambio de mesero: las pendientes pasan al nuevo responsable.
+    # Un aviso ya recibido pero aún no entregado también debe reasignarse.
+    ack_before_transfer=post("waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/ack",{})
+    assert ack_before_transfer.status_code==200
+    before_web=len(web_calls);before_fcm=len(fcm_calls)
     transfer=post("owner",f"/api/accounts/{aid}/reassign",{
         "owner_id":users["other_waiter"],"reason":"Cambio de responsable de mesa"})
     assert transfer.status_code==200,transfer.text
+    assert transfer.json()["notifications_reassigned"]==2
     assert get("waiter","/api/waiter/ready-alerts").json()==[]
     pending=get("other_waiter","/api/waiter/ready-alerts")
     assert pending.status_code==200 and len(pending.json())==2,pending.text
+    assert all(not x["acknowledged"] and not x["delivered"] for x in pending.json())
+    assert len(web_calls)==before_web+2 and len(fcm_calls)==before_fcm+2
+    assert all(x[2]==users["other_waiter"] for x in web_calls[-2:])
+    assert all(x[2]==users["other_waiter"] for x in fcm_calls[-2:])
+    assert all(x[0]["recipient_id"]==str(users["other_waiter"]) for x in fcm_calls[-2:])
     assert post("waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/ack",{}).status_code==403
+
+    # Si ambos transportes fallan, el outbox conserva el evento y reintenta.
+    retry_event_id=remaining_ids[1]
+    with app.SessionLocal() as db:
+        retry_row=db.get(app.ReadyNotificationEvent,retry_event_id)
+        retry_row.provider_accepted_at=None
+        retry_row.attempted_at=None
+        retry_row.attempt_count=0
+        retry_row.next_attempt_at=None
+        retry_row.last_error=None
+        db.commit()
+    failure['active']=True
+    asyncio.run(app.dispatch_ready_notification(retry_event_id))
+    with app.SessionLocal() as db:
+        retry_row=db.get(app.ReadyNotificationEvent,retry_event_id)
+        assert retry_row.attempt_count==1
+        assert retry_row.provider_accepted_at is None
+        assert retry_row.next_attempt_at is not None
+        assert retry_row.last_error
+        retry_row.next_attempt_at=app.now()-timedelta(seconds=1)
+        db.commit()
+    failure['active']=False
+    asyncio.run(app.dispatch_ready_notification(retry_event_id))
+    with app.SessionLocal() as db:
+        retry_row=db.get(app.ReadyNotificationEvent,retry_event_id)
+        assert retry_row.attempt_count==2
+        assert retry_row.provider_accepted_at is not None
+        assert retry_row.next_attempt_at is None
+
+    # El nuevo mesero confirma recepción y luego entrega al cliente.
     assert post("other_waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/ack",{}).status_code==200
+    assert post("other_waiter",f"/api/waiter/ready-alerts/{remaining_ids[0]}/deliver",{}).status_code==200
     assert len(get("other_waiter","/api/waiter/ready-alerts").json())==1
+    assert post("other_waiter",f"/api/waiter/ready-alerts/{remaining_ids[1]}/ack",{}).status_code==200
+    assert post("other_waiter",f"/api/waiter/ready-alerts/{remaining_ids[1]}/deliver",{}).status_code==200
+    assert get("other_waiter","/api/waiter/ready-alerts").json()==[]
 
     with app.SessionLocal() as db:
         period=db.scalar(app.select(app.CashPeriod).where(app.CashPeriod.closed_at.is_(None)))
@@ -165,5 +229,9 @@ assert "Pedidos pendientes de entregar" in js
 assert "beep('ready')" in js
 assert "window.MitoteAndroid" in js
 assert "case 'ack-ready':" in js
-print("OK: mesero correcto, cocina, barra, pedido completo, idempotencia, pantalla, sonido y turno activo")
+assert "case 'deliver-ready':" in js
+assert "Pendiente de confirmar recepción" in js
+assert "Recibido · pendiente de entrega" in js
+assert "✓ Recibido" in js and "✓ Entregado" in js
+print("OK: sonido, eventos persistentes, reintentos, recepción, entrega, reasignación y deduplicación")
 dbfile.unlink(missing_ok=True)
