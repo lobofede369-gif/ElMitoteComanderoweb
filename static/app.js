@@ -1032,7 +1032,7 @@ async function syncWaiterReadyAlerts(initial=false){
     state.data.readyAlerts=items;
     try{sessionStorage.setItem(userKey,JSON.stringify([...state.waiterReadySeen].slice(-180)))}catch{}
     // Actualizar solo el panel de avisos; no volver a cargar las cuentas.
-    if(initial&&state.screen==='accounts'){
+    if(state.screen==='accounts'){
       const panel=$('.waiter-ready-card');
       if(panel)panel.outerHTML=waiterReadyAlertsHtml();
     }
