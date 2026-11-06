@@ -26,6 +26,8 @@ import mitote_extensions as ext
 from fastapi.testclient import TestClient
 
 with TestClient(app.app) as client:
+    health=client.get("/api/health")
+    assert health.status_code==200 and health.json()=={"ok":True,"database":"ok"},health.text
     # create_all no debe modificar tablas ya existentes ni fallar al repetirse
     app.Base.metadata.create_all(app.engine)
     with app.SessionLocal() as db:
@@ -53,6 +55,16 @@ with TestClient(app.app) as client:
         db.commit()
         product_id = db.scalar(app.select(app.Product.id))
         table_id = db.scalar(app.select(app.DiningTable.id))
+
+    # La restricción parcial también debe impedir dos turnos abiertos en PostgreSQL.
+    with app.SessionLocal() as db:
+        db.add(app.CashPeriod(opening_cents=100))
+        try:
+            db.commit()
+        except app.IntegrityError:
+            db.rollback()
+        else:
+            raise AssertionError("PostgreSQL permitió dos turnos de caja abiertos")
 
     def bearer_user(user_id):
         token = app.jwt.encode({"sub": str(user_id), "ver": 1,

@@ -282,13 +282,18 @@ async function render(options={}){
 function waiterReadyAlertsHtml(){
   const ready=state.data.readyAlerts||[];
   return '<div class="card waiter-ready-card"><div class="row"><h3>🔔 Pedidos pendientes de entregar</h3><button class="outline small" data-action="enable-sound">♪ Probar sonido</button></div>'+
-    (ready.length?ready.slice(0,14).map(x=>'<div class="lineitem row"><div><b>'+
-      esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+
-      '</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+
-      (x.complete?' · Todas las estaciones listas':'')+
-      '</div></div><div class="row"><button class="outline small" data-action="open-account" data-id="'+
-      Number(x.account_id)+'">Ver cuenta</button><button class="primary small" data-action="ack-ready" data-id="'+
-      Number(x.event_id)+'">✓ Entregado</button></div></div>').join(''):
+    (ready.length?ready.slice(0,14).map(x=>{
+      const status=x.acknowledged?'Recibido · pendiente de entrega':'Pendiente de confirmar recepción';
+      const action=x.acknowledged?'deliver-ready':'ack-ready';
+      const label=x.acknowledged?'✓ Entregado':'✓ Recibido';
+      return '<div class="lineitem row"><div><b>'+
+        esc(x.complete?'✅ Pedido completo':'✓ '+x.station_name+' lista')+
+        '</b><div class="mini">'+esc(x.account)+' · Comanda #'+Number(x.batch_id)+
+        (x.complete?' · Todas las estaciones listas':'')+
+        '</div><div class="mini">'+status+'</div></div><div class="row"><button class="outline small" data-action="open-account" data-id="'+
+        Number(x.account_id)+'">Ver cuenta</button><button class="primary small" data-action="'+action+'" data-id="'+
+        Number(x.event_id)+'">'+label+'</button></div></div>';
+    }).join(''):
       '<p class="mini">No tienes avisos pendientes de entregar en este turno.</p>')+'</div>';
 }
 async function showAccounts(all){
@@ -685,8 +690,16 @@ case 'push-disable':await disablePush();await render();break;
 case 'ack-ready':{
   if(!Number.isInteger(id)||id<1)throw Error('Aviso inválido');
   await api('/waiter/ready-alerts/'+id+'/ack','POST',{});
+  state.data.readyAlerts=(state.data.readyAlerts||[]).map(x=>x.event_id===id?{...x,acknowledged:true,received_at:new Date().toISOString()}:x);
+  toast('Recepción confirmada. Marca Entregado cuando lo hayas llevado a la mesa.');
+  await render();
+  break;
+}
+case 'deliver-ready':{
+  if(!Number.isInteger(id)||id<1)throw Error('Aviso inválido');
+  await api('/waiter/ready-alerts/'+id+'/deliver','POST',{});
   state.data.readyAlerts=(state.data.readyAlerts||[]).filter(x=>x.event_id!==id);
-  toast('Entrega confirmada');
+  toast('Entrega al cliente confirmada y registrada');
   await render();
   break;
 }
@@ -871,7 +884,7 @@ case 'account-split-form':{
   break;
 }
 case 'table-add':await api('/tables','POST',{name:d.name,area:d.area,capacity:Number(d.capacity),sort_order:Number(d.sort_order||0),active:true});toast('Mesa registrada');await render();break;case 'ticket-lookup':{const a=await api('/accounts/'+Number(d.id));$('#content').innerHTML=`<button class="outline small" data-nav="cashier">← Volver</button><div class="card"><h3>Ticket #${a.id} · ${esc(a.name)}</h3><p>${pill(a.status)} · Total ${money(a.total)} · Pagado ${money(a.paid)}</p><div class="inline"><button class="outline" data-action="download-ticket" data-id="${a.id}">Descargar PDF</button><button class="outline" data-action="share-ticket" data-id="${a.id}">Compartir por WhatsApp</button></div></div>`;break}case 'new-account':{const tableId=d.table_id?Number(d.table_id):null;const name=(d.name||'').trim();const payload={name,table_id:tableId};const scope='account-create';const client_key=pendingOperationKey(scope,payload);const r=await api('/accounts','POST',{...payload,client_key});clearPendingOperation(scope);state.account=r.id;state.draft=[];persistWorkState();toast(r.duplicate?'Cuenta ya registrada; no se duplicó':tableId?'Cuenta abierta en '+(state.data.tables||[]).find(t=>t.id===tableId)?.name:'Cuenta libre creada');await go('orders',{replace:true});break}case 'reassign-form':{const accountId=Number(d.account_id);await api(`/accounts/${accountId}/reassign`,'POST',{owner_id:Number(d.owner_id),reason:d.reason});toast('Cuenta reasignada');await refreshAccountPanel(accountId,true);break}case 'discount-form':{const accountId=Number(state.data.currentAccount?.id);if(!accountId)throw Error('No hay una cuenta seleccionada');const payload={scope:d.scope,mode:d.mode,value:d.value,reason:d.reason,...(d.scope==='item'?{item_id:Number(d.item_id)}:{})};if(d.scope==='item'&&!payload.item_id)throw Error('Selecciona el producto');await api(`/accounts/${accountId}/discounts`,'POST',payload);toast('Descuento aplicado y auditado');await render();break}
-case 'pay-form':{const a=state.data.currentAccount;const methods=['cash','card','transfer'];const lines=methods.filter(x=>Number(d[x])>0).map(x=>({method:x,amount:d[x],tip:d[x+'_tip']||'0',...(x==='cash'&&Number(d.received)>0?{received:d.received}:{})}));if(!lines.length)throw Error('Escribe al menos un importe de consumo');for(const method of methods){if(Number(d[method+'_tip']||0)>0&&Number(d[method]||0)<=0)throw Error(`Registra primero un importe de consumo en ${method==='cash'?'efectivo':method==='card'?'tarjeta':'transferencia'} para asociar esa propina`)}let allocations=[];if(d.split_mode==='products'){allocations=$$('.allocation-qty').filter(x=>Number(x.value)>0).map(x=>({item_id:Number(x.dataset.item),qty:Number(x.value)}));if(!allocations.length)throw Error('Selecciona productos');const expected=allocations.reduce((s,x)=>{const el=$(`.allocation-qty[data-item="${x.item_id}"]`);return s+x.qty*Number(el.dataset.price)},0);const got=lines.reduce((s,x)=>s+Math.round(Number(x.amount)*100),0);if(Math.round(expected*100)!==got)throw Error(`Los productos elegidos suman ${money(expected)}; ajusta los métodos de pago`)}if(!confirm('¿Confirmar el pago y registrar las propinas por separado?'))return;const scope='payment-'+a.id;const payload={lines,allocations};const client_key=pendingOperationKey(scope,payload);const result=await api(`/accounts/${a.id}/payments`,'POST',{client_key,...payload});clearPendingOperation(scope);toast(result.duplicate?'Pago ya registrado; no se duplicó':'Pago y propinas registrados');await render();break}case 'cash-movement':await api('/cash/movements','POST',{kind:d.kind,amount:d.amount,reason:d.reason});toast('Movimiento registrado o solicitado');await render();break;case 'cash-close':if(!confirm('¿Confirmar corte general? El periodo quedará cerrado y no podrá modificarse.'))return;await api('/cash/close','POST',{counted:d.counted,note:d.note});toast('Corte cerrado y archivado con su PDF. Ventas anteriores fuera de las vistas activas.');await render();break;case 'cash-open':await api('/cash/open','POST',{opening:d.opening});toast('Periodo de caja abierto');await render();break;case 'product-add':await api('/products','POST',{name:d.name,category:d.category||'General',station:d.station,price:d.price,stock:Number(d.stock||0),inventory_enabled:form.querySelector('[name="inventory_enabled"]').checked});toast('Producto creado');await render();break;
+case 'pay-form':{const a=state.data.currentAccount;const methods=['cash','card','transfer'];const lines=methods.filter(x=>Number(d[x])>0).map(x=>({method:x,amount:d[x],tip:d[x+'_tip']||'0',...(x==='cash'&&Number(d.received)>0?{received:d.received}:{})}));if(!lines.length)throw Error('Escribe al menos un importe de consumo');for(const method of methods){if(Number(d[method+'_tip']||0)>0&&Number(d[method]||0)<=0)throw Error(`Registra primero un importe de consumo en ${method==='cash'?'efectivo':method==='card'?'tarjeta':'transferencia'} para asociar esa propina`)}let allocations=[];if(d.split_mode==='products'){allocations=$$('.allocation-qty').filter(x=>Number(x.value)>0).map(x=>({item_id:Number(x.dataset.item),qty:Number(x.value)}));if(!allocations.length)throw Error('Selecciona productos');const expected=allocations.reduce((s,x)=>{const el=$(`.allocation-qty[data-item="${x.item_id}"]`);return s+x.qty*Number(el.dataset.price)},0);const got=lines.reduce((s,x)=>s+Math.round(Number(x.amount)*100),0);if(Math.round(expected*100)!==got)throw Error(`Los productos elegidos suman ${money(expected)}; ajusta los métodos de pago`)}if(!confirm('¿Confirmar el pago y registrar las propinas por separado?'))return;const scope='payment-'+a.id;const payload={lines,allocations};const client_key=pendingOperationKey(scope,payload);const result=await api(`/accounts/${a.id}/payments`,'POST',{client_key,...payload});clearPendingOperation(scope);toast(result.duplicate?'Pago ya registrado; no se duplicó':'Pago y propinas registrados');await render();break}case 'cash-movement':{const payload={kind:d.kind,amount:d.amount,reason:d.reason};const client_key=pendingOperationKey('cash-movement',payload);const result=await api('/cash/movements','POST',{...payload,client_key});clearPendingOperation('cash-movement');toast(result.duplicate?'Movimiento ya registrado; no se duplicó':'Movimiento registrado o solicitado');await render();break;}case 'cash-close':if(!confirm('¿Confirmar corte general? El periodo quedará cerrado y no podrá modificarse.'))return;await api('/cash/close','POST',{counted:d.counted,note:d.note});toast('Corte cerrado y archivado con su PDF. Ventas anteriores fuera de las vistas activas.');await render();break;case 'cash-open':await api('/cash/open','POST',{opening:d.opening});toast('Periodo de caja abierto');await render();break;case 'product-add':await api('/products','POST',{name:d.name,category:d.category||'General',station:d.station,price:d.price,stock:Number(d.stock||0),inventory_enabled:form.querySelector('[name="inventory_enabled"]').checked});toast('Producto creado');await render();break;
 case (form.id.startsWith('variant-add-')?form.id:'__no-variant__'):{const productId=Number(form.id.slice('variant-add-'.length));await api(`/products/${productId}/variants`,'POST',{name:d.name,price:d.price,active:true,sort_order:0});toast('Presentación agregada');await render();break;}
 case (form.id.startsWith('modifier-group-add-')?form.id:'__no-group__'):{const productId=Number(form.id.slice('modifier-group-add-'.length));const min=Number(d.min_select||0),max=Number(d.max_select||1);if(min>max)throw Error('El mínimo no puede superar al máximo');await api(`/products/${productId}/modifier-groups`,'POST',{name:d.name,min_select:min,max_select:max,active:true,sort_order:0});toast('Grupo de modificadores creado');await render();break;}
 case (form.id.startsWith('modifier-option-add-')?form.id:'__no-option__'):{const groupId=Number(form.id.slice('modifier-option-add-'.length));await api(`/modifier-groups/${groupId}/options`,'POST',{name:d.name,price_delta:d.price_delta||'0',active:true,sort_order:0});toast('Opción agregada');await render();break;}
@@ -1019,7 +1032,7 @@ async function syncWaiterReadyAlerts(initial=false){
     state.data.readyAlerts=items;
     try{sessionStorage.setItem(userKey,JSON.stringify([...state.waiterReadySeen].slice(-180)))}catch{}
     // Actualizar solo el panel de avisos; no volver a cargar las cuentas.
-    if(initial&&state.screen==='accounts'){
+    if(state.screen==='accounts'){
       const panel=$('.waiter-ready-card');
       if(panel)panel.outerHTML=waiterReadyAlertsHtml();
     }
