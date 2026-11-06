@@ -341,6 +341,7 @@ class CashCutArchive(Base):
 class CashMovement(Base):
     __tablename__='cash_movements'
     id=Column(Integer,primary_key=True)
+    client_key=Column(String(100),nullable=True)
     period_id=Column(Integer,ForeignKey('cash_periods.id'),nullable=False)
     requester_id=Column(Integer,ForeignKey('users.id'),nullable=False)
     approved_by=Column(Integer,ForeignKey('users.id'))
@@ -445,6 +446,7 @@ PERFORMANCE_INDEXES = (
     Index('ix_batches_account_id', Batch.account_id),
     Index('ix_order_items_batch_id', OrderItem.batch_id),
     Index('ix_payments_account_id', Payment.account_id),
+    Index('uq_cash_movements_client_key', CashMovement.client_key, unique=True),
     # Una sola caja abierta incluso si dos administradores intentan abrirla a la vez.
     # El índice usa una expresión constante porque NULLs distintos no se comparan
     # como duplicados en un índice único convencional.
@@ -468,6 +470,9 @@ def bootstrap():
     # Migración aditiva y compatible con SQLite/PostgreSQL. Los eventos existentes
     # con acknowledged_at ya representan entregas confirmadas en la UI anterior.
     with engine.begin() as conn:
+        cash_movement_columns={column['name'] for column in inspect(conn).get_columns('cash_movements')}
+        if 'client_key' not in cash_movement_columns:
+            conn.exec_driver_sql('ALTER TABLE cash_movements ADD COLUMN client_key VARCHAR(100) NULL')
         columns={column['name'] for column in inspect(conn).get_columns('ready_notification_events')}
         additions={
             'provider_accepted_at':'TIMESTAMP WITH TIME ZONE NULL',
@@ -2919,12 +2924,56 @@ def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
             'expected':amount(expected),'movements':[{'id':m.id,'kind':m.kind,'amount':amount(m.cents),'reason':m.reason,'status':m.status} for m in moves],
             'blocking_count':int(blocking_count),'blocking_accounts':blocking_data,
             'can_close':blocking_count==0 and not any(m.status=='pending' for m in moves)}
-class MovementIn(BaseModel):kind:Literal['in','out'];amount:Decimal=Field(gt=0);reason:str=Field(min_length=3,max_length=400)
+class MovementIn(BaseModel):
+    kind:Literal['in','out']
+    amount:Decimal=Field(gt=0)
+    reason:str=Field(min_length=3,max_length=400)
+    client_key:Optional[str]=Field(default=None,min_length=8,max_length=100)
+
 @app.post('/api/cash/movements')
 async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depends(auth)):
-    allow(user,'owner','admin','cashier');p=active_period(db)
-    m=CashMovement(period_id=p.id,requester_id=user.id,kind=data.kind,cents=cents(data.amount),reason=data.reason,status='approved' if user.role in ('owner','admin') else 'pending',approved_by=user.id if user.role in ('owner','admin') else None)
-    db.add(m);audit(db,user,'cash.movement.request',kind=m.kind,cents=m.cents);db.commit();await notify();return {'id':m.id,'status':m.status}
+    allow(user,'owner','admin','cashier')
+    movement_cents=cents(data.amount)
+    reason=data.reason.strip()
+    client_key=(data.client_key or '').strip() or None
+
+    def duplicate_result():
+        if not client_key:
+            return None
+        existing=db.scalar(select(CashMovement).where(CashMovement.client_key==client_key))
+        if not existing:
+            return None
+        same=(existing.requester_id==user.id and existing.kind==data.kind and
+              existing.cents==movement_cents and existing.reason==reason)
+        if not same:
+            raise HTTPException(409,'La clave de movimiento ya fue utilizada con otros datos.')
+        return {'id':existing.id,'status':existing.status,'duplicate':True}
+
+    previous=duplicate_result()
+    if previous:
+        return previous
+    p=active_period(db)
+    # Segunda lectura después del bloqueo del turno: dos reintentos simultáneos
+    # con la misma clave devuelven un solo movimiento, nunca dos salidas/entradas.
+    previous=duplicate_result()
+    if previous:
+        return previous
+    m=CashMovement(client_key=client_key,period_id=p.id,requester_id=user.id,
+        kind=data.kind,cents=movement_cents,reason=reason,
+        status='approved' if user.role in ('owner','admin') else 'pending',
+        approved_by=user.id if user.role in ('owner','admin') else None)
+    db.add(m)
+    audit(db,user,'cash.movement.request',kind=m.kind,cents=m.cents,client_key=client_key)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        previous=duplicate_result()
+        if previous:
+            return previous
+        raise HTTPException(409,'No se pudo registrar el movimiento. Actualiza e inténtalo de nuevo.')
+    await notify()
+    return {'id':m.id,'status':m.status,'duplicate':False}
 class MoveDecision(BaseModel):approve:bool
 @app.post('/api/cash/movements/{movement_id}/decide')
 async def move_decide(movement_id:int,data:MoveDecision,db:Session=Depends(db_session),user:User=Depends(auth)):
