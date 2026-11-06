@@ -145,6 +145,10 @@ with TestClient(app.app) as client:
     app.bootstrap()
     with app.SessionLocal() as db:
         assert len(list(db.scalars(app.select(app.ReadyNotificationEvent))))==3
+        # Reiniciar/bootstrap no debe borrar la aceptación del proveedor ni reiniciar reintentos.
+        persisted=db.get(app.ReadyNotificationEvent,first_event_id)
+        assert persisted.provider_accepted_at is not None
+        assert persisted.attempt_count==1
 
     assert post("other_waiter",f"/api/waiter/ready-alerts/{first_event_id}/ack",{}).status_code==403
     ack=post("waiter",f"/api/waiter/ready-alerts/{first_event_id}/ack",{})
