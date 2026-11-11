@@ -439,6 +439,30 @@ class Audit(Base):
     detail=Column(Text,default='{}')
     created_at=Column(DateTime(timezone=True),default=now)
 
+class InventoryMovement(Base):
+    """Ledger inmutable de movimientos de existencias por producto terminado."""
+    __tablename__='inventory_movements'
+    id=Column(Integer,primary_key=True)
+    product_id=Column(Integer,ForeignKey('products.id'),nullable=False,index=True)
+    actor_id=Column(Integer,ForeignKey('users.id'),nullable=True)
+    account_id=Column(Integer,ForeignKey('accounts.id'),nullable=True,index=True)
+    batch_id=Column(Integer,ForeignKey('batches.id'),nullable=True)
+    order_item_id=Column(Integer,ForeignKey('order_items.id'),nullable=True)
+    kind=Column(String(24),nullable=False)
+    quantity_change=Column(Integer,nullable=False)
+    before_stock=Column(Integer,nullable=False)
+    after_stock=Column(Integer,nullable=False)
+    reason=Column(String(400),nullable=False,default='')
+    account_name=Column(String(120),nullable=True)
+    table_name=Column(String(80),nullable=True)
+    source_key=Column(String(160),nullable=True,unique=True)
+    created_at=Column(DateTime(timezone=True),default=now,nullable=False)
+    __table_args__=(
+        Index('ix_inventory_movements_product_created', 'product_id', 'created_at'),
+        Index('ix_inventory_movements_account_created', 'account_id', 'created_at'),
+        Index('ix_inventory_movements_created', 'created_at'),
+    )
+
 # Índices de alto tráfico. Se crean también sobre tablas existentes durante bootstrap.
 PERFORMANCE_INDEXES = (
     Index('ix_accounts_owner_created_at', Account.owner_id, Account.created_at),
@@ -549,6 +573,18 @@ def bootstrap():
                     ticket_id=ticket.id,batch_id=batch.id,account_id=account.id,
                     waiter_id=account.owner_id,station=ticket.station,complete=complete,
                     created_at=ticket.ready_at or now(),attempted_at=None,attempt_count=0))
+        # El Kardex comienza con un saldo inicial verificable para cada producto
+        # cuyo control individual está activado. No se inventan ventas históricas.
+        tracked_products=db.scalars(select(Product).where(Product.inventory_enabled.is_(True))).all()
+        for product in tracked_products:
+            opening_key=f'inventory-opening:{product.id}'
+            if not db.scalar(select(InventoryMovement.id).where(InventoryMovement.source_key==opening_key)):
+                db.add(InventoryMovement(
+                    product_id=product.id,actor_id=None,kind='opening',
+                    quantity_change=product.stock,before_stock=0,after_stock=product.stock,
+                    reason='Saldo inicial al iniciar el historial de inventario',
+                    source_key=opening_key,created_at=now()
+                ))
         # Solo aplica menú cuando exista la aprobación explícita en Render.
         menu_photo_import.apply_approved_photo_menu_at_startup(db)
         db.commit()
@@ -1464,6 +1500,7 @@ class ProductIn(BaseModel):
     blocked:bool=False
     inventory_enabled:bool=False
     stock:int=Field(default=0,ge=0)
+    stock_reason:Optional[str]=Field(default=None,max_length=400)
     expected_version:Optional[int]=Field(default=None,ge=1)
 class ActiveToggleIn(BaseModel):
     active: bool
@@ -1561,7 +1598,12 @@ async def toggle_product_promotion(promotion_id:int,data:ActiveToggleIn,db:Sessi
 async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
     p=Product(name=data.name.strip(),category=data.category.strip()[:80],station=data.station,price_cents=cents(data.price),active=data.active,blocked=data.blocked,inventory_enabled=data.inventory_enabled,stock=data.stock)
-    db.add(p);audit(db,user,'product.create',name=p.name);db.commit();await notify();return {'id':p.id}
+    db.add(p);db.flush()
+    if data.inventory_enabled:
+        db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='opening',
+            quantity_change=p.stock,before_stock=0,after_stock=p.stock,
+            reason='Saldo inicial al crear producto',source_key=f'inventory-opening:{p.id}',created_at=now()))
+    audit(db,user,'product.create',name=p.name);db.commit();await notify();return {'id':p.id}
 @app.get('/api/products/archived')
 def archived_products(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
@@ -1609,7 +1651,22 @@ async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_sessi
     if data.expected_version is None or p.version != data.expected_version:
         raise HTTPException(409,'El producto o sus existencias cambiaron. Actualiza la pantalla antes de guardar')
     before=product_dict(p,db.get(Setting,1),db)
+    old_stock=p.stock;was_inventory_enabled=p.inventory_enabled
+    if data.stock!=old_stock and not (data.stock_reason or '').strip():
+        raise HTTPException(400,'Indica el motivo del ajuste de existencias')
+    if data.inventory_enabled and not was_inventory_enabled:
+        opening_key=f'inventory-opening:{p.id}'
+        if not db.scalar(select(InventoryMovement.id).where(InventoryMovement.source_key==opening_key)):
+            db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='opening',
+                quantity_change=old_stock,before_stock=0,after_stock=old_stock,
+                reason='Saldo inicial al activar control individual',source_key=opening_key,created_at=now()))
     p.name=data.name.strip();p.category=data.category.strip()[:80];p.station=data.station;p.price_cents=cents(data.price);p.active=data.active;p.blocked=data.blocked;p.inventory_enabled=data.inventory_enabled;p.stock=data.stock;p.version+=1
+    if data.stock!=old_stock:
+        db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='adjustment',
+            quantity_change=data.stock-old_stock,before_stock=old_stock,after_stock=data.stock,
+            reason=data.stock_reason.strip(),source_key=f'inventory-adjust-product:{secrets.token_urlsafe(18)}',created_at=now()))
+        audit(db,user,'inventory.adjustment',product_id=p.id,before=old_stock,delta=data.stock-old_stock,
+              after=data.stock,reason=data.stock_reason.strip(),source='product.edit')
     audit(db,user,'product.update',id=p.id,before=before,after=product_dict(p,db.get(Setting,1),db));db.commit();await notify();return {'ok':True}
 class RestockIn(BaseModel): delta:int=Field(gt=0,le=100000);reason:str=Field(min_length=3,max_length=400);expected_version:int
 @app.post('/api/products/{product_id}/restock')
@@ -1619,7 +1676,94 @@ async def restock(product_id:int,data:RestockIn,db:Session=Depends(db_session),u
     if not p:raise HTTPException(404,'Producto inexistente')
     if p.version!=data.expected_version:raise HTTPException(409,'Existencias cambiaron; actualiza la pantalla')
     before=p.stock;p.stock+=data.delta;p.version+=1
-    audit(db,user,'inventory.restock',product_id=p.id,before=before,delta=data.delta,after=p.stock,reason=data.reason);db.commit();await notify();return {'stock':p.stock}
+    db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='restock',
+        quantity_change=data.delta,before_stock=before,after_stock=p.stock,reason=data.reason.strip(),
+        source_key=f'inventory-restock:{secrets.token_urlsafe(18)}',created_at=now()))
+    audit(db,user,'inventory.restock',product_id=p.id,before=before,delta=data.delta,after=p.stock,reason=data.reason)
+    db.commit();await notify();return {'stock':p.stock}
+
+class InventoryAdjustmentIn(BaseModel):
+    mode:Literal['out','count']
+    quantity:int=Field(ge=0,le=100000)
+    reason:str=Field(min_length=3,max_length=400)
+    expected_version:int=Field(ge=1)
+
+@app.post('/api/products/{product_id}/inventory-adjustment')
+async def inventory_adjustment(product_id:int,data:InventoryAdjustmentIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
+    if not p:raise HTTPException(404,'Producto inexistente')
+    if p.version!=data.expected_version:raise HTTPException(409,'Existencias cambiaron; actualiza la pantalla')
+    before=p.stock
+    if data.mode=='out':
+        if data.quantity<1:raise HTTPException(400,'La salida debe ser de al menos una unidad')
+        if data.quantity>before:raise HTTPException(409,'La salida supera las existencias disponibles')
+        after=before-data.quantity;kind='manual_out';delta=-data.quantity
+    else:
+        after=data.quantity;delta=after-before;kind='adjustment'
+        if delta==0:raise HTTPException(400,'El recuento coincide con las existencias actuales')
+    p.stock=after;p.version+=1
+    db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind=kind,
+        quantity_change=delta,before_stock=before,after_stock=after,reason=data.reason.strip(),
+        source_key=f'inventory-manual:{secrets.token_urlsafe(18)}',created_at=now()))
+    audit(db,user,'inventory.manual_movement',product_id=p.id,kind=kind,
+          before=before,delta=delta,after=after,reason=data.reason.strip())
+    db.commit();await notify();return {'stock':p.stock,'delta':delta}
+
+@app.get('/api/inventory/movements')
+def inventory_movements(product_id:Optional[int]=None,kind:Optional[str]=None,
+                        from_date:Optional[str]=None,to_date:Optional[str]=None,
+                        limit:int=120,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    filters=[]
+    if product_id is not None:filters.append(InventoryMovement.product_id==product_id)
+    allowed_kinds={'opening','restock','sale','return','manual_out','adjustment'}
+    if kind:
+        if kind not in allowed_kinds:raise HTTPException(400,'Tipo de movimiento inválido')
+        filters.append(InventoryMovement.kind==kind)
+    tz=ZoneInfo('America/Mexico_City')
+    def local_boundary(value,exclusive_end=False):
+        if not value:return None
+        try:
+            day=datetime.strptime(value,'%Y-%m-%d')
+            if exclusive_end:day+=timedelta(days=1)
+            return day.replace(tzinfo=tz).astimezone(timezone.utc)
+        except ValueError:
+            raise HTTPException(400,'Fecha inválida; utiliza AAAA-MM-DD')
+    start=local_boundary(from_date)
+    end=local_boundary(to_date,True)
+    if start and end and start>=end:raise HTTPException(400,'El rango de fechas no es válido')
+    if start:filters.append(InventoryMovement.created_at>=start)
+    if end:filters.append(InventoryMovement.created_at<end)
+    summary_rows=db.execute(
+        select(InventoryMovement.kind,func.coalesce(func.sum(InventoryMovement.quantity_change),0))
+        .where(*filters).group_by(InventoryMovement.kind)
+    ).all()
+    summary={name:int(value or 0) for name,value in summary_rows}
+    stmt=(select(InventoryMovement,Product,User,Account)
+          .join(Product,Product.id==InventoryMovement.product_id)
+          .outerjoin(User,User.id==InventoryMovement.actor_id)
+          .outerjoin(Account,Account.id==InventoryMovement.account_id)
+          .where(*filters)
+          .order_by(InventoryMovement.created_at.desc(),InventoryMovement.id.desc())
+          .limit(max(1,min(limit,300))))
+    rows=db.execute(stmt).all()
+    movements=[]
+    for movement,product,actor,account in rows:
+        movements.append({
+            'id':movement.id,'product_id':product.id,'product_name':product.name,
+            'category':product.category,'kind':movement.kind,
+            'quantity_change':movement.quantity_change,'before_stock':movement.before_stock,
+            'after_stock':movement.after_stock,'reason':movement.reason,
+            'actor_name':actor.display if actor else 'Sistema',
+            'account_id':movement.account_id,'account_name':movement.account_name or (account.name if account else ''),
+            'account_status':account.status if account else '',
+            'account_closed_at':account.closed_at.isoformat() if account and account.closed_at else '',
+            'table_name':movement.table_name or '',
+            'batch_id':movement.batch_id,'order_item_id':movement.order_item_id,
+            'created_at':movement.created_at.isoformat() if movement.created_at else ''
+        })
+    return {'summary':summary,'movements':movements,'limit':max(1,min(limit,300))}
 
 def dining_table_dict(db,t):
     occupancy=db.get(TableOccupancy,t.id)
@@ -2421,17 +2565,30 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
             raise HTTPException(409,'Identificador de envío ya utilizado')
         raise
     mitote_extensions.snapshot_batch_policy(db,batch.id)
+    occupancy=db.scalar(select(TableOccupancy).where(TableOccupancy.account_id==a.id))
+    assigned_table=db.get(DiningTable,occupancy.table_id) if occupancy else None
+    table_name=assigned_table.name if assigned_table else ''
+    created_order_items=[]
     for row in prepared:
         line=row['line'];p=row['product'];variant=row['variant']
         item=OrderItem(batch_id=batch.id,product_id=p.id,name=p.name,station=p.station,price_cents=row['final_cents'],qty=line.qty,note=line.note.strip())
         db.add(item);db.flush()
+        created_order_items.append((item,p,line.qty))
         db.add(OrderItemMeta(order_item_id=item.id,variant_name=variant.name if variant else '',
             modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=mitote_extensions.product_prep_minutes(db,p.id,line.prep_minutes),
             release_after_minutes=line.release_after_minutes,promotion_name=row['promo_name'],
             base_price_cents=row['base_cents'],modifier_price_cents=row['modifier_cents']))
-    for pid,qty in need.items():
-        p=products[pid]
-        if setting.inventory_on and p.inventory_enabled:p.stock-=qty;p.version+=1
+    # Una salida por línea de comanda: conserva producto, folio, mesa, usuario y hora.
+    # La clave única batch/item evita duplicar movimientos si el envío se reintenta.
+    for item,p,qty in created_order_items:
+        if setting.inventory_on and p.inventory_enabled:
+            before=p.stock;p.stock-=qty;p.version+=1
+            db.add(InventoryMovement(product_id=p.id,actor_id=user.id,account_id=a.id,
+                batch_id=batch.id,order_item_id=item.id,kind='sale',quantity_change=-qty,
+                before_stock=before,after_stock=p.stock,
+                reason=f'Salida por comanda enviada · cuenta #{a.id}',
+                account_name=a.name,table_name=table_name,
+                source_key=f'inventory-sale:{batch.id}:{item.id}',created_at=now()))
     for station in stations:db.add(StationTicket(batch_id=batch.id,station=station))
     audit(db,user,'order.send',account_id=a.id,batch_id=batch.id,stations=sorted(stations),items=len(prepared))
     try:
@@ -2541,7 +2698,16 @@ async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),u
                     raise HTTPException(409,'No se puede devolver stock: la preparación ya comenzó')
                 p=db.execute(select(Product).where(Product.id==item.product_id).with_for_update()).scalar_one()
                 s=db.get(Setting,1)
-                if s.inventory_on and p.inventory_enabled:p.stock+=r.qty;p.version+=1
+                if s.inventory_on and p.inventory_enabled:
+                    before=p.stock;p.stock+=r.qty;p.version+=1
+                    occupancy=db.scalar(select(TableOccupancy).where(TableOccupancy.account_id==a.id))
+                    assigned_table=db.get(DiningTable,occupancy.table_id) if occupancy else None
+                    db.add(InventoryMovement(product_id=p.id,actor_id=user.id,account_id=a.id,
+                        batch_id=item.batch_id,order_item_id=item.id,kind='return',quantity_change=r.qty,
+                        before_stock=before,after_stock=p.stock,
+                        reason=f'Devolución autorizada por cancelación · cuenta #{a.id}',
+                        account_name=a.name,table_name=assigned_table.name if assigned_table else '',
+                        source_key=f'inventory-return:{r.id}',created_at=now()))
     r.status='approved' if data.approve else 'rejected';r.decided_by=user.id
     audit(db,user,'approval.decide',id=r.id,approved=data.approve,return_stock=data.return_stock);db.commit();await notify();return {'ok':True}
 
