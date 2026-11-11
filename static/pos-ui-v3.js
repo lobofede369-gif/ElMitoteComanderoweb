@@ -26,14 +26,6 @@
   const ICON_BY_SCREEN = {overview:'home',accounts:'list',all:'list',new:'plus',orders:'food',station:'chef',history:'history',tickets:'chef',cashier:'cash',cash:'receipt',products:'menu',inventory:'boxes',users:'people',approvals:'shield',audit:'audit'};
   const PRIMARY = {owner:['overview','all','cashier','products'],admin:['overview','all','cashier','products'],waiter:['accounts','new','orders'],cashier:['cashier','cash'],kitchen:['station','history'],bar:['station','history']};
   const SHORT_LABELS = {overview:'Inicio',all:'Cuentas',accounts:'Cuentas',new:'Nueva',orders:'Comandas',cashier:'Cobros',products:'Menú',cash:'Caja',station:'Tickets',history:'Historial'};
-  const TILES = [
-    {screen:'all',icon:'list',label:'Cuentas',hint:'Ver todas las cuentas'},
-    {screen:'cashier',icon:'cash',label:'Cobrar',hint:'Pagos pendientes'},
-    {screen:'tickets',icon:'chef',label:'Estaciones',hint:'Cocina y barra'},
-    {screen:'products',icon:'menu',label:'Productos',hint:'Menú y precios'},
-    {screen:'users',icon:'people',label:'Personal',hint:'Usuarios y PIN'},
-    {screen:'inventory',icon:'boxes',label:'Inventario',hint:'Existencias y control'}
-  ];
   function icon(name, size = 24) {
     return `<svg class="pos-icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.list}</svg>`;
   }
@@ -128,15 +120,7 @@
     if (!available()) return;
     const content = $('#content');
     if (!content || $('.pos-shortcuts', content)) return;
-    if (state.screen === 'overview' && ['owner','admin'].includes(state.user.role)) {
-      const area = document.createElement('section');
-      area.className = 'pos-shortcuts';
-      area.innerHTML = `<div class="pos-section-title"><span>ACCESOS RÁPIDOS</span><strong>Operación del restaurante</strong></div><div class="pos-tiles">${TILES.map((t,i)=>tileMarkup(t,i===1)).join('')}</div>`;
-      const dashboard = $('.premium-dashboard', content);
-      const stats = dashboard?.querySelector('.statgrid');
-      if (stats) stats.after(area);
-      else content.prepend(area);
-    } else if (state.screen === 'accounts' && state.user.role === 'waiter') {
+    if (state.screen === 'accounts' && state.user.role === 'waiter') {
       const area = document.createElement('section');
       area.className = 'pos-shortcuts';
       area.innerHTML = `<div class="pos-section-title"><span>OPERACIÓN</span><strong>¿Qué necesitas hacer?</strong></div><div class="pos-tiles pos-tiles-two">${tileMarkup({screen:'new',icon:'plus',label:'Nueva cuenta',hint:'Abrir una cuenta'},true)}${tileMarkup({screen:'orders',icon:'food',label:'Comandas',hint:'Agregar y enviar productos'})}</div>`;
