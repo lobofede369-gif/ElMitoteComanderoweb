@@ -22,6 +22,7 @@ jobs:
 
       - name: Validar sintaxis JavaScript
         run: |
+          node --check static/features.js
           node --check static/app.js
           node --check static/pos-ui-v3.js
           node --check static/sw.js
@@ -40,7 +41,16 @@ jobs:
           sw = Path('static/sw.js').read_text(encoding='utf-8')
           assert '/static/theme-obsidian-titanium.css?v=1' in html
           assert '/static/theme-obsidian-modules.css?v=2' in html
-          assert '/static/app.js?v=16' in html
+          assert '/static/app.js?v=30' in html
+          assert '/static/app.js?v=30' in sw
+          assert 'function setConnectionState(connected)' in app
+          assert "syncWaiterReadyAlerts" in app
+          assert "case 'deliver-ready':" in app
+          assert "Pendiente de confirmar recepción" in app
+          assert '/static/cash-receipt.css?v=1' in html
+          assert '/static/cash-receipt.css?v=1' in sw
+          assert '/static/features.js?v=3' in html
+          assert '/static/features.css?v=1' in html
           assert '/static/pos-ui-v3.js?v=7' in html
           assert 'theme-obsidian-modules.css?v=2' in sw
           assert '/static/theme-luxury-motion.css?v=1' in html
@@ -48,9 +58,10 @@ jobs:
           assert '@media(prefers-reduced-motion:reduce)' in motion
           fast = Path('static/theme-service-fast.css').read_text(encoding='utf-8')
           waiter = Path('static/pos-ui-v3.js').read_text(encoding='utf-8')
-          assert '/static/theme-service-fast.css?v=1' in html
-          assert '/static/theme-service-fast.css?v=1' in sw
-          assert 'mitote-comandas-v19' in sw
+          assert '/static/theme-service-fast.css?v=2' in html
+          assert '/static/theme-service-fast.css?v=2' in sw
+          assert 'mitote-comandas-v34' in sw
+          assert 'renotify:false' in sw
           assert 'pos-search' in waiter and 'applyCatalogFilter()' in waiter
           assert 'obs.observe(content,{childList:true});' in waiter
           assert 'subtree:true' not in waiter
@@ -95,4 +106,44 @@ jobs:
       - name: Validar API y roles con SQLite temporal
         run: |
           python -m scripts.test_owner_permissions
-          if [ -f scripts/test_pin_login.py ]; then python -m scripts.test_pin_login; fi
+          python -m scripts.test_performance_regressions
+          python -m scripts.test_pin_login
+          python -m scripts.test_audit_regressions
+          python -m scripts.test_new_features
+          python -m scripts.test_cash_cut_archive
+          python -m scripts.test_cash_receipt
+          python -m scripts.test_waiter_notifications
+          python -m scripts.test_menu_photo
+          python -m scripts.test_owner_one_time
+          python -m scripts.test_photo_menu_approved
+
+
+  postgres-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: mitote_ci
+          POSTGRES_PASSWORD: mitote_ci_password
+          POSTGRES_DB: mitote_features_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mitote_ci -d mitote_features_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v4
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements.txt httpx==0.28.1
+      - name: Integración PostgreSQL independiente de producción
+        env:
+          MITOTE_TEST_DATABASE_URL: postgresql://mitote_ci:mitote_ci_password@localhost:5432/mitote_features_ci
+        run: python -m scripts.test_postgres_integration

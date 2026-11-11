@@ -1,0 +1,148 @@
+/* El Mitote Comandas · pantalla de carga inicial */
+#startup-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  padding: max(26px, env(safe-area-inset-top)) 24px max(26px, env(safe-area-inset-bottom));
+  overflow: hidden;
+  color: #fff;
+  background:
+    radial-gradient(ellipse 78% 42% at 50% 0%, rgba(165, 35, 28, .25), transparent 70%),
+    radial-gradient(ellipse 54% 38% at 50% 100%, rgba(213, 145, 42, .10), transparent 72%),
+    linear-gradient(155deg, #171112 0%, #0d0b0b 56%, #15100d 100%);
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 320ms ease, visibility 320ms ease;
+}
+#startup-splash::before,
+#startup-splash::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  border: 1px solid rgba(231, 190, 104, .10);
+  border-radius: 50%;
+}
+#startup-splash::before {
+  width: min(90vw, 480px);
+  aspect-ratio: 1;
+  top: -31%;
+  left: 50%;
+  transform: translateX(-50%);
+  box-shadow: 0 0 0 42px rgba(231, 190, 104, .025), 0 0 0 92px rgba(231, 190, 104, .018);
+}
+#startup-splash::after {
+  width: min(76vw, 360px);
+  aspect-ratio: 1;
+  bottom: -34%;
+  left: -28%;
+  border-color: rgba(196, 38, 47, .11);
+}
+#startup-splash.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+body.startup-active { overflow: hidden; }
+.startup-card {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  justify-items: center;
+  width: min(390px, 100%);
+  text-align: center;
+}
+.startup-logo {
+  display: block;
+  width: min(88vw, 350px);
+  max-height: 190px;
+  height: auto;
+  object-fit: contain;
+  filter: drop-shadow(0 9px 24px rgba(0, 0, 0, .52));
+  animation: mitote-logo-arrive 650ms cubic-bezier(.2,.75,.25,1) both;
+}
+.startup-app-name {
+  margin: 9px 0 0;
+  color: #f1d18b;
+  font-size: .82rem;
+  font-weight: 900;
+  letter-spacing: .34em;
+  text-indent: .34em;
+}
+.startup-divider {
+  width: 76px;
+  height: 2px;
+  margin: 23px 0 18px;
+  border-radius: 99px;
+  background: linear-gradient(90deg, transparent, #c62b32 28%, #e9c779 50%, #c62b32 72%, transparent);
+}
+.startup-message {
+  min-height: 22px;
+  margin: 0 0 15px;
+  color: #e8ded0;
+  font-size: .9rem;
+  font-weight: 600;
+  letter-spacing: .015em;
+}
+.startup-progress {
+  width: min(310px, 84vw);
+  height: 6px;
+  overflow: hidden;
+  border: 1px solid rgba(226, 191, 125, .23);
+  border-radius: 99px;
+  background: rgba(255, 255, 255, .09);
+  box-shadow: 0 0 18px rgba(0, 0, 0, .35);
+}
+.startup-progress-fill {
+  display: block;
+  width: 4%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #9d1d2a 0%, #d83b35 42%, #f0d18d 100%);
+  box-shadow: 0 0 12px rgba(230, 183, 94, .45);
+  transition: width 420ms cubic-bezier(.2,.75,.25,1);
+}
+.startup-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  width: min(310px, 84vw);
+  margin-top: 9px;
+  color: #a99b8b;
+  font-size: .72rem;
+  letter-spacing: .035em;
+}
+#startup-progress-value {
+  color: #f1d18b;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+.startup-error {
+  width: min(340px, 90vw);
+  margin-top: 19px;
+  padding: 13px 14px;
+  border: 1px solid rgba(213, 65, 67, .42);
+  border-radius: 12px;
+  background: rgba(86, 20, 25, .38);
+  color: #f3d7d3;
+  font-size: .84rem;
+  line-height: 1.45;
+}
+.startup-retry {
+  min-width: 170px;
+  margin-top: 14px;
+  border: 1px solid #d8b86f;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #f0d28c, #c49a4f);
+  color: #21170b;
+  font-weight: 900;
+  box-shadow: 0 8px 25px rgba(0, 0, 0, .28);
+}
+.startup-retry:active { transform: translateY(1px); }
+@keyframes mitote-logo-arrive {
+  from { opacity: 0; transform: translateY(9px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #startup-splash, .startup-logo, .startup-progress-fill { transition: none; animation: none; }
+}

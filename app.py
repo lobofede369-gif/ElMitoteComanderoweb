@@ -21,7 +21,7 @@ from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, Column, Integer, String, Boolean, ForeignKey,
-                        DateTime, Text, UniqueConstraint, select, func)
+                        DateTime, Text, LargeBinary, UniqueConstraint, Index, select, func, inspect, or_, text)
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker, Session
 from sqlalchemy.exc import IntegrityError
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as PDFImage
@@ -99,6 +99,11 @@ class UserPin(Base):
     lookup = Column(String(64), nullable=False, unique=True)
     pin_hash = Column(String(255), nullable=False)
 
+class OwnerRecoveryEvent(Base):
+    __tablename__='owner_recovery_events'
+    fingerprint=Column(String(64),primary_key=True)
+    consumed_at=Column(DateTime(timezone=True),default=now,nullable=False)
+
 class Setting(Base):
     __tablename__='settings'
     id=Column(Integer,primary_key=True)
@@ -116,7 +121,18 @@ class Product(Base):
     blocked=Column(Boolean,default=False)
     inventory_enabled=Column(Boolean,default=False)
     stock=Column(Integer,default=0)
+    inventory_only=Column(Boolean,default=False,nullable=False)
+    inventory_unit=Column(String(20),default='unidades',nullable=False)
     version=Column(Integer,default=1)
+
+class ArchivedProduct(Base):
+    __tablename__='archived_products'
+    product_id=Column(Integer,ForeignKey('products.id'),primary_key=True)
+    archived_by=Column(Integer,ForeignKey('users.id'),nullable=False)
+    reason=Column(String(200),nullable=False)
+    original_active=Column(Boolean,nullable=False)
+    original_blocked=Column(Boolean,nullable=False)
+    archived_at=Column(DateTime(timezone=True),default=now,nullable=False)
 
 class Account(Base):
     __tablename__='accounts'
@@ -126,6 +142,17 @@ class Account(Base):
     status=Column(String(20),default='open',nullable=False)
     created_at=Column(DateTime(timezone=True),default=now)
     closed_at=Column(DateTime(timezone=True))
+
+class AccountCreateKey(Base):
+    """Clave idempotente para evitar cuentas duplicadas tras reintentos de red."""
+    __tablename__='account_create_keys'
+    id=Column(Integer,primary_key=True)
+    user_id=Column(Integer,ForeignKey('users.id'),nullable=False)
+    client_key=Column(String(80),nullable=False)
+    account_id=Column(Integer,ForeignKey('accounts.id'),nullable=False)
+    request_hash=Column(String(64),nullable=False)
+    created_at=Column(DateTime(timezone=True),default=now,nullable=False)
+    __table_args__=(UniqueConstraint('user_id','client_key'),)
 
 class DiningTable(Base):
     __tablename__='restaurant_tables'
@@ -195,6 +222,8 @@ class ProductModifierOption(Base):
     price_delta_cents=Column(Integer,default=0,nullable=False)
     active=Column(Boolean,default=True,nullable=False)
     sort_order=Column(Integer,default=0,nullable=False)
+    inventory_product_id=Column(Integer,ForeignKey('products.id'),nullable=True)
+    inventory_quantity=Column(Integer,default=1,nullable=False)
 
 class ProductPromotion(Base):
     __tablename__='product_promotions'
@@ -305,9 +334,18 @@ class CashPeriod(Base):
     closed_by=Column(Integer,ForeignKey('users.id'))
     note=Column(String(400),default='')
 
+class CashCutArchive(Base):
+    """Instantánea inmutable del corte: detalle y PDF almacenados juntos."""
+    __tablename__='cash_cut_archives'
+    period_id=Column(Integer,ForeignKey('cash_periods.id'),primary_key=True)
+    detail_json=Column(Text,nullable=False)
+    pdf_blob=Column(LargeBinary,nullable=False)
+    archived_at=Column(DateTime(timezone=True),default=now,nullable=False)
+
 class CashMovement(Base):
     __tablename__='cash_movements'
     id=Column(Integer,primary_key=True)
+    client_key=Column(String(100),nullable=True)
     period_id=Column(Integer,ForeignKey('cash_periods.id'),nullable=False)
     requester_id=Column(Integer,ForeignKey('users.id'),nullable=False)
     approved_by=Column(Integer,ForeignKey('users.id'))
@@ -371,6 +409,32 @@ class FcmDevice(Base):
     token = Column(String(2048), unique=True, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=now, nullable=False)
 
+class ReadyNotificationEvent(Base):
+    """Registro persistente de aviso por estación y por comanda.
+
+    Se registra en la MISMA transacción que la transición a READY, de modo que
+    si Render se reinicia el aviso sigue en PostgreSQL.
+    """
+    __tablename__ = 'ready_notification_events'
+    id = Column(Integer, primary_key=True)
+    event_key = Column(String(90), nullable=False, unique=True)
+    ticket_id = Column(Integer, ForeignKey('station_tickets.id'), nullable=False, unique=True)
+    batch_id = Column(Integer, ForeignKey('batches.id'), nullable=False)
+    account_id = Column(Integer, ForeignKey('accounts.id'), nullable=False)
+    waiter_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+    station = Column(String(12), nullable=False)
+    complete = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=now, nullable=False)
+    attempted_at = Column(DateTime(timezone=True), nullable=True)
+    # FCM/Web Push accepted the request; this is NOT proof the phone displayed it.
+    provider_accepted_at = Column(DateTime(timezone=True), nullable=True)
+    attempt_count = Column(Integer, default=0, nullable=False)
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(240), nullable=True)
+    # acknowledged_at = waiter confirmed receipt; delivered_at = customer received order.
+    acknowledged_at = Column(DateTime(timezone=True), nullable=True)
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+
 class Audit(Base):
     __tablename__='audit'
     id=Column(Integer,primary_key=True)
@@ -378,6 +442,40 @@ class Audit(Base):
     action=Column(String(80),nullable=False)
     detail=Column(Text,default='{}')
     created_at=Column(DateTime(timezone=True),default=now)
+
+class InventoryMovement(Base):
+    """Ledger inmutable de movimientos de existencias por producto terminado."""
+    __tablename__='inventory_movements'
+    id=Column(Integer,primary_key=True)
+    product_id=Column(Integer,ForeignKey('products.id'),nullable=False,index=True)
+    actor_id=Column(Integer,ForeignKey('users.id'),nullable=True)
+    account_id=Column(Integer,ForeignKey('accounts.id'),nullable=True,index=True)
+    batch_id=Column(Integer,ForeignKey('batches.id'),nullable=True)
+    order_item_id=Column(Integer,ForeignKey('order_items.id'),nullable=True)
+    kind=Column(String(24),nullable=False)
+    quantity_change=Column(Integer,nullable=False)
+    before_stock=Column(Integer,nullable=False)
+    after_stock=Column(Integer,nullable=False)
+    reason=Column(String(400),nullable=False,default='')
+    account_name=Column(String(120),nullable=True)
+    table_name=Column(String(80),nullable=True)
+    source_key=Column(String(160),nullable=True,unique=True)
+    created_at=Column(DateTime(timezone=True),default=now,nullable=False)
+    __table_args__=(
+        Index('ix_inventory_movements_product_created', 'product_id', 'created_at'),
+        Index('ix_inventory_movements_account_created', 'account_id', 'created_at'),
+        Index('ix_inventory_movements_created', 'created_at'),
+    )
+
+# Índices de alto tráfico. Se crean también sobre tablas existentes durante bootstrap.
+PERFORMANCE_INDEXES = (
+    Index('ix_accounts_owner_created_at', Account.owner_id, Account.created_at),
+    Index('ix_accounts_created_at', Account.created_at),
+    Index('ix_batches_account_id', Batch.account_id),
+    Index('ix_order_items_batch_id', OrderItem.batch_id),
+    Index('ix_payments_account_id', Payment.account_id),
+    Index('uq_cash_movements_client_key', CashMovement.client_key, unique=True),
+)
 
 listeners=set()
 login_failures={}
@@ -391,19 +489,271 @@ def audit(db,user,action,**data):
 
 def bootstrap():
     Base.metadata.create_all(engine)
+    # Migración aditiva y compatible con SQLite/PostgreSQL. Los eventos existentes
+    # con acknowledged_at ya representan entregas confirmadas en la UI anterior.
+    with engine.begin() as conn:
+        cash_movement_columns={column['name'] for column in inspect(conn).get_columns('cash_movements')}
+        if 'client_key' not in cash_movement_columns:
+            conn.exec_driver_sql('ALTER TABLE cash_movements ADD COLUMN client_key VARCHAR(100) NULL')
+        product_columns={column['name'] for column in inspect(conn).get_columns('products')}
+        if 'inventory_only' not in product_columns:
+            conn.exec_driver_sql('ALTER TABLE products ADD COLUMN inventory_only BOOLEAN NOT NULL DEFAULT FALSE')
+        if 'inventory_unit' not in product_columns:
+            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN inventory_unit VARCHAR(20) NOT NULL DEFAULT 'unidades'")
+        modifier_columns={column['name'] for column in inspect(conn).get_columns('product_modifier_options')}
+        if 'inventory_product_id' not in modifier_columns:
+            conn.exec_driver_sql("ALTER TABLE product_modifier_options ADD COLUMN inventory_product_id INTEGER NULL REFERENCES products(id)")
+        if 'inventory_quantity' not in modifier_columns:
+            conn.exec_driver_sql("ALTER TABLE product_modifier_options ADD COLUMN inventory_quantity INTEGER NOT NULL DEFAULT 1")
+        columns={column['name'] for column in inspect(conn).get_columns('ready_notification_events')}
+        additions={
+            'provider_accepted_at':'TIMESTAMP WITH TIME ZONE NULL',
+            'attempt_count':'INTEGER NOT NULL DEFAULT 0',
+            'next_attempt_at':'TIMESTAMP WITH TIME ZONE NULL',
+            'last_error':'VARCHAR(240) NULL',
+            'delivered_at':'TIMESTAMP WITH TIME ZONE NULL',
+        }
+        # Esta limpieza solo corresponde a la primera actualización del esquema.
+        # Ejecutarla en cada arranque borraba el estado de entrega de eventos nuevos
+        # y volvía a enviar notificaciones ya aceptadas por FCM/Web Push.
+        legacy_outbox_schema=any(name not in columns for name in additions)
+        for column_name,column_type in additions.items():
+            if column_name not in columns:
+                conn.exec_driver_sql(
+                    f'ALTER TABLE ready_notification_events ADD COLUMN {column_name} {column_type}'
+                )
+        conn.exec_driver_sql(
+            'UPDATE ready_notification_events SET delivered_at=acknowledged_at '
+            'WHERE acknowledged_at IS NOT NULL AND delivered_at IS NULL'
+        )
+        if legacy_outbox_schema:
+            conn.exec_driver_sql(
+                'UPDATE ready_notification_events SET attempt_count=0, next_attempt_at=NULL, '
+                'provider_accepted_at=NULL WHERE acknowledged_at IS NULL AND delivered_at IS NULL'
+            )
+    # create_all no agrega índices a tablas ya creadas; checkfirst permite
+    # desplegar esta migración de forma idempotente en SQLite y PostgreSQL.
+    for performance_index in PERFORMANCE_INDEXES:
+        performance_index.create(bind=engine,checkfirst=True)
+    # Índice parcial de expresión constante: evita dos cajas abiertas incluso bajo
+    # concurrencia. El DDL es común a SQLite y PostgreSQL.
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            'CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_periods_single_open '
+            'ON cash_periods ((1)) WHERE closed_at IS NULL'
+        )
     with SessionLocal() as db:
         if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False))
         if not db.scalar(select(User).where(User.role=='owner')):
             db.add(User(username=ADMIN_USERNAME,display='Propietario',role='owner',password_hash=ph.hash(ADMIN_PASSWORD)))
+            db.flush()
+        # Recuperación excepcional autorizada mediante variables PRIVADAS de Render.
+        # El token solo puede consumirse una vez, aun si Render reinicia.
+        token=os.getenv('OWNER_RECOVERY_TOKEN','').strip()
+        if token:
+            new_password=os.getenv('OWNER_RECOVERY_PASSWORD','')
+            new_pin=os.getenv('OWNER_RECOVERY_PIN','')
+            if len(token)<32 or len(new_password)<14 or not re.fullmatch(r'[0-9]{6}',new_pin):
+                raise RuntimeError('Datos de recuperación del propietario incompletos')
+            fingerprint=hashlib.sha256(token.encode('utf-8')).hexdigest()
+            if not db.get(OwnerRecoveryEvent,fingerprint):
+                owner=db.execute(select(User).where(User.role=='owner').with_for_update()).scalar_one()
+                owner.password_hash=ph.hash(new_password)
+                _set_user_pin(db,owner,new_pin)
+                db.add(OwnerRecoveryEvent(fingerprint=fingerprint))
+                audit(db,None,'owner.recovery',owner_id=owner.id)
+        # Conservar los pedidos que ya estaban listos durante el turno abierto
+        # cuando se introduce por primera vez el registro persistente.
+        period = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+        if period:
+            ready_rows = db.execute(
+                select(StationTicket,Batch,Account).join(Batch,Batch.id==StationTicket.batch_id)
+                .join(Account,Account.id==Batch.account_id)
+                .where(Batch.created_at>=period.opened_at,StationTicket.status=='ready',
+                       Account.status.in_(('open','pending')))
+            ).all()
+            batch_ids = {b.id for _,b,_ in ready_rows}
+            all_tickets = db.scalars(select(StationTicket).where(StationTicket.batch_id.in_(batch_ids))).all() if batch_ids else []
+            by_batch = {}
+            for ticket in all_tickets:
+                by_batch.setdefault(ticket.batch_id,[]).append(ticket)
+            for ticket,batch,account in ready_rows:
+                if db.scalar(select(ReadyNotificationEvent.id).where(ReadyNotificationEvent.ticket_id==ticket.id)):
+                    continue
+                siblings = by_batch[batch.id]
+                complete = all(x.status=='ready' for x in siblings) and ticket.id==max(
+                    siblings,key=lambda x:(x.ready_at or x.created_at or now(),x.id)).id
+                db.add(ReadyNotificationEvent(event_key=f'ready-{ticket.id}',
+                    ticket_id=ticket.id,batch_id=batch.id,account_id=account.id,
+                    waiter_id=account.owner_id,station=ticket.station,complete=complete,
+                    created_at=ticket.ready_at or now(),attempted_at=None,attempt_count=0))
+        # El Kardex comienza con un saldo inicial verificable para cada producto
+        # cuyo control individual está activado. No se inventan ventas históricas.
+        tracked_products=db.scalars(select(Product).where(Product.inventory_enabled.is_(True))).all()
+        for product in tracked_products:
+            opening_key=f'inventory-opening:{product.id}'
+            if not db.scalar(select(InventoryMovement.id).where(InventoryMovement.source_key==opening_key)):
+                db.add(InventoryMovement(
+                    product_id=product.id,actor_id=None,kind='opening',
+                    quantity_change=product.stock,before_stock=0,after_stock=product.stock,
+                    reason='Saldo inicial al iniciar el historial de inventario',
+                    source_key=opening_key,created_at=now()
+                ))
+        # Solo aplica menú cuando exista la aprobación explícita en Render.
+        menu_photo_import.apply_approved_photo_menu_at_startup(db)
         db.commit()
+
+async def dispatch_ready_notification(event_id:int):
+    """Envía el evento al mesero actual; el ACK humano y la entrega se registran aparte."""
+    max_attempts=12
+    with SessionLocal() as db:
+        row=db.execute(select(ReadyNotificationEvent).where(
+            ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
+        stamp=now()
+        if not row or row.acknowledged_at is not None or row.delivered_at is not None:
+            return
+        if row.provider_accepted_at is not None or (row.attempt_count or 0)>=max_attempts:
+            return
+        due=row.next_attempt_at
+        if due is not None:
+            if due.tzinfo is None:
+                due=due.replace(tzinfo=timezone.utc)
+            if due>stamp:
+                return
+        account=db.get(Account,row.account_id)
+        recipient_id=account.owner_id if account else row.waiter_id
+        waiter=db.get(User,recipient_id) if recipient_id else None
+        if not account or not waiter or not waiter.active or waiter.role!='waiter':
+            row.attempt_count=(row.attempt_count or 0)+1
+            row.attempted_at=stamp
+            row.last_error='La cuenta no tiene un mesero activo asignado.'
+            row.next_attempt_at=stamp+timedelta(minutes=5) if row.attempt_count<max_attempts else None
+            db.commit()
+            return
+        row.waiter_id=recipient_id
+        row.attempt_count=(row.attempt_count or 0)+1
+        attempt=row.attempt_count
+        row.attempted_at=stamp
+        # Lease: evita que el worker y la transición READY envíen en paralelo.
+        row.next_attempt_at=stamp+timedelta(minutes=2)
+        event_key=row.event_key
+        station_label='Cocina' if row.station=='kitchen' else 'Barra'
+        title='El Mitote · Pedido completo' if row.complete else f'El Mitote · {station_label} lista'
+        body=(f'Pedido completo para {account.name} · comanda #{row.batch_id}. ¡Listo para entregar!'
+              if row.complete else f'{station_label} terminó {account.name} · comanda #{row.batch_id}.')
+        payload={'title':title,'body':body,
+                 'url':f'/?push=accounts&account={account.id}',
+                 'kind':'ready_complete' if row.complete else 'ready_station',
+                 'tag':f'mitote-{event_key}','event_id':event_key,
+                 'recipient_id':str(recipient_id)}
+        db.commit()
+
+    results=await asyncio.gather(
+        push_to(payload,role='waiter',user_id=recipient_id),
+        fcm_to(payload,role='waiter',user_id=recipient_id),
+        return_exceptions=True
+    )
+    normalized=[x if isinstance(x,dict) else {
+        'sent':0,'failed':1,'error':type(x).__name__
+    } for x in results]
+    accepted=sum(int(x.get('sent') or 0) for x in normalized)>0
+    errors=[str(x.get('error')) for x in normalized if x.get('error')]
+
+    with SessionLocal() as db:
+        row=db.execute(select(ReadyNotificationEvent).where(
+            ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
+        if not row:
+            return
+        account=db.get(Account,row.account_id)
+        # Si cambió el responsable mientras FCM estaba enviando, descartar el
+        # resultado antiguo y dejar que el worker notifique al nuevo mesero.
+        if not account or account.owner_id!=recipient_id or row.waiter_id!=recipient_id:
+            if account and account.owner_id:
+                row.waiter_id=account.owner_id
+            row.attempt_count=0
+            row.attempted_at=None
+            row.provider_accepted_at=None
+            row.next_attempt_at=None
+            row.last_error=None
+        elif accepted:
+            # Aceptación del proveedor ≠ recepción en el teléfono. El mesero
+            # confirma la recepción desde el panel y luego marca la entrega.
+            row.provider_accepted_at=now()
+            row.next_attempt_at=None
+            row.last_error=None
+        else:
+            row.last_error=('; '.join(errors) or 'Ningún proveedor aceptó el aviso.')[:240]
+            if row.attempt_count>=max_attempts:
+                row.next_attempt_at=None
+            else:
+                delay=min(900,20*(2**min(max(0,attempt-1),6)))
+                row.next_attempt_at=now()+timedelta(seconds=delay)
+        db.commit()
+
+
+async def ready_notification_outbox_worker():
+    """Reintenta eventos no aceptados; el panel del mesero es el respaldo persistente."""
+    while True:
+        await asyncio.sleep(20)
+        try:
+            stamp=now()
+            with SessionLocal() as db:
+                ids=db.scalars(select(ReadyNotificationEvent.id).where(
+                    ReadyNotificationEvent.acknowledged_at.is_(None),
+                    ReadyNotificationEvent.delivered_at.is_(None),
+                    ReadyNotificationEvent.provider_accepted_at.is_(None),
+                    ReadyNotificationEvent.attempt_count<12,
+                    or_(ReadyNotificationEvent.next_attempt_at.is_(None),
+                        ReadyNotificationEvent.next_attempt_at<=stamp)
+                ).order_by(ReadyNotificationEvent.id).limit(40)).all()
+            for event_id in ids:
+                await dispatch_ready_notification(event_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('Error reanudando avisos de pedidos listos')
+
 
 @asynccontextmanager
 async def lifespan(app):
     bootstrap()
-    yield
+    prep_worker=asyncio.create_task(mitote_extensions.prep_alert_worker())
+    ready_worker=asyncio.create_task(ready_notification_outbox_worker())
+    try:
+        yield
+    finally:
+        for task in (prep_worker,ready_worker):
+            task.cancel()
+        await asyncio.gather(prep_worker,ready_worker,return_exceptions=True)
 
 app=FastAPI(title='El Mitote Comandas',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
 app.mount('/static',StaticFiles(directory='static'),name='static')
+
+http_log=logging.getLogger('mitote.http')
+
+@app.middleware("http")
+async def observe_request_performance(request:Request,call_next):
+    """Expose server time and log only slow/failed requests without customer data."""
+    request_id=request.headers.get('x-request-id','')
+    if not request_id or len(request_id)>64 or not re.fullmatch(r'[A-Za-z0-9._-]+',request_id):
+        request_id=secrets.token_hex(8)
+    started=time.perf_counter()
+    try:
+        response=await call_next(request)
+    except Exception:
+        elapsed_ms=(time.perf_counter()-started)*1000
+        http_log.exception(
+            "request_failed id=%s method=%s path=%s duration_ms=%.1f",
+            request_id,request.method,request.url.path,elapsed_ms)
+        raise
+    elapsed_ms=(time.perf_counter()-started)*1000
+    response.headers["X-Request-ID"]=request_id
+    response.headers["Server-Timing"]=f"app;dur={elapsed_ms:.1f}"
+    if elapsed_ms>=500:
+        http_log.warning(
+            "slow_request id=%s method=%s path=%s status=%s duration_ms=%.1f",
+            request_id,request.method,request.url.path,response.status_code,elapsed_ms)
+    return response
 
 @app.get('/')
 def root(): return FileResponse('static/index.html')
@@ -412,7 +762,15 @@ def sw(): return FileResponse('static/sw.js',media_type='application/javascript'
 @app.get('/manifest.webmanifest')
 def manifest(): return FileResponse('static/manifest.webmanifest',media_type='application/manifest+json')
 @app.get('/api/health')
-def health(): return {'ok':True}
+def health():
+    """Health check real: no declara saludable la app si PostgreSQL no responde."""
+    try:
+        with engine.connect() as connection:
+            connection.execute(text('SELECT 1'))
+    except Exception:
+        http_log.exception('health_check_failed')
+        raise HTTPException(503,'Base de datos no disponible')
+    return {'ok':True,'database':'ok'}
 
 def db_session():
     with SessionLocal() as db: yield db
@@ -436,8 +794,11 @@ def owner_account(db,user,account_id,allowed=('open','pending')):
     return acc
 
 def account_gross_total(db,acc):
-    rows=db.execute(select(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(Batch.account_id==acc.id)).scalars().all()
-    return sum(x.price_cents*(x.qty-x.cancelled_qty) for x in rows)
+    value=db.scalar(select(func.coalesce(func.sum(
+        OrderItem.price_cents*(OrderItem.qty-func.coalesce(OrderItem.cancelled_qty,0))),0
+    )).select_from(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(
+        Batch.account_id==acc.id))
+    return int(value or 0)
 
 def account_discount_total(db,account_id):
     return db.scalar(select(func.coalesce(func.sum(AccountDiscount.discount_cents),0)).where(
@@ -465,6 +826,63 @@ def account_dict(db,a):
             'table_area':table.area if table else None,
             'created_at':a.created_at.isoformat() if a.created_at else ''}
 
+def account_dict_many(db, accounts):
+    """Serializa cuentas activas con agregados y relaciones precargadas en bloque."""
+    if not accounts:
+        return []
+    account_ids=[a.id for a in accounts]
+    owner_ids={a.owner_id for a in accounts if a.owner_id is not None}
+
+    gross_rows=db.execute(
+        select(Batch.account_id,func.coalesce(func.sum(
+            OrderItem.price_cents*(OrderItem.qty-func.coalesce(OrderItem.cancelled_qty,0))),0))
+        .join(OrderItem,OrderItem.batch_id==Batch.id)
+        .where(Batch.account_id.in_(account_ids))
+        .group_by(Batch.account_id)
+    ).all()
+    discount_rows=db.execute(
+        select(AccountDiscount.account_id,func.coalesce(func.sum(AccountDiscount.discount_cents),0))
+        .where(AccountDiscount.account_id.in_(account_ids),AccountDiscount.status=='applied')
+        .group_by(AccountDiscount.account_id)
+    ).all()
+    payment_rows=db.execute(
+        select(Payment.account_id,func.coalesce(func.sum(Payment.cents),0))
+        .where(Payment.account_id.in_(account_ids))
+        .group_by(Payment.account_id)
+    ).all()
+    owner_rows=db.scalars(select(User).where(User.id.in_(owner_ids))).all() if owner_ids else []
+    occupancy_rows=db.execute(
+        select(TableOccupancy.account_id,DiningTable.id,DiningTable.name,DiningTable.area)
+        .join(DiningTable,DiningTable.id==TableOccupancy.table_id)
+        .where(TableOccupancy.account_id.in_(account_ids))
+    ).all()
+
+    gross_by={row[0]:int(row[1] or 0) for row in gross_rows}
+    discount_by={row[0]:int(row[1] or 0) for row in discount_rows}
+    paid_by={row[0]:int(row[1] or 0) for row in payment_rows}
+    owner_by={u.id:u.display for u in owner_rows}
+    table_by={row[0]:{"id":row[1],"name":row[2],"area":row[3]} for row in occupancy_rows}
+
+    result=[]
+    for account in accounts:
+        gross=gross_by.get(account.id,0)
+        discounts=discount_by.get(account.id,0)
+        total=max(0,gross-discounts)
+        paid=paid_by.get(account.id,0)
+        table=table_by.get(account.id)
+        result.append({
+            "id":account.id,"name":account.name,"owner_id":account.owner_id,
+            "owner":owner_by.get(account.owner_id,"?"),"status":account.status,
+            "gross_total":amount(gross),"discount_total":amount(discounts),
+            "total":amount(total),"paid":amount(paid),"due":amount(total-paid),
+            "table_id":table["id"] if table else None,
+            "table_name":table["name"] if table else None,
+            "table_area":table["area"] if table else None,
+            "created_at":account.created_at.isoformat() if account.created_at else ""
+        })
+    return result
+
+
 def release_table_for_account(db,a,user,reason):
     occupancy=db.execute(select(TableOccupancy).where(TableOccupancy.account_id==a.id).with_for_update()).scalar_one_or_none()
     if not occupancy:
@@ -482,14 +900,24 @@ def promotion_is_active(promo, at=None):
     if not promo.active:return False
     try:
         days={int(x) for x in (promo.weekdays or '').split(',') if x.strip()!=''}
-        if at.weekday() not in days:return False
-        today=at.date().isoformat()
-        if promo.start_date and today<promo.start_date:return False
-        if promo.end_date and today>promo.end_date:return False
         current=at.strftime('%H:%M')
         start=promo.start_time or '00:00';end=promo.end_time or '23:59'
-        if start<=end:return start<=current<=end
-        return current>=start or current<=end
+        # Promociones nocturnas pertenecen al día en que comenzaron.
+        # Ej.: lunes 22:00–martes 02:00 debe seguir activa el martes 01:00.
+        effective_date=at.date()
+        if start<=end:
+            if not start<=current<=end:return False
+        elif current>=start:
+            pass
+        elif current<=end:
+            effective_date-=timedelta(days=1)
+        else:
+            return False
+        if effective_date.weekday() not in days:return False
+        day=effective_date.isoformat()
+        if promo.start_date and day<promo.start_date:return False
+        if promo.end_date and day>promo.end_date:return False
+        return True
     except Exception:
         return False
 
@@ -500,25 +928,90 @@ def apply_promotion(base_cents, promo):
         return max(0,int((Decimal(base_cents)*(Decimal(100-promo.discount_percent)/Decimal(100))).quantize(Decimal('1'),rounding=ROUND_HALF_UP)))
     return base_cents
 
-def product_dict(p,settings,db=None):
-    status='No disponible' if p.blocked or not p.active else ('Sin control' if not settings.inventory_on or not p.inventory_enabled else ('Agotado' if p.stock==0 else 'Stock bajo' if p.stock<=3 else 'Disponible'))
-    variants=[];groups=[];promotions=[];active_promo=None
-    if db is not None:
-        variants=[{'id':v.id,'name':v.name,'price':amount(v.price_cents),'active':v.active,'sort_order':v.sort_order}
-                  for v in db.scalars(select(ProductVariant).where(ProductVariant.product_id==p.id).order_by(ProductVariant.sort_order,ProductVariant.id))]
-        for g in db.scalars(select(ProductModifierGroup).where(ProductModifierGroup.product_id==p.id).order_by(ProductModifierGroup.sort_order,ProductModifierGroup.id)):
-            options=[{'id':o.id,'name':o.name,'price_delta':amount(o.price_delta_cents),'active':o.active,'sort_order':o.sort_order}
-                     for o in db.scalars(select(ProductModifierOption).where(ProductModifierOption.group_id==g.id).order_by(ProductModifierOption.sort_order,ProductModifierOption.id))]
-            groups.append({'id':g.id,'name':g.name,'min_select':g.min_select,'max_select':g.max_select,'active':g.active,'options':options})
-        promo_rows=db.scalars(select(ProductPromotion).where(ProductPromotion.product_id==p.id).order_by(ProductPromotion.id.desc())).all()
-        promotions=[{'id':x.id,'name':x.name,'price':amount(x.price_cents) if x.price_cents is not None else None,'discount_percent':x.discount_percent,'weekdays':x.weekdays,'start_time':x.start_time,'end_time':x.end_time,'start_date':x.start_date,'end_date':x.end_date,'active':x.active}
-                    for x in promo_rows]
-        active_promo=next((x for x in promo_rows if promotion_is_active(x)),None)
+def product_related_data(db, products):
+    """Carga las relaciones del catálogo en lotes, evitando consultas N+1."""
+    product_ids = [p.id for p in products]
+    if not product_ids:
+        return {"variants": {}, "groups": {}, "options": {}, "promotions": {}}
+
+    variants = db.scalars(
+        select(ProductVariant)
+        .where(ProductVariant.product_id.in_(product_ids))
+        .order_by(ProductVariant.product_id, ProductVariant.sort_order, ProductVariant.id)
+    ).all()
+    groups = db.scalars(
+        select(ProductModifierGroup)
+        .where(ProductModifierGroup.product_id.in_(product_ids))
+        .order_by(ProductModifierGroup.product_id, ProductModifierGroup.sort_order,
+                  ProductModifierGroup.id)
+    ).all()
+    group_ids = [g.id for g in groups]
+    options = db.scalars(
+        select(ProductModifierOption)
+        .where(ProductModifierOption.group_id.in_(group_ids))
+        .order_by(ProductModifierOption.group_id, ProductModifierOption.sort_order,
+                  ProductModifierOption.id)
+    ).all() if group_ids else []
+    promotions = db.scalars(
+        select(ProductPromotion)
+        .where(ProductPromotion.product_id.in_(product_ids))
+        .order_by(ProductPromotion.product_id, ProductPromotion.id.desc())
+    ).all()
+
+    def grouped(rows, key):
+        result = {}
+        for row in rows:
+            result.setdefault(getattr(row, key), []).append(row)
+        return result
+
+    return {
+        "variants": grouped(variants, "product_id"),
+        "groups": grouped(groups, "product_id"),
+        "options": grouped(options, "group_id"),
+        "promotions": grouped(promotions, "product_id"),
+    }
+
+
+def product_dict(p,settings,db=None,related=None):
+    status='Solo inventario' if p.inventory_only else ('No disponible' if p.blocked or not p.active else ('Sin control' if not settings.inventory_on or not p.inventory_enabled else ('Agotado' if p.stock==0 else 'Stock bajo' if p.stock<=3 else 'Disponible')))
+    variant_rows=[];group_rows=[];option_map={};promo_rows=[]
+    if related is not None:
+        variant_rows=related["variants"].get(p.id, [])
+        group_rows=related["groups"].get(p.id, [])
+        option_map=related["options"]
+        promo_rows=related["promotions"].get(p.id, [])
+    elif db is not None:
+        variant_rows=db.scalars(select(ProductVariant).where(
+            ProductVariant.product_id==p.id).order_by(
+            ProductVariant.sort_order,ProductVariant.id)).all()
+        group_rows=db.scalars(select(ProductModifierGroup).where(
+            ProductModifierGroup.product_id==p.id).order_by(
+            ProductModifierGroup.sort_order,ProductModifierGroup.id)).all()
+        for group in group_rows:
+            option_map[group.id]=db.scalars(select(ProductModifierOption).where(
+                ProductModifierOption.group_id==group.id).order_by(
+                ProductModifierOption.sort_order,ProductModifierOption.id)).all()
+        promo_rows=db.scalars(select(ProductPromotion).where(
+            ProductPromotion.product_id==p.id).order_by(ProductPromotion.id.desc())).all()
+
+    variants=[{'id':v.id,'name':v.name,'price':amount(v.price_cents),'active':v.active,'sort_order':v.sort_order}
+              for v in variant_rows]
+    groups=[]
+    for g in group_rows:
+        options=[{'id':o.id,'name':o.name,'price_delta':amount(o.price_delta_cents),'active':o.active,'sort_order':o.sort_order,
+                  'inventory_product_id':o.inventory_product_id,'inventory_quantity':o.inventory_quantity}
+                 for o in option_map.get(g.id, [])]
+        groups.append({'id':g.id,'name':g.name,'min_select':g.min_select,'max_select':g.max_select,'active':g.active,'options':options})
+    promotions=[{'id':x.id,'name':x.name,'price':amount(x.price_cents) if x.price_cents is not None else None,'discount_percent':x.discount_percent,'weekdays':x.weekdays,'start_time':x.start_time,'end_time':x.end_time,'start_date':x.start_date,'end_date':x.end_date,'active':x.active}
+                for x in promo_rows]
+    active_promo=next((x for x in promo_rows if promotion_is_active(x)),None)
     current_cents=apply_promotion(p.price_cents,active_promo)
     return {'id':p.id,'name':p.name,'category':p.category,'station':p.station,'price':amount(p.price_cents),
             'current_price':amount(current_cents),'promotion':({'id':active_promo.id,'name':active_promo.name,'price':amount(current_cents),'fixed_price':amount(active_promo.price_cents) if active_promo.price_cents is not None else None,'discount_percent':active_promo.discount_percent} if active_promo else None),
             'variants':variants,'modifier_groups':groups,'promotions':promotions,
-            'active':p.active,'blocked':p.blocked,'inventory_enabled':p.inventory_enabled,'stock':p.stock,'version':p.version,'status':status}
+            'active':p.active,'blocked':p.blocked,'inventory_enabled':p.inventory_enabled,'stock':p.stock,
+            'inventory_only':p.inventory_only,'inventory_unit':p.inventory_unit,
+            'version':p.version,'status':status}
 
 def _pin_lookup(pin: str) -> str:
     return hmac.new(SECRET_KEY.encode('utf-8'),
@@ -554,12 +1047,28 @@ def login_pin(data: PinLoginIn, request: Request, db: Session = Depends(db_sessi
     attempts = [t for t in login_failures.get(identifier, []) if time.time() - t < 600]
     if len(attempts) >= 15:
         raise HTTPException(429, 'Demasiados intentos. Espera 10 minutos.')
-    rec = db.scalar(select(UserPin).where(UserPin.lookup == _pin_lookup(data.pin)))
-    user = db.get(User, rec.user_id) if rec else None
+    lookup_started = time.perf_counter()
+    match = db.execute(
+        select(UserPin, User)
+        .join(User, User.id == UserPin.user_id)
+        .where(UserPin.lookup == _pin_lookup(data.pin))
+    ).first()
+    lookup_ms = (time.perf_counter() - lookup_started) * 1000
+    rec, user = match if match else (None, None)
+
+    verify_started = time.perf_counter()
     try:
         valid = bool(user and user.active and ph.verify(rec.pin_hash, data.pin))
     except (VerifyMismatchError, VerificationError):
         valid = False
+    verify_ms = (time.perf_counter() - verify_started) * 1000
+
+    total_ms = lookup_ms + verify_ms
+    if total_ms >= 250:
+        http_log.warning(
+            "slow_pin_login lookup_ms=%.1f argon2_ms=%.1f total_ms=%.1f outcome=%s",
+            lookup_ms, verify_ms, total_ms, "success" if valid else "rejected",
+        )
     if not valid:
         attempts.append(time.time())
         login_failures[identifier] = attempts
@@ -574,7 +1083,8 @@ def login_pin(data: PinLoginIn, request: Request, db: Session = Depends(db_sessi
 class LoginIn(BaseModel): username:str; secret:str
 @app.post('/api/login')
 def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
-    identifier=f"{request.client.host if request.client else 'unknown'}:{data.username.strip().lower()}"
+    # Un límite por IP evita saltar el bloqueo probando distintos usuarios.
+    identifier=f"password:{request.client.host if request.client else 'unknown'}"
     attempts=[t for t in login_failures.get(identifier,[]) if time.time()-t<900]
     if len(attempts)>=7:raise HTTPException(429,'Demasiados intentos. Espera 15 minutos')
     user=db.scalar(select(User).where(User.username==data.username.strip()))
@@ -583,9 +1093,10 @@ def login(data:LoginIn,request:Request,db:Session=Depends(db_session)):
     if not valid:
         attempts.append(time.time());login_failures[identifier]=attempts
         raise HTTPException(401,'Credenciales incorrectas')
-    # Cuando ya se asignó PIN, los perfiles operativos usan solo el teclado numérico.
-    if user.role != 'owner' and db.get(UserPin, user.id):
-        raise HTTPException(403, 'Este empleado ya utiliza acceso mediante PIN')
+    # El acceso con contraseña antigua es solo recuperación del propietario.
+    # Incluso los perfiles antiguos sin PIN deben activarlo antes de operar.
+    if user.role != 'owner':
+        raise HTTPException(403, 'El acceso de empleados requiere PIN personal de seis dígitos')
     login_failures.pop(identifier,None)
     token=jwt.encode({'sub':str(user.id),'ver':user.session_version,'exp':now()+timedelta(hours=10)},SECRET_KEY,algorithm='HS256')
     return {'token':token,'user':{'id':user.id,'display':user.display,'username':user.username,'role':user.role}}
@@ -672,17 +1183,21 @@ def _push_one(row,payload):
                   'keys':{'p256dh':row['p256dh'],'auth':row['auth_key']}},
                 data=json.dumps(payload,ensure_ascii=False),
                 vapid_private_key=VAPID_PRIVATE_KEY,
-                vapid_claims={'sub':VAPID_SUBJECT},ttl=600,timeout=5)
-        return None
+                vapid_claims={'sub':VAPID_SUBJECT},ttl=43200,timeout=5)
+        return {'ok':True,'expired_id':None,'error':None}
     except WebPushException as exc:
-        if exc.status_code in (404,410):return row['id']
+        if exc.status_code in (404,410):
+            return {'ok':False,'expired_id':row['id'],'error':f'HTTP {exc.status_code}'}
         log.warning('Fallo push id=%s codigo=%s',row['id'],exc.status_code)
-    except Exception:
+        return {'ok':False,'expired_id':None,'error':f'HTTP {exc.status_code or "desconocido"}'}
+    except Exception as exc:
         log.exception('Error de notificación push id=%s',row['id'])
-    return None
+        return {'ok':False,'expired_id':None,'error':type(exc).__name__}
+
 
 async def push_to(payload,role=None,user_id=None):
-    if not PUSH_ENABLED:return
+    if not PUSH_ENABLED:
+        return {'enabled':False,'devices':0,'sent':0,'failed':0,'error':'Web Push no configurado'}
     try:
         with SessionLocal() as db:
             q=select(PushDevice).join(User,PushDevice.user_id==User.id).where(User.active.is_(True))
@@ -690,17 +1205,26 @@ async def push_to(payload,role=None,user_id=None):
             if user_id:q=q.where(User.id==user_id)
             rows=[{'id':d.id,'endpoint':d.endpoint,'p256dh':d.p256dh,'auth_key':d.auth_key}
                   for d in db.scalars(q)]
-        if not rows:return
+        if not rows:
+            return {'enabled':True,'devices':0,'sent':0,'failed':0,'error':'Sin dispositivos Web Push registrados'}
         results=await asyncio.gather(*(asyncio.to_thread(_push_one,r,payload) for r in rows),return_exceptions=True)
-        expired=[x for x in results if isinstance(x,int)]
+        normalized=[x if isinstance(x,dict) else {
+            'ok':False,'expired_id':None,'error':type(x).__name__
+        } for x in results]
+        expired=[x['expired_id'] for x in normalized if x.get('expired_id') is not None]
         if expired:
             with SessionLocal() as db:
                 for rid in expired:
                     d=db.get(PushDevice,rid)
                     if d:db.delete(d)
                 db.commit()
-    except Exception:
+        sent=sum(1 for x in normalized if x.get('ok'))
+        errors=[str(x.get('error')) for x in normalized if x.get('error')]
+        return {'enabled':True,'devices':len(rows),'sent':sent,'failed':len(rows)-sent,
+                'error':'; '.join(errors[:3]) if errors else None}
+    except Exception as exc:
         log.exception('No se pudieron distribuir notificaciones push')
+        return {'enabled':True,'devices':0,'sent':0,'failed':1,'error':type(exc).__name__}
 
 @app.post('/api/push/test')
 async def push_test(user:User=Depends(auth)):
@@ -744,21 +1268,26 @@ def _fcm_send_one(device, payload):
         token=device['token'],
         data={'title': str(payload.get('title','El Mitote Comandas'))[:100],
               'body': str(payload.get('body','Nuevo aviso'))[:180],
-              'route': route},
-        android=messaging.AndroidConfig(priority='high', ttl=timedelta(minutes=10))
+              'route': route,
+              'kind': str(payload.get('kind','general'))[:32],
+              'tag': str(payload.get('tag','mitote-aviso'))[:100],
+              'event_id': str(payload.get('event_id',''))[:90],
+              'recipient_id': str(payload.get('recipient_id',''))[:40]},
+        android=messaging.AndroidConfig(priority='high', ttl=timedelta(hours=12))
     )
     try:
-        messaging.send(msg)
-        return None
+        message_id=messaging.send(msg)
+        return {'ok':True,'message_id':message_id,'expired_id':None,'error':None}
     except Exception as exc:
         if isinstance(exc, getattr(messaging, 'UnregisteredError', type(None))):
-            return device['id']
-        log.warning('FCM no pudo entregar al dispositivo %s: %s', device['id'], type(exc).__name__)
-        return None
+            return {'ok':False,'message_id':None,'expired_id':device['id'],'error':'Token FCM no registrado'}
+        log.warning('FCM no pudo aceptar el dispositivo %s: %s', device['id'], type(exc).__name__)
+        return {'ok':False,'message_id':None,'expired_id':None,'error':type(exc).__name__}
+
 
 async def fcm_to(payload, role=None, user_id=None):
     if not _firebase_ready():
-        return
+        return {'enabled':False,'devices':0,'sent':0,'failed':0,'error':'Firebase Cloud Messaging no configurado'}
     try:
         with SessionLocal() as db:
             q = select(FcmDevice).join(User, FcmDevice.user_id == User.id).where(User.active.is_(True))
@@ -768,9 +1297,12 @@ async def fcm_to(payload, role=None, user_id=None):
                 q = q.where(User.id == user_id)
             devices = [{'id': x.id, 'token': x.token} for x in db.scalars(q)]
         if not devices:
-            return
+            return {'enabled':True,'devices':0,'sent':0,'failed':0,'error':'Sin dispositivos FCM registrados'}
         results = await asyncio.gather(*(asyncio.to_thread(_fcm_send_one, d, payload) for d in devices), return_exceptions=True)
-        expired = [x for x in results if isinstance(x, int)]
+        normalized=[x if isinstance(x,dict) else {
+            'ok':False,'message_id':None,'expired_id':None,'error':type(x).__name__
+        } for x in results]
+        expired = [x['expired_id'] for x in normalized if x.get('expired_id') is not None]
         if expired:
             with SessionLocal() as db:
                 for device_id in expired:
@@ -778,8 +1310,13 @@ async def fcm_to(payload, role=None, user_id=None):
                     if old:
                         db.delete(old)
                 db.commit()
-    except Exception:
+        sent=sum(1 for x in normalized if x.get('ok'))
+        errors=[str(x.get('error')) for x in normalized if x.get('error')]
+        return {'enabled':True,'devices':len(devices),'sent':sent,'failed':len(devices)-sent,
+                'error':'; '.join(errors[:3]) if errors else None}
+    except Exception as exc:
         log.exception('Fallo el envío FCM')
+        return {'enabled':True,'devices':0,'sent':0,'failed':1,'error':type(exc).__name__}
 
 @app.post('/api/fcm/test')
 async def fcm_test(db: Session = Depends(db_session), user: User = Depends(auth)):
@@ -839,7 +1376,11 @@ async def create_staff(data: StaffCreateIn, db: Session = Depends(db_session), u
     db.flush()
     _set_user_pin(db, target, data.pin)
     audit(db, user, 'staff.create', id=target.id, role=target.role, name=name)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, 'El PIN o el identificador del empleado ya está en uso')
     await notify()
     return {'id':target.id,'display':target.display,'role':target.role}
 
@@ -855,23 +1396,42 @@ async def assign_staff_pin(user_id: int, data: StaffPinIn,
         raise HTTPException(404, 'Personal no encontrado')
     _set_user_pin(db, target, data.pin)
     audit(db,user,'staff.pin_set',id=target.id)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, 'El PIN ya pertenece a otra persona')
     await notify()
     return {'ok':True,'owner_pin_changed':target.id == user.id}
 
-class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:str=Field(min_length=2,max_length=100);role:Literal['admin','cashier','waiter','kitchen','bar'];secret:str=Field(min_length=4,max_length=120)
+class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:str=Field(min_length=2,max_length=100);role:Literal['admin','cashier','waiter','kitchen','bar'];secret:str=Field(min_length=6,max_length=6)
 @app.get('/api/users')
 def users(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
-    return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,'active':u.active,'has_pin':db.get(UserPin,u.id) is not None} for u in db.scalars(select(User).order_by(User.id))]
+    rows=db.scalars(select(User).order_by(User.id)).all()
+    user_ids=[row.id for row in rows]
+    pin_ids=set(db.scalars(select(UserPin.user_id).where(
+        UserPin.user_id.in_(user_ids))).all()) if user_ids else set()
+    return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,
+             'active':u.active,'has_pin':u.id in pin_ids} for u in rows]
 @app.post('/api/users')
 async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner')
-    if data.role=='waiter' and (len(data.secret)!=4 or not data.secret.isdigit()):raise HTTPException(400,'El PIN del mesero debe tener cuatro dígitos')
-    if data.role!='waiter' and len(data.secret)<8:raise HTTPException(400,'La contraseña debe tener al menos 8 caracteres')
-    if db.scalar(select(User).where(User.username==data.username.strip())):raise HTTPException(409,'Usuario ya registrado')
-    u=User(username=data.username.strip(),display=data.display.strip(),role=data.role,password_hash=ph.hash(data.secret))
-    db.add(u);audit(db,user,'user.create',username=u.username,role=u.role);db.commit();await notify()
+    # Compatibilidad con clientes anteriores: nunca crear empleados sin PIN.
+    if not _pin_format(data.secret):raise HTTPException(400,'El PIN debe tener exactamente seis números')
+    username=data.username.strip()
+    display=data.display.strip()
+    if not username or not display:raise HTTPException(400,'Nombre y usuario son obligatorios')
+    if db.scalar(select(User).where(User.username==username)):raise HTTPException(409,'Usuario ya registrado')
+    u=User(username=username,display=display,role=data.role,password_hash=ph.hash(secrets.token_urlsafe(32)))
+    db.add(u);db.flush()
+    _set_user_pin(db,u,data.secret)
+    audit(db,user,'user.create',username=u.username,role=u.role)
+    try:db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409,'Usuario o PIN ya registrado')
+    await notify()
     return {'id':u.id}
 
 class UserUpdateIn(BaseModel): active:Optional[bool]=None;secret:Optional[str]=None
@@ -883,11 +1443,18 @@ async def update_user(user_id:int,data:UserUpdateIn,db:Session=Depends(db_sessio
     if target.id==user.id or target.role=='owner':raise HTTPException(403,'No se puede desactivar ni modificar al propietario desde aquí')
     if data.active is not None:target.active=data.active
     if data.secret is not None:
-        if target.role=='waiter' and (len(data.secret)!=4 or not data.secret.isdigit()):raise HTTPException(400,'PIN de 4 dígitos requerido')
-        if target.role!='waiter' and len(data.secret)<8:raise HTTPException(400,'Contraseña de 8 caracteres requerida')
-        target.password_hash=ph.hash(data.secret)
-    target.session_version+=1
-    audit(db,user,'user.update',id=target.id,active=target.active,reset=bool(data.secret));db.commit();await notify();return {'ok':True}
+        # La API anterior ya no debe habilitar credenciales sin PIN.
+        _set_user_pin(db,target,data.secret)
+        target.password_hash=ph.hash(secrets.token_urlsafe(32))
+    else:
+        target.session_version=(target.session_version or 1)+1
+    audit(db,user,'user.update',id=target.id,active=target.active,reset=bool(data.secret))
+    try:db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409,'El PIN ya pertenece a otra persona')
+    await notify()
+    return {'ok':True}
 
 @app.get('/api/settings')
 def settings(db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -897,7 +1464,7 @@ class SettingsIn(BaseModel): inventory_on:bool;confirmed_recount:bool=False
 @app.put('/api/settings')
 async def set_settings(data:SettingsIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
-    s=db.get(Setting,1)
+    s=db.execute(select(Setting).where(Setting.id==1).with_for_update()).scalar_one()
     if data.inventory_on and not s.inventory_on and not data.confirmed_recount:raise HTTPException(409,'Confirma el recuento de existencias antes de activar inventario')
     old=s.inventory_on;s.inventory_on=data.inventory_on;s.inventory_reviewed=data.confirmed_recount if data.inventory_on else False
     audit(db,user,'inventory.global',old=old,new=s.inventory_on);db.commit();await notify();return {'ok':True}
@@ -905,7 +1472,42 @@ async def set_settings(data:SettingsIn,db:Session=Depends(db_session),user:User=
 @app.get('/api/products')
 def products(db:Session=Depends(db_session),user:User=Depends(auth)):
     s=db.get(Setting,1)
-    return [product_dict(p,s,db) for p in db.scalars(select(Product).order_by(Product.category,Product.name))]
+    query=select(Product).outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id).where(
+        ArchivedProduct.product_id.is_(None)).order_by(Product.category,Product.name)
+    rows=db.scalars(query).all()
+    related=product_related_data(db,rows)
+    return [product_dict(p,s,related=related) for p in rows]
+class RemoveCategoryIn(BaseModel):
+    name:str=Field(min_length=1,max_length=80)
+    destination:str=Field(min_length=1,max_length=80)
+    expected_visible_count:int=Field(ge=1)
+
+@app.post('/api/categories/remove')
+async def remove_category(data:RemoveCategoryIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    source=data.name.strip()
+    destination=data.destination.strip()
+    if not source or not destination or source.casefold()==destination.casefold():
+        raise HTTPException(400,'Indica una categoría destino diferente')
+    rows=db.scalars(select(Product).where(Product.category==source).with_for_update()).all()
+    if not rows:raise HTTPException(404,'La categoría ya no existe')
+    hidden=set(db.scalars(select(ArchivedProduct.product_id).where(
+        ArchivedProduct.product_id.in_([p.id for p in rows]))))
+    visible_count=sum(p.id not in hidden for p in rows)
+    if visible_count!=data.expected_visible_count:
+        raise HTTPException(409,'El contenido de la categoría cambió; actualiza antes de borrarla')
+    for p in rows:
+        p.category=destination
+        p.version=(p.version or 1)+1
+    audit(db,user,'category.remove',source=source,destination=destination,
+          active_products=visible_count,all_products=len(rows))
+    db.commit();await notify()
+    return {'ok':True,'moved':visible_count,'new_category':destination}
+
+class ProductArchiveIn(BaseModel):
+    expected_version:int=Field(ge=1)
+    reason:str=Field(min_length=3,max_length=200)
+
 class ProductIn(BaseModel):
     name:str=Field(min_length=1,max_length=160)
     category:str='General'
@@ -915,6 +1517,8 @@ class ProductIn(BaseModel):
     blocked:bool=False
     inventory_enabled:bool=False
     stock:int=Field(default=0,ge=0)
+    stock_reason:Optional[str]=Field(default=None,max_length=400)
+    expected_version:Optional[int]=Field(default=None,ge=1)
 class ActiveToggleIn(BaseModel):
     active: bool
 
@@ -936,6 +1540,17 @@ class ModifierOptionIn(BaseModel):
     price_delta: Decimal = Field(default=Decimal('0'),ge=0)
     active: bool = True
     sort_order: int = Field(default=0,ge=0,le=10000)
+    inventory_product_id: Optional[int] = Field(default=None,ge=1)
+    inventory_quantity: int = Field(default=1,ge=1,le=100)
+
+class ModifierOptionInventoryIn(BaseModel):
+    inventory_product_id: Optional[int] = Field(default=None,ge=1)
+    inventory_quantity: int = Field(default=1,ge=1,le=100)
+
+class InventoryItemIn(BaseModel):
+    name: str = Field(min_length=2,max_length=160)
+    stock: int = Field(default=0,ge=0,le=100000)
+    unit: Literal['botellas','latas','unidades','kg','litros'] = 'botellas'
 
 class PromotionIn(BaseModel):
     name: str = Field(min_length=1,max_length=120)
@@ -974,8 +1589,34 @@ async def add_modifier_group(product_id:int,data:ModifierGroupIn,db:Session=Depe
 async def add_modifier_option(group_id:int,data:ModifierOptionIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin');g=db.get(ProductModifierGroup,group_id)
     if not g:raise HTTPException(404,'Grupo de modificadores inexistente')
-    o=ProductModifierOption(group_id=g.id,name=data.name.strip(),price_delta_cents=cents(data.price_delta),active=data.active,sort_order=data.sort_order)
-    db.add(o);db.flush();audit(db,user,'product.modifier_option.create',group_id=g.id,option_id=o.id,name=o.name,price_delta=amount(o.price_delta_cents));db.commit();await notify();return {'id':o.id,'ok':True}
+    stock_item=None
+    if data.inventory_product_id is not None:
+        stock_item=db.get(Product,data.inventory_product_id)
+        if not stock_item or not stock_item.inventory_only or not stock_item.inventory_enabled:
+            raise HTTPException(400,'Selecciona un insumo con control de inventario activo')
+    o=ProductModifierOption(group_id=g.id,name=data.name.strip(),price_delta_cents=cents(data.price_delta),
+        active=data.active,sort_order=data.sort_order,
+        inventory_product_id=stock_item.id if stock_item else None,inventory_quantity=data.inventory_quantity)
+    db.add(o);db.flush()
+    audit(db,user,'product.modifier_option.create',group_id=g.id,option_id=o.id,name=o.name,
+          price_delta=amount(o.price_delta_cents),inventory_product_id=o.inventory_product_id)
+    db.commit();await notify();return {'id':o.id,'ok':True}
+
+@app.patch('/api/modifier-options/{option_id}/inventory')
+async def link_modifier_inventory(option_id:int,data:ModifierOptionInventoryIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    option=db.get(ProductModifierOption,option_id)
+    if not option:raise HTTPException(404,'Opción inexistente')
+    stock_item=None
+    if data.inventory_product_id is not None:
+        stock_item=db.get(Product,data.inventory_product_id)
+        if not stock_item or not stock_item.inventory_only or not stock_item.inventory_enabled:
+            raise HTTPException(400,'Selecciona un insumo con control de inventario activo')
+    option.inventory_product_id=stock_item.id if stock_item else None
+    option.inventory_quantity=data.inventory_quantity
+    audit(db,user,'product.modifier_option.inventory_link',option_id=option.id,
+          inventory_product_id=option.inventory_product_id,inventory_quantity=option.inventory_quantity)
+    db.commit();await notify();return {'ok':True}
 
 @app.patch('/api/modifier-options/{option_id}')
 async def toggle_modifier_option(option_id:int,data:ActiveToggleIn,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -1011,14 +1652,75 @@ async def toggle_product_promotion(promotion_id:int,data:ActiveToggleIn,db:Sessi
 async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
     p=Product(name=data.name.strip(),category=data.category.strip()[:80],station=data.station,price_cents=cents(data.price),active=data.active,blocked=data.blocked,inventory_enabled=data.inventory_enabled,stock=data.stock)
-    db.add(p);audit(db,user,'product.create',name=p.name);db.commit();await notify();return {'id':p.id}
+    db.add(p);db.flush()
+    if data.inventory_enabled:
+        db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='opening',
+            quantity_change=p.stock,before_stock=0,after_stock=p.stock,
+            reason='Saldo inicial al crear producto',source_key=f'inventory-opening:{p.id}',created_at=now()))
+    audit(db,user,'product.create',name=p.name);db.commit();await notify();return {'id':p.id}
+@app.get('/api/products/archived')
+def archived_products(db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    rows=db.execute(select(ArchivedProduct,Product).join(
+        Product,Product.id==ArchivedProduct.product_id).order_by(ArchivedProduct.archived_at.desc()).limit(150)).all()
+    return [{'id':p.id,'name':p.name,'station':p.station,'version':p.version,
+             'reason':a.reason,'archived_at':a.archived_at.isoformat() if a.archived_at else ''}
+            for a,p in rows]
+
+@app.post('/api/products/{product_id}/archive')
+async def archive_product(product_id:int,data:ProductArchiveIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
+    if not p:raise HTTPException(404,'Producto inexistente')
+    if db.get(ArchivedProduct,p.id):raise HTTPException(409,'Este producto ya está eliminado del menú')
+    if p.version!=data.expected_version:raise HTTPException(409,'El producto cambió; actualiza la pantalla antes de eliminar')
+    db.add(ArchivedProduct(product_id=p.id,archived_by=user.id,reason=data.reason.strip(),
+                           original_active=bool(p.active),original_blocked=bool(p.blocked)))
+    p.active=False;p.blocked=True;p.version+=1
+    audit(db,user,'product.archive',product_id=p.id,name=p.name,reason=data.reason.strip())
+    db.commit();await notify()
+    return {'ok':True,'archived':True}
+
+class ProductRestoreIn(BaseModel):
+    expected_version:int=Field(ge=1)
+
+@app.post('/api/products/{product_id}/restore')
+async def restore_product(product_id:int,data:ProductRestoreIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
+    a=db.get(ArchivedProduct,product_id)
+    if not p or not a:raise HTTPException(404,'Producto archivado inexistente')
+    if p.version!=data.expected_version:raise HTTPException(409,'El producto cambió; actualiza la pantalla')
+    p.active=bool(a.original_active);p.blocked=bool(a.original_blocked);p.version+=1
+    db.delete(a)
+    audit(db,user,'product.restore',product_id=p.id,name=p.name)
+    db.commit();await notify()
+    return {'ok':True,'restored':True}
+
 @app.put('/api/products/{product_id}')
 async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
     p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
     if not p:raise HTTPException(404,'Producto inexistente')
+    if data.expected_version is None or p.version != data.expected_version:
+        raise HTTPException(409,'El producto o sus existencias cambiaron. Actualiza la pantalla antes de guardar')
     before=product_dict(p,db.get(Setting,1),db)
+    old_stock=p.stock;was_inventory_enabled=p.inventory_enabled
+    if data.stock!=old_stock and not (data.stock_reason or '').strip():
+        raise HTTPException(400,'Indica el motivo del ajuste de existencias')
+    if data.inventory_enabled and not was_inventory_enabled:
+        opening_key=f'inventory-opening:{p.id}'
+        if not db.scalar(select(InventoryMovement.id).where(InventoryMovement.source_key==opening_key)):
+            db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='opening',
+                quantity_change=old_stock,before_stock=0,after_stock=old_stock,
+                reason='Saldo inicial al activar control individual',source_key=opening_key,created_at=now()))
     p.name=data.name.strip();p.category=data.category.strip()[:80];p.station=data.station;p.price_cents=cents(data.price);p.active=data.active;p.blocked=data.blocked;p.inventory_enabled=data.inventory_enabled;p.stock=data.stock;p.version+=1
+    if data.stock!=old_stock:
+        db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='adjustment',
+            quantity_change=data.stock-old_stock,before_stock=old_stock,after_stock=data.stock,
+            reason=data.stock_reason.strip(),source_key=f'inventory-adjust-product:{secrets.token_urlsafe(18)}',created_at=now()))
+        audit(db,user,'inventory.adjustment',product_id=p.id,before=old_stock,delta=data.stock-old_stock,
+              after=data.stock,reason=data.stock_reason.strip(),source='product.edit')
     audit(db,user,'product.update',id=p.id,before=before,after=product_dict(p,db.get(Setting,1),db));db.commit();await notify();return {'ok':True}
 class RestockIn(BaseModel): delta:int=Field(gt=0,le=100000);reason:str=Field(min_length=3,max_length=400);expected_version:int
 @app.post('/api/products/{product_id}/restock')
@@ -1028,7 +1730,112 @@ async def restock(product_id:int,data:RestockIn,db:Session=Depends(db_session),u
     if not p:raise HTTPException(404,'Producto inexistente')
     if p.version!=data.expected_version:raise HTTPException(409,'Existencias cambiaron; actualiza la pantalla')
     before=p.stock;p.stock+=data.delta;p.version+=1
-    audit(db,user,'inventory.restock',product_id=p.id,before=before,delta=data.delta,after=p.stock,reason=data.reason);db.commit();await notify();return {'stock':p.stock}
+    db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='restock',
+        quantity_change=data.delta,before_stock=before,after_stock=p.stock,reason=data.reason.strip(),
+        source_key=f'inventory-restock:{secrets.token_urlsafe(18)}',created_at=now()))
+    audit(db,user,'inventory.restock',product_id=p.id,before=before,delta=data.delta,after=p.stock,reason=data.reason)
+    db.commit();await notify();return {'stock':p.stock}
+
+class InventoryAdjustmentIn(BaseModel):
+    mode:Literal['out','count']
+    quantity:int=Field(ge=0,le=100000)
+    reason:str=Field(min_length=3,max_length=400)
+    expected_version:int=Field(ge=1)
+
+@app.post('/api/products/{product_id}/inventory-adjustment')
+async def inventory_adjustment(product_id:int,data:InventoryAdjustmentIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
+    if not p:raise HTTPException(404,'Producto inexistente')
+    if p.version!=data.expected_version:raise HTTPException(409,'Existencias cambiaron; actualiza la pantalla')
+    before=p.stock
+    if data.mode=='out':
+        if data.quantity<1:raise HTTPException(400,'La salida debe ser de al menos una unidad')
+        if data.quantity>before:raise HTTPException(409,'La salida supera las existencias disponibles')
+        after=before-data.quantity;kind='manual_out';delta=-data.quantity
+    else:
+        after=data.quantity;delta=after-before;kind='adjustment'
+        if delta==0:raise HTTPException(400,'El recuento coincide con las existencias actuales')
+    p.stock=after;p.version+=1
+    db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind=kind,
+        quantity_change=delta,before_stock=before,after_stock=after,reason=data.reason.strip(),
+        source_key=f'inventory-manual:{secrets.token_urlsafe(18)}',created_at=now()))
+    audit(db,user,'inventory.manual_movement',product_id=p.id,kind=kind,
+          before=before,delta=delta,after=after,reason=data.reason.strip())
+    db.commit();await notify();return {'stock':p.stock,'delta':delta}
+
+@app.post('/api/inventory/items')
+async def create_inventory_item(data:InventoryItemIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    name=data.name.strip()
+    duplicate=db.scalar(select(Product.id).where(
+        Product.inventory_only.is_(True),func.lower(Product.name)==name.lower()))
+    if duplicate:raise HTTPException(409,'Ya existe un insumo con ese nombre')
+    item=Product(name=name,category='Insumos',station='bar',price_cents=0,
+        active=False,blocked=True,inventory_enabled=True,stock=data.stock,
+        inventory_only=True,inventory_unit=data.unit)
+    db.add(item);db.flush()
+    db.add(InventoryMovement(product_id=item.id,actor_id=user.id,kind='opening',
+        quantity_change=item.stock,before_stock=0,after_stock=item.stock,
+        reason='Saldo inicial al registrar insumo',source_key=f'inventory-opening:{item.id}',created_at=now()))
+    audit(db,user,'inventory.item.create',product_id=item.id,name=item.name,stock=item.stock,unit=item.inventory_unit)
+    db.commit();await notify()
+    return {'id':item.id,'ok':True}
+
+@app.get('/api/inventory/movements')
+def inventory_movements(product_id:Optional[int]=None,kind:Optional[str]=None,
+                        from_date:Optional[str]=None,to_date:Optional[str]=None,
+                        limit:int=120,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    filters=[]
+    if product_id is not None:filters.append(InventoryMovement.product_id==product_id)
+    allowed_kinds={'opening','restock','sale','return','manual_out','adjustment'}
+    if kind:
+        if kind not in allowed_kinds:raise HTTPException(400,'Tipo de movimiento inválido')
+        filters.append(InventoryMovement.kind==kind)
+    tz=ZoneInfo('America/Mexico_City')
+    def local_boundary(value,exclusive_end=False):
+        if not value:return None
+        try:
+            day=datetime.strptime(value,'%Y-%m-%d')
+            if exclusive_end:day+=timedelta(days=1)
+            return day.replace(tzinfo=tz).astimezone(timezone.utc)
+        except ValueError:
+            raise HTTPException(400,'Fecha inválida; utiliza AAAA-MM-DD')
+    start=local_boundary(from_date)
+    end=local_boundary(to_date,True)
+    if start and end and start>=end:raise HTTPException(400,'El rango de fechas no es válido')
+    if start:filters.append(InventoryMovement.created_at>=start)
+    if end:filters.append(InventoryMovement.created_at<end)
+    summary_rows=db.execute(
+        select(InventoryMovement.kind,func.coalesce(func.sum(InventoryMovement.quantity_change),0))
+        .where(*filters).group_by(InventoryMovement.kind)
+    ).all()
+    summary={name:int(value or 0) for name,value in summary_rows}
+    stmt=(select(InventoryMovement,Product,User,Account)
+          .join(Product,Product.id==InventoryMovement.product_id)
+          .outerjoin(User,User.id==InventoryMovement.actor_id)
+          .outerjoin(Account,Account.id==InventoryMovement.account_id)
+          .where(*filters)
+          .order_by(InventoryMovement.created_at.desc(),InventoryMovement.id.desc())
+          .limit(max(1,min(limit,300))))
+    rows=db.execute(stmt).all()
+    movements=[]
+    for movement,product,actor,account in rows:
+        movements.append({
+            'id':movement.id,'product_id':product.id,'product_name':product.name,
+            'category':product.category,'kind':movement.kind,'inventory_unit':product.inventory_unit,
+            'quantity_change':movement.quantity_change,'before_stock':movement.before_stock,
+            'after_stock':movement.after_stock,'reason':movement.reason,
+            'actor_name':actor.display if actor else 'Sistema',
+            'account_id':movement.account_id,'account_name':movement.account_name or (account.name if account else ''),
+            'account_status':account.status if account else '',
+            'account_closed_at':account.closed_at.isoformat() if account and account.closed_at else '',
+            'table_name':movement.table_name or '',
+            'batch_id':movement.batch_id,'order_item_id':movement.order_item_id,
+            'created_at':movement.created_at.isoformat() if movement.created_at else ''
+        })
+    return {'summary':summary,'movements':movements,'limit':max(1,min(limit,300))}
 
 def dining_table_dict(db,t):
     occupancy=db.get(TableOccupancy,t.id)
@@ -1040,13 +1847,41 @@ def dining_table_dict(db,t):
             'account_id':account.id if occupied else None,'account_name':account.name if occupied else None,
             'waiter':owner.display if owner else None}
 
+def dining_table_dict_many(db,tables):
+    """Resuelve ocupación, cuenta y mesero de todas las mesas con una consulta."""
+    if not tables:
+        return []
+    table_ids=[t.id for t in tables]
+    rows=db.execute(
+        select(TableOccupancy.table_id,Account.id,Account.name,Account.status,User.display)
+        .join(Account,Account.id==TableOccupancy.account_id)
+        .outerjoin(User,User.id==Account.owner_id)
+        .where(TableOccupancy.table_id.in_(table_ids))
+    ).all()
+    by_table={row[0]:row for row in rows}
+    result=[]
+    for table in tables:
+        row=by_table.get(table.id)
+        occupied=bool(row and row[3] in ('open','pending'))
+        result.append({
+            'id':table.id,'name':table.name,'area':table.area,'capacity':table.capacity,
+            'active':table.active,'sort_order':table.sort_order,
+            'status':'occupied' if occupied else 'available',
+            'account_id':row[1] if occupied else None,
+            'account_name':row[2] if occupied else None,
+            'waiter':row[4] if row else None
+        })
+    return result
+
+
 @app.get('/api/tables')
 def dining_tables(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier','waiter')
     q=select(DiningTable).order_by(DiningTable.area,DiningTable.sort_order,DiningTable.id)
     if user.role not in ('owner','admin'):
         q=q.where(DiningTable.active.is_(True))
-    return [dining_table_dict(db,t) for t in db.scalars(q)]
+    rows=db.scalars(q).all()
+    return dining_table_dict_many(db,rows)
 
 class DiningTableIn(BaseModel):
     name:str=Field(min_length=1,max_length=80)
@@ -1100,26 +1935,93 @@ async def update_dining_table(table_id:int,data:DiningTableIn,db:Session=Depends
 @app.get('/api/accounts')
 def accounts(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier','waiter')
-    q=select(Account).order_by(Account.id.desc())
+    p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    if not p:return []  # Los cierres anteriores se consultan solo desde el historial de caja.
+    q=select(Account).where(Account.created_at>=p.opened_at).order_by(Account.id.desc())
     if user.role=='waiter':q=q.where(Account.owner_id==user.id)
     else:q=q.limit(200)
-    return [account_dict(db,a) for a in db.scalars(q)]
+    rows=db.scalars(q).all()
+    return account_dict_many(db,rows)
+
+@app.get('/api/overview')
+def overview(db:Session=Depends(db_session),user:User=Depends(auth)):
+    """Resumen compacto del panel: métricas agregadas sin descargar listas completas."""
+    allow(user,'owner','admin')
+    period=db.scalar(select(CashPeriod).where(
+        CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    status_counts={}
+    new_tickets=0
+    if period:
+        status_counts=dict(db.execute(
+            select(Account.status,func.count(Account.id))
+            .where(Account.created_at>=period.opened_at)
+            .group_by(Account.status)
+        ).all())
+        new_tickets=db.scalar(
+            select(func.count(StationTicket.id))
+            .join(Batch,Batch.id==StationTicket.batch_id)
+            .where(Batch.created_at>=period.opened_at,StationTicket.status=='new')
+        ) or 0
+    product_count=db.scalar(
+        select(func.count(Product.id))
+        .outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id)
+        .where(ArchivedProduct.product_id.is_(None))
+    ) or 0
+    return {
+        'active_accounts':int(status_counts.get('open',0)+status_counts.get('pending',0)),
+        'pending_accounts':int(status_counts.get('pending',0)),
+        'new_tickets':int(new_tickets),
+        'products':int(product_count),
+    }
 class AccountIn(BaseModel):
     name:Optional[str]=Field(default=None,max_length=120)
     table_id:Optional[int]=None
+    client_key:Optional[str]=Field(default=None,max_length=80)
 
 @app.post('/api/accounts')
 async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','waiter')
-    period=active_period(db)  # Locks the current shift against a concurrent close.
+    client_key=(data.client_key or '').strip()
+    payload={'name':(data.name or '').strip(),'table_id':data.table_id}
+    request_hash=hashlib.sha256(json.dumps(payload,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+    def existing_create():
+        if not client_key:
+            return None
+        record=db.scalar(select(AccountCreateKey).where(
+            AccountCreateKey.user_id==user.id,
+            AccountCreateKey.client_key==client_key))
+        if not record:
+            return None
+        if not hmac.compare_digest(record.request_hash,request_hash):
+            raise HTTPException(409,'La clave de reintento ya fue utilizada con otros datos. Actualiza la pantalla antes de continuar.')
+        account=db.get(Account,record.account_id)
+        if not account:
+            raise HTTPException(409,'La cuenta asociada al reintento ya no está disponible.')
+        return account
+
+    def duplicate_response(account):
+        table_id=db.scalar(select(TableOccupancy.table_id).where(
+            TableOccupancy.account_id==account.id))
+        return {'id':account.id,'table_id':table_id,'duplicate':True}
+
+    previous=existing_create()
+    if previous:
+        return duplicate_response(previous)
+
+    period=active_period_for_work(db)  # Shared lock: concurrent waiters may open accounts together.
     if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id==period.id)):
         raise HTTPException(409,'El reparto de propinas ya fue generado; el turno está en proceso de cierre. Abre un nuevo turno para continuar.')
     table=None
     if data.table_id is not None:
         table=db.execute(select(DiningTable).where(DiningTable.id==data.table_id).with_for_update()).scalar_one_or_none()
         if not table or not table.active:raise HTTPException(404,'La mesa no existe o está desactivada')
-        if db.get(TableOccupancy,table.id):raise HTTPException(409,'Esta mesa ya está ocupada. Actualiza la lista de mesas.')
-    account_name=(data.name or '').strip()
+        if db.get(TableOccupancy,table.id):
+            previous=existing_create()
+            if previous:
+                return duplicate_response(previous)
+            raise HTTPException(409,'Esta mesa ya está ocupada. Actualiza la lista de mesas.')
+    account_name=payload['name']
     if not account_name and table:account_name=table.name
     if not account_name:raise HTTPException(400,'Escribe un nombre para la cuenta libre o selecciona una mesa')
     a=Account(name=account_name,owner_id=user.id)
@@ -1128,13 +2030,20 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
     if table:
         db.add(TableOccupancy(table_id=table.id,account_id=a.id,assigned_by=user.id))
         audit(db,user,'table.assign',table_id=table.id,table_name=table.name,account_id=a.id,waiter=user.display)
+    if client_key:
+        db.add(AccountCreateKey(user_id=user.id,client_key=client_key,
+            account_id=a.id,request_hash=request_hash))
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        previous=existing_create()
+        if previous:
+            return duplicate_response(previous)
         raise HTTPException(409,'La mesa acaba de ser ocupada por otro mesero. Actualiza las mesas.')
     await notify()
-    return {'id':a.id,'table_id':table.id if table else None}
+    return {'id':a.id,'table_id':table.id if table else None,'duplicate':False}
+
 class VoidAccountIn(BaseModel):
     reason:str=Field(min_length=3,max_length=400)
 
@@ -1156,39 +2065,117 @@ async def void_account(account_id:int,data:VoidAccountIn,db:Session=Depends(db_s
 def account_detail(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier','waiter')
     a=owner_account(db,user,account_id,allowed=None)
-    batches=db.scalars(select(Batch).where(Batch.account_id==a.id).order_by(Batch.id)).all()
-    result=account_dict(db,a);result['items']=[];result['batches']=[]
-    for b in batches:
-        items=db.scalars(select(OrderItem).where(OrderItem.batch_id==b.id)).all()
-        result['batches'].append({'id':b.id,'sent_by':db.get(User,b.sent_by).display,'created_at':b.created_at.isoformat() if b.created_at else ''})
-        for i in items:
-            meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==i.id))
-            try:modifiers=json.loads(meta.modifiers_json or '[]') if meta else []
-            except Exception:modifiers=[]
-            result['items'].append({'id':i.id,'batch_id':b.id,'name':i.name,'station':i.station,'price':amount(i.price_cents),
-                'qty':i.qty,'cancelled_qty':i.cancelled_qty,'note':i.note,'variant_name':meta.variant_name if meta else '',
-                'modifiers':modifiers,'prep_minutes':meta.prep_minutes if meta else 15,
-                'release_after_minutes':meta.release_after_minutes if meta else 0,'promotion_name':meta.promotion_name if meta else ''})
-    result['payments']=[{'id':p.id,'method':p.method,'amount':amount(p.cents),'received':amount(p.received_cents),
-                         'tip':amount(db.scalar(select(PaymentTip.cents).where(PaymentTip.payment_id==p.id)) or 0),
-                         'created_at':p.created_at.isoformat() if p.created_at else ''} for p in db.scalars(select(Payment).where(Payment.account_id==a.id).order_by(Payment.id))]
-    result['discounts']=[{'id':d.id,'scope':d.scope,'item_id':d.item_id,
-                          'item_name':(db.get(OrderItem,d.item_id).name if d.item_id and db.get(OrderItem,d.item_id) else ''),
-                          'mode':d.mode,'value':d.value_text,'base':amount(d.base_cents),
-                          'amount':amount(d.discount_cents),'reason':d.reason,'status':d.status,
-                          'created_at':d.created_at.isoformat() if d.created_at else ''}
-                         for d in db.scalars(select(AccountDiscount).where(AccountDiscount.account_id==a.id).order_by(AccountDiscount.id))]
-    result['tips']=[{'id':t.id,'payment_id':t.payment_id,'method':t.method,'amount':amount(t.cents),
-                     'created_at':t.created_at.isoformat() if t.created_at else ''}
-                    for t in db.scalars(select(PaymentTip).where(PaymentTip.account_id==a.id).order_by(PaymentTip.id))]
+    batches=db.scalars(select(Batch).where(
+        Batch.account_id==a.id).order_by(Batch.id)).all()
+    batch_ids=[row.id for row in batches]
+    items=db.scalars(select(OrderItem).where(
+        OrderItem.batch_id.in_(batch_ids)).order_by(
+        OrderItem.batch_id,OrderItem.id)).all() if batch_ids else []
+    item_ids=[row.id for row in items]
+    meta_rows=db.scalars(select(OrderItemMeta).where(
+        OrderItemMeta.order_item_id.in_(item_ids))).all() if item_ids else []
+    meta_by_item={row.order_item_id:row for row in meta_rows}
+    item_by_id={row.id:row for row in items}
+
+    sender_ids={row.sent_by for row in batches if row.sent_by is not None}
+    sender_map={row.id:row.display for row in db.scalars(
+        select(User).where(User.id.in_(sender_ids))).all()} if sender_ids else {}
+
+    payments=db.scalars(select(Payment).where(
+        Payment.account_id==a.id).order_by(Payment.id)).all()
+    tips=db.scalars(select(PaymentTip).where(
+        PaymentTip.account_id==a.id).order_by(PaymentTip.id)).all()
+    tip_by_payment={row.payment_id:row.cents for row in tips}
+    discounts=db.scalars(select(AccountDiscount).where(
+        AccountDiscount.account_id==a.id).order_by(AccountDiscount.id)).all()
+
+    result=account_dict_many(db,[a])[0]
+    result['items']=[]
+    result['batches']=[
+        {'id':batch.id,'sent_by':sender_map.get(batch.sent_by,'?'),
+         'created_at':batch.created_at.isoformat() if batch.created_at else ''}
+        for batch in batches
+    ]
+    for item in items:
+        meta=meta_by_item.get(item.id)
+        try:
+            modifiers=json.loads(meta.modifiers_json or '[]') if meta else []
+        except (TypeError,ValueError):
+            modifiers=[]
+        result['items'].append({
+            'id':item.id,'batch_id':item.batch_id,'name':item.name,
+            'station':item.station,'price':amount(item.price_cents),
+            'qty':item.qty,'cancelled_qty':item.cancelled_qty,'note':item.note,
+            'variant_name':meta.variant_name if meta else '',
+            'modifiers':modifiers,'prep_minutes':meta.prep_minutes if meta else 15,
+            'release_after_minutes':meta.release_after_minutes if meta else 0,
+            'promotion_name':meta.promotion_name if meta else ''
+        })
+    result['payments']=[
+        {'id':payment.id,'method':payment.method,'amount':amount(payment.cents),
+         'received':amount(payment.received_cents),
+         'tip':amount(tip_by_payment.get(payment.id,0)),
+         'created_at':payment.created_at.isoformat() if payment.created_at else ''}
+        for payment in payments
+    ]
+    result['discounts']=[
+        {'id':discount.id,'scope':discount.scope,'item_id':discount.item_id,
+         'item_name':(item_by_id[discount.item_id].name
+                      if discount.item_id in item_by_id else ''),
+         'mode':discount.mode,'value':discount.value_text,
+         'base':amount(discount.base_cents),'amount':amount(discount.discount_cents),
+         'reason':discount.reason,'status':discount.status,
+         'created_at':discount.created_at.isoformat() if discount.created_at else ''}
+        for discount in discounts
+    ]
+    result['tips']=[
+        {'id':tip.id,'payment_id':tip.payment_id,'method':tip.method,
+         'amount':amount(tip.cents),
+         'created_at':tip.created_at.isoformat() if tip.created_at else ''}
+        for tip in tips
+    ]
     return result
+
+@app.get('/api/cashier/overview')
+def cashier_overview(account_id:Optional[int]=None,db:Session=Depends(db_session),
+                     user:User=Depends(auth)):
+    """Una sola respuesta para lista de cobros y detalle inicial seleccionado."""
+    allow(user,'owner','admin','cashier')
+    pending=[row for row in accounts(db,user) if row['status']=='pending']
+    pending_ids={row['id'] for row in pending}
+    selected_id=account_id if account_id in pending_ids else (pending[0]['id'] if pending else None)
+    selected=account_detail(selected_id,db,user) if selected_id is not None else None
+    return {'accounts':pending,'selected':selected}
+
 class ReassignIn(BaseModel): owner_id:int;reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/accounts/{account_id}/reassign')
 async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner');a=owner_account(db,user,account_id)
     dest=db.get(User,data.owner_id)
     if not dest or not dest.active or dest.role!='waiter':raise HTTPException(400,'El destino debe ser un mesero activo')
-    old=a.owner_id;a.owner_id=dest.id;audit(db,user,'account.reassign',id=a.id,old=old,new=dest.id,reason=data.reason);db.commit();await notify();return {'ok':True}
+    old=a.owner_id;a.owner_id=dest.id
+    # Todos los avisos aún no entregados siguen la cuenta. Incluso si el mesero
+    # anterior ya confirmó recepción, el nuevo responsable debe recibirlos.
+    pending_ids=[]
+    if old!=dest.id:
+        pending=db.scalars(select(ReadyNotificationEvent).where(
+            ReadyNotificationEvent.account_id==a.id,
+            ReadyNotificationEvent.delivered_at.is_(None))).all()
+        for notice in pending:
+            notice.waiter_id=dest.id
+            notice.acknowledged_at=None
+            notice.attempted_at=None
+            notice.attempt_count=0
+            notice.provider_accepted_at=None
+            notice.next_attempt_at=None
+            notice.last_error=None
+            pending_ids.append(notice.id)
+    audit(db,user,'account.reassign',id=a.id,old=old,new=dest.id,
+          reason=data.reason,notifications_reassigned=len(pending_ids))
+    db.commit();await notify()
+    for event_id in pending_ids:
+        await dispatch_ready_notification(event_id)
+    return {'ok':True,'notifications_reassigned':len(pending_ids)}
 
 
 # --- Gestión avanzada de cuentas (Fase 2B) ---------------------------------
@@ -1577,20 +2564,53 @@ class OrderIn(BaseModel):
 @app.post('/api/accounts/{account_id}/orders')
 async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','waiter')
-    active_period(db)
+    period=active_period_for_work(db)
+    if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id==period.id)):
+        raise HTTPException(409,'El reparto de propinas ya fue generado; el turno está en proceso de cierre. Abre un nuevo turno para continuar.')
+    a=owner_account(db,user,account_id,allowed=None)
+    # Releer la clave después del bloqueo de cuenta: dos toques simultáneos no crean dos comandas.
     existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
     if existing:
         if existing.account_id!=account_id:raise HTTPException(409,'Identificador de envío ya utilizado')
         return {'batch_id':existing.id,'duplicate':True}
-    a=owner_account(db,user,account_id,('open',))
-    setting=db.get(Setting,1);need={}
-    for line in data.items:need[line.product_id]=need.get(line.product_id,0)+line.qty
-    products={p.id:p for p in db.scalars(select(Product).where(Product.id.in_(need)).order_by(Product.id).with_for_update())}
-    if len(products)!=len(need):raise HTTPException(400,'Hay productos inexistentes')
-    for pid,qty in need.items():
-        p=products[pid]
-        if not p.active or p.blocked:raise HTTPException(409,f'{p.name} no está disponible')
-        if setting.inventory_on and p.inventory_enabled and p.stock<qty:raise HTTPException(409,f'Sin existencias suficientes de {p.name}')
+    if a.status!='open':raise HTTPException(409,'La cuenta ya no admite nuevas comandas')
+    # Lectura compartida del ajuste: permite varios envíos y bloquea cambios de inventario hasta confirmar.
+    setting=db.execute(select(Setting).where(Setting.id==1).with_for_update(read=True)).scalar_one()
+    order_product_ids={line.product_id for line in data.items}
+    selected_option_ids=sorted({option_id for line in data.items for option_id in line.modifier_option_ids})
+    selected_option_rows=db.scalars(select(ProductModifierOption).where(
+        ProductModifierOption.id.in_(selected_option_ids))).all() if selected_option_ids else []
+    selected_option_by_id={option.id:option for option in selected_option_rows}
+    if len(selected_option_by_id)!=len(selected_option_ids):
+        raise HTTPException(400,'Hay opciones de producto inexistentes')
+    mapped_stock_ids={option.inventory_product_id for option in selected_option_rows if option.inventory_product_id}
+    all_product_ids=order_product_ids|mapped_stock_ids
+    product_query=select(Product).where(Product.id.in_(all_product_ids)).order_by(Product.id)
+    # Bloquea existencias compartidas para evitar que dos comandas descuenten la misma botella.
+    product_query=product_query.with_for_update() if setting.inventory_on else product_query.with_for_update(read=True)
+    products={p.id:p for p in db.scalars(product_query)}
+    if len(products)!=len(all_product_ids):raise HTTPException(400,'Hay productos o insumos inexistentes')
+    need={}
+    for line in data.items:
+        product=products[line.product_id]
+        if product.inventory_only or not product.active or product.blocked:
+            raise HTTPException(409,f'{product.name} no está disponible')
+        if product.inventory_enabled:
+            need[product.id]=need.get(product.id,0)+line.qty
+        for option_id in line.modifier_option_ids:
+            option=selected_option_by_id.get(option_id)
+            if option and option.inventory_product_id:
+                stock_id=option.inventory_product_id
+                stock_item=products.get(stock_id)
+                if not stock_item or not stock_item.inventory_only or not stock_item.inventory_enabled:
+                    raise HTTPException(409,'El insumo vinculado ya no está disponible para inventario')
+                need[stock_id]=need.get(stock_id,0)+line.qty*option.inventory_quantity
+    if setting.inventory_on:
+        for stock_id,qty in need.items():
+            stock_item=products[stock_id]
+            if stock_item.stock<qty:
+                unit=stock_item.inventory_unit or 'unidades'
+                raise HTTPException(409,f'Sin existencias suficientes de {stock_item.name}: quedan {stock_item.stock} {unit}')
     prepared=[];stations=set()
     for line in data.items:
         p=products[line.product_id];stations.add(p.station)
@@ -1624,32 +2644,89 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         modifier_snapshot=[]
         for option in options:
             group=group_by_id.get(option.group_id) or db.get(ProductModifierGroup,option.group_id)
-            modifier_snapshot.append({'group':group.name if group else 'Extra','name':option.name,'price_delta':amount(option.price_delta_cents)})
+            stock_item=products.get(option.inventory_product_id) if option.inventory_product_id else None
+            modifier_snapshot.append({'group':group.name if group else 'Extra','name':option.name,
+                'price_delta':amount(option.price_delta_cents),'modifier_option_id':option.id,
+                'inventory_product_id':option.inventory_product_id,
+                'inventory_product_name':stock_item.name if stock_item else '',
+                'inventory_quantity':option.inventory_quantity})
         prepared.append({'line':line,'product':p,'variant':variant,'options':modifier_snapshot,
-                         'base_cents':promo_base,'modifier_cents':modifier_cents,'final_cents':final_price,
-                         'promo_name':promo.name if promo else ''})
-    batch=Batch(account_id=a.id,sent_by=user.id,client_key=data.client_key);db.add(batch);db.flush()
+                         'selected_options':options,'base_cents':promo_base,'modifier_cents':modifier_cents,
+                         'final_cents':final_price,'promo_name':promo.name if promo else ''})
+    batch=Batch(account_id=a.id,sent_by=user.id,client_key=data.client_key);db.add(batch)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
+        if existing and existing.account_id==account_id:
+            return {'batch_id':existing.id,'duplicate':True}
+        if existing:
+            raise HTTPException(409,'Identificador de envío ya utilizado')
+        raise
+    mitote_extensions.snapshot_batch_policy(db,batch.id)
+    occupancy=db.scalar(select(TableOccupancy).where(TableOccupancy.account_id==a.id))
+    assigned_table=db.get(DiningTable,occupancy.table_id) if occupancy else None
+    table_name=assigned_table.name if assigned_table else ''
+    created_order_items=[]
     for row in prepared:
         line=row['line'];p=row['product'];variant=row['variant']
         item=OrderItem(batch_id=batch.id,product_id=p.id,name=p.name,station=p.station,price_cents=row['final_cents'],qty=line.qty,note=line.note.strip())
         db.add(item);db.flush()
+        created_order_items.append((item,p,line.qty,row['selected_options']))
         db.add(OrderItemMeta(order_item_id=item.id,variant_name=variant.name if variant else '',
-            modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=line.prep_minutes,
+            modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=mitote_extensions.product_prep_minutes(db,p.id,line.prep_minutes),
             release_after_minutes=line.release_after_minutes,promotion_name=row['promo_name'],
             base_price_cents=row['base_cents'],modifier_price_cents=row['modifier_cents']))
-    for pid,qty in need.items():
-        p=products[pid]
-        if setting.inventory_on and p.inventory_enabled:p.stock-=qty;p.version+=1
+    # Una salida por línea de comanda: conserva producto, folio, mesa, usuario y hora.
+    # La clave única batch/item evita duplicar movimientos si el envío se reintenta.
+    for item,p,qty,selected_options in created_order_items:
+        if setting.inventory_on and p.inventory_enabled:
+            before=p.stock;p.stock-=qty;p.version+=1
+            db.add(InventoryMovement(product_id=p.id,actor_id=user.id,account_id=a.id,
+                batch_id=batch.id,order_item_id=item.id,kind='sale',quantity_change=-qty,
+                before_stock=before,after_stock=p.stock,
+                reason=f'Salida por comanda enviada · cuenta #{a.id}',
+                account_name=a.name,table_name=table_name,
+                source_key=f'inventory-sale:{batch.id}:{item.id}',created_at=now()))
+        if setting.inventory_on:
+            for option in selected_options:
+                if not option.inventory_product_id:continue
+                stock_item=products[option.inventory_product_id]
+                delta=qty*option.inventory_quantity
+                before=stock_item.stock;stock_item.stock-=delta;stock_item.version+=1
+                db.add(InventoryMovement(product_id=stock_item.id,actor_id=user.id,account_id=a.id,
+                    batch_id=batch.id,order_item_id=item.id,kind='sale',quantity_change=-delta,
+                    before_stock=before,after_stock=stock_item.stock,
+                    reason=f'Salida por cerveza seleccionada · {p.name} · {option.name} · cuenta #{a.id}',
+                    account_name=a.name,table_name=table_name,
+                    source_key=f'inventory-sale:{batch.id}:{item.id}:modifier:{option.id}',created_at=now()))
     for station in stations:db.add(StationTicket(batch_id=batch.id,station=station))
     audit(db,user,'order.send',account_id=a.id,batch_id=batch.id,stations=sorted(stations),items=len(prepared))
-    db.commit();await notify()
-    for station in sorted(stations):
-        await push_to({'title':'El Mitote · '+('Cocina' if station=='kitchen' else 'Barra'),
-                       'body':f'Nueva comanda #{batch.id} · {a.name}',
-                       'url':f'/?push=station&account={a.id}',
-                       'tag':f'mitote-order-{batch.id}-{station}'},role=station)
-        await fcm_to({'title':'El Mitote · '+('Cocina' if station=='kitchen' else 'Barra'),
-                      'body':f'Nueva comanda #{batch.id}','url':'/?push=station'},role=station)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # Última defensa para una clave repetida enviada desde cuentas distintas o en carrera.
+        existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
+        if existing and existing.account_id==account_id:
+            return {'batch_id':existing.id,'duplicate':True}
+        if existing:
+            raise HTTPException(409,'Identificador de envío ya utilizado')
+        raise
+    await notify()
+    async def dispatch_station(station):
+        station_title='Cocina' if station=='kitchen' else 'Barra'
+        payload={'title':'El Mitote · '+station_title,
+                 'body':f'Nueva comanda #{batch.id} · {a.name}',
+                 'url':f'/?push=station&account={a.id}',
+                 'tag':f'mitote-order-{batch.id}-{station}'}
+        fcm_payload={'title':'El Mitote · '+station_title,
+                     'body':f'Nueva comanda #{batch.id}','url':'/?push=station'}
+        await asyncio.gather(push_to(payload,role=station),
+                             fcm_to(fcm_payload,role=station),
+                             return_exceptions=True)
+    await asyncio.gather(*(dispatch_station(station) for station in sorted(stations)))
     return {'batch_id':batch.id,'duplicate':False}
 
 class RepeatOrderIn(BaseModel):
@@ -1658,7 +2735,7 @@ class RepeatOrderIn(BaseModel):
 
 @app.post('/api/accounts/{account_id}/items/{item_id}/repeat')
 async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Session=Depends(db_session),user:User=Depends(auth)):
-    allow(user,'owner','admin','waiter');active_period(db)
+    allow(user,'owner','admin','waiter');active_period_for_work(db)
     existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
     if existing:
         if existing.account_id!=account_id:raise HTTPException(409,'Identificador de envío ya utilizado')
@@ -1666,12 +2743,36 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
     account=owner_account(db,user,account_id,('open',))
     item=db.execute(select(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(OrderItem.id==item_id,Batch.account_id==account_id).with_for_update()).scalar_one_or_none()
     if not item:raise HTTPException(404,'Producto de la cuenta no encontrado')
-    product=db.execute(select(Product).where(Product.id==item.product_id).with_for_update()).scalar_one_or_none()
-    if not product or not product.active or product.blocked:raise HTTPException(409,'El producto ya no está disponible')
-    setting=db.get(Setting,1)
-    if setting.inventory_on and product.inventory_enabled and product.stock<data.qty:raise HTTPException(409,'No hay existencias suficientes para repetir el producto')
     old_meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==item.id))
+    try:
+        modifier_snapshot=json.loads(old_meta.modifiers_json or '[]') if old_meta else []
+    except Exception:
+        modifier_snapshot=[]
+    mapped=[m for m in modifier_snapshot if m.get('inventory_product_id')]
+    stock_need={}
+    for modifier in mapped:
+        stock_id=int(modifier['inventory_product_id'])
+        stock_need[stock_id]=stock_need.get(stock_id,0)+data.qty*int(modifier.get('inventory_quantity') or 1)
+    setting=db.get(Setting,1)
+    product_ids={item.product_id}|set(stock_need)
+    locked=db.scalars(select(Product).where(Product.id.in_(product_ids)).order_by(Product.id).with_for_update()).all()
+    products={p.id:p for p in locked}
+    product=products.get(item.product_id)
+    if not product or product.inventory_only or not product.active or product.blocked:
+        raise HTTPException(409,'El producto ya no está disponible')
+    for stock_id in stock_need:
+        stock_item=products.get(stock_id)
+        if not stock_item or not stock_item.inventory_only or not stock_item.inventory_enabled:
+            raise HTTPException(409,'El insumo vinculado ya no está disponible para inventario')
+    if setting.inventory_on:
+        if product.inventory_enabled and product.stock<data.qty:
+            raise HTTPException(409,f'Sin existencias suficientes de {product.name}')
+        for stock_id,required in stock_need.items():
+            stock_item=products[stock_id]
+            if stock_item.stock<required:
+                raise HTTPException(409,f'Sin existencias suficientes de {stock_item.name}: quedan {stock_item.stock} {stock_item.inventory_unit}')
     batch=Batch(account_id=account.id,sent_by=user.id,client_key=data.client_key);db.add(batch);db.flush()
+    mitote_extensions.snapshot_batch_policy(db,batch.id)
     new_item=OrderItem(batch_id=batch.id,product_id=item.product_id,name=item.name,station=item.station,price_cents=item.price_cents,qty=data.qty,note=item.note)
     db.add(new_item);db.flush()
     if old_meta:
@@ -1680,7 +2781,28 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
             base_price_cents=old_meta.base_price_cents,modifier_price_cents=old_meta.modifier_price_cents))
     else:
         db.add(OrderItemMeta(order_item_id=new_item.id,variant_name='',modifiers_json='[]',prep_minutes=15,release_after_minutes=0,base_price_cents=item.price_cents,modifier_price_cents=0))
-    if setting.inventory_on and product.inventory_enabled:product.stock-=data.qty;product.version+=1
+    occupancy=db.scalar(select(TableOccupancy).where(TableOccupancy.account_id==account.id))
+    assigned_table=db.get(DiningTable,occupancy.table_id) if occupancy else None
+    table_name=assigned_table.name if assigned_table else ''
+    if setting.inventory_on and product.inventory_enabled:
+        before=product.stock;product.stock-=data.qty;product.version+=1
+        db.add(InventoryMovement(product_id=product.id,actor_id=user.id,account_id=account.id,
+            batch_id=batch.id,order_item_id=new_item.id,kind='sale',quantity_change=-data.qty,
+            before_stock=before,after_stock=product.stock,
+            reason=f'Salida por comanda repetida · cuenta #{account.id}',
+            account_name=account.name,table_name=table_name,
+            source_key=f'inventory-sale:{batch.id}:{new_item.id}',created_at=now()))
+    if setting.inventory_on:
+        for modifier in mapped:
+            stock_item=products[int(modifier['inventory_product_id'])]
+            delta=data.qty*int(modifier.get('inventory_quantity') or 1)
+            before=stock_item.stock;stock_item.stock-=delta;stock_item.version+=1
+            db.add(InventoryMovement(product_id=stock_item.id,actor_id=user.id,account_id=account.id,
+                batch_id=batch.id,order_item_id=new_item.id,kind='sale',quantity_change=-delta,
+                before_stock=before,after_stock=stock_item.stock,
+                reason=f'Salida por cerveza seleccionada en comanda repetida · {item.name} · {modifier.get("name","")}',
+                account_name=account.name,table_name=table_name,
+                source_key=f'inventory-sale:{batch.id}:{new_item.id}:repeat:{stock_item.id}',created_at=now()))
     db.add(StationTicket(batch_id=batch.id,station=item.station))
     audit(db,user,'order.repeat',account_id=account.id,source_item_id=item.id,new_item_id=new_item.id,qty=data.qty,batch_id=batch.id)
     db.commit();await notify()
@@ -1730,16 +2852,36 @@ async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),u
                 station_ticket=db.scalar(select(StationTicket).where(StationTicket.batch_id==item.batch_id,StationTicket.station==item.station))
                 if station_ticket and station_ticket.status in ('preparing','ready'):
                     raise HTTPException(409,'No se puede devolver stock: la preparación ya comenzó')
-                p=db.execute(select(Product).where(Product.id==item.product_id).with_for_update()).scalar_one()
-                s=db.get(Setting,1)
-                if s.inventory_on and p.inventory_enabled:p.stock+=r.qty;p.version+=1
+                # Solo devuelve los insumos/productos que sí se descontaron al enviar la comanda.
+                # No crea existencias en pedidos anteriores ni si el inventario se apagó después.
+                sales=db.scalars(select(InventoryMovement).where(
+                    InventoryMovement.order_item_id==item.id,InventoryMovement.kind=='sale'
+                ).with_for_update()).all()
+                occupancy=db.scalar(select(TableOccupancy).where(TableOccupancy.account_id==a.id))
+                assigned_table=db.get(DiningTable,occupancy.table_id) if occupancy else None
+                for sale in sales:
+                    per_unit=abs(int(sale.quantity_change))//max(1,int(item.qty))
+                    delta=per_unit*r.qty
+                    if delta<1:continue
+                    stock_item=db.execute(select(Product).where(Product.id==sale.product_id).with_for_update()).scalar_one_or_none()
+                    if not stock_item:continue
+                    before=stock_item.stock;stock_item.stock+=delta;stock_item.version+=1
+                    db.add(InventoryMovement(product_id=stock_item.id,actor_id=user.id,account_id=a.id,
+                        batch_id=item.batch_id,order_item_id=item.id,kind='return',quantity_change=delta,
+                        before_stock=before,after_stock=stock_item.stock,
+                        reason=f'Devolución autorizada por cancelación · cuenta #{a.id}',
+                        account_name=a.name,table_name=assigned_table.name if assigned_table else '',
+                        source_key=f'inventory-return:{r.id}:{sale.id}',created_at=now()))
     r.status='approved' if data.approve else 'rejected';r.decided_by=user.id
     audit(db,user,'approval.decide',id=r.id,approved=data.approve,return_stock=data.return_stock);db.commit();await notify();return {'ok':True}
 
 @app.get('/api/tickets')
 def tickets(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','kitchen','bar')
-    q=select(StationTicket).order_by(StationTicket.id.desc()).limit(150)
+    p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    if not p:return []
+    q=select(StationTicket).join(Batch,Batch.id==StationTicket.batch_id).where(
+        Batch.created_at>=p.opened_at).order_by(StationTicket.id.desc()).limit(150)
     if user.role in ('kitchen','bar'):q=q.where(StationTicket.station==user.role)
     out=[]
     for t in db.scalars(q):
@@ -1757,6 +2899,69 @@ def tickets(db:Session=Depends(db_session),user:User=Depends(auth)):
                 'promotion_name':meta.promotion_name if meta else ''})
         out.append({'id':t.id,'batch_id':b.id,'account':a.name,'account_id':a.id,'waiter':db.get(User,b.sent_by).display,'station':t.station,'status':t.status,'created_at':t.created_at.isoformat() if t.created_at else '', 'items':ticket_items})
     return out
+@app.get('/api/waiter/ready-alerts')
+def waiter_ready_alerts(db:Session=Depends(db_session),user:User=Depends(auth)):
+    """Avisos persistentes sin confirmar, solo para el mesero actual de la cuenta."""
+    allow(user,'waiter')
+    period=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    if not period:return []
+    rows=db.execute(
+        select(ReadyNotificationEvent,Account).join(Account,ReadyNotificationEvent.account_id==Account.id)
+        .join(Batch,Batch.id==ReadyNotificationEvent.batch_id)
+        .where(ReadyNotificationEvent.waiter_id==user.id,Account.owner_id==user.id,
+               ReadyNotificationEvent.delivered_at.is_(None),
+               Batch.created_at>=period.opened_at,Account.status.in_(('open','pending')))
+        .order_by(ReadyNotificationEvent.created_at.desc(),ReadyNotificationEvent.id.desc()).limit(80)
+    ).all()
+    return [{
+        'id':e.event_key,'event_id':e.id,'ticket_id':e.ticket_id,
+        'batch_id':e.batch_id,'account_id':e.account_id,'account':a.name,
+        'station':e.station,'station_name':'Cocina' if e.station=='kitchen' else 'Barra',
+        'complete':e.complete,'ready_at':e.created_at.isoformat(),
+        'acknowledged':e.acknowledged_at is not None,
+        'received_at':e.acknowledged_at.isoformat() if e.acknowledged_at else None,
+        'delivered':e.delivered_at is not None,
+        'delivered_at':e.delivered_at.isoformat() if e.delivered_at else None
+    } for e,a in rows]
+
+
+@app.post('/api/waiter/ready-alerts/{event_id}/ack')
+async def acknowledge_ready_alert(event_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'waiter')
+    row=db.execute(select(ReadyNotificationEvent).where(
+        ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
+    if not row:raise HTTPException(404,'Aviso no encontrado')
+    account=db.get(Account,row.account_id)
+    if row.waiter_id!=user.id or not account or account.owner_id!=user.id:
+        raise HTTPException(403,'Aviso no asignado a este mesero')
+    if row.delivered_at is not None or row.acknowledged_at is not None:
+        return {'ok':True,'duplicate':True,'received':True}
+    row.acknowledged_at=now()
+    row.next_attempt_at=None
+    audit(db,user,'ready.received',event_id=row.id,ticket_id=row.ticket_id,account_id=row.account_id)
+    db.commit();await notify()
+    return {'ok':True,'duplicate':False,'received':True}
+
+
+@app.post('/api/waiter/ready-alerts/{event_id}/deliver')
+async def deliver_ready_alert(event_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'waiter')
+    row=db.execute(select(ReadyNotificationEvent).where(
+        ReadyNotificationEvent.id==event_id).with_for_update()).scalar_one_or_none()
+    if not row:raise HTTPException(404,'Aviso no encontrado')
+    account=db.get(Account,row.account_id)
+    if row.waiter_id!=user.id or not account or account.owner_id!=user.id:
+        raise HTTPException(403,'Aviso no asignado a este mesero')
+    if row.delivered_at is not None:
+        return {'ok':True,'duplicate':True,'delivered':True}
+    if row.acknowledged_at is None:
+        raise HTTPException(409,'Primero confirma que recibiste el pedido.')
+    row.delivered_at=now()
+    audit(db,user,'ready.delivered',event_id=row.id,ticket_id=row.ticket_id,account_id=row.account_id)
+    db.commit();await notify()
+    return {'ok':True,'duplicate':False,'delivered':True}
+
+
 class StatusIn(BaseModel):status:Literal['received','preparing','ready']
 @app.post('/api/tickets/{ticket_id}/status')
 async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -1775,18 +2980,32 @@ async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_sessio
     owner_id=account.owner_id
     station=t.station
     account_name=account.name
-    db.commit();await notify()
+    complete=False
     if data.status=='ready':
-        await push_to({'title':'El Mitote · Pedido listo',
-                       'body':f'{"Cocina" if station=="kitchen" else "Barra"} terminó el pedido de {account_name}',
-                       'url':f'/?push=accounts&account={account.id}',
-                       'tag':f'mitote-ready-{t.id}'},role='waiter',user_id=owner_id)
-        await fcm_to({'title': 'El Mitote · Pedido listo',
-                      'body': f'Pedido listo · comanda #{batch.id}',
-                      'url': '/?push=accounts'}, role='waiter', user_id=owner_id)
+        siblings=db.scalars(select(StationTicket).where(StationTicket.batch_id==batch.id)).all()
+        complete=bool(siblings) and all(x.status=='ready' for x in siblings)
+    event_id=None
+    if data.status=='ready':
+        event=ReadyNotificationEvent(event_key=f'ready-{t.id}',
+            ticket_id=t.id,batch_id=batch.id,account_id=account.id,
+            waiter_id=owner_id,station=station,complete=complete,
+            created_at=t.ready_at)
+        db.add(event);db.flush();event_id=event.id
+    db.commit();await notify()
+    if event_id is not None:
+        await dispatch_ready_notification(event_id)
     return {'ok':True}
 
+def active_period_for_work(db):
+    """Bloqueo compartido del turno: admite varias comandas y bloquea el cierre."""
+    p=db.execute(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(
+        CashPeriod.id.desc()).with_for_update(read=True)).scalar_one_or_none()
+    if not p:raise HTTPException(409,'No hay un turno de caja abierto; administración debe abrir uno')
+    return p
+
+
 def active_period(db):
+    """Bloqueo exclusivo reservado para pagos, reparto y cierre de caja."""
     p=db.execute(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()).with_for_update()).scalar_one_or_none()
     if not p:raise HTTPException(409,'No hay un turno de caja abierto; administración debe abrir uno')
     return p
@@ -1929,11 +3148,21 @@ class PaymentIn(BaseModel):client_key:str=Field(min_length=8,max_length=100);lin
 @app.post('/api/accounts/{account_id}/payments')
 async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier')
-    existing=db.scalar(select(Payment).where(Payment.client_key.like(data.client_key+'-%')))
+    # Comparación exacta: LIKE considera '%' y '_' comodines de SQL.
+    existing=db.scalar(select(Payment).where(Payment.client_key==f'{data.client_key}-0'))
     if existing:
         if existing.account_id!=account_id:raise HTTPException(409,'Clave de pago reutilizada')
         return {'ok':True,'duplicate':True}
-    a=owner_account(db,user,account_id,('pending',));total,paid=acc_totals(db,a)
+    # Orden de bloqueo consistente con send_order: primero el turno y después la
+    # cuenta. Evita el deadlock caja↔mesero cuando ambos operan la misma cuenta.
+    p=active_period(db)
+    a=owner_account(db,user,account_id,('pending',))
+    # Segunda lectura tras bloquear la cuenta para evitar reintentos simultáneos.
+    existing=db.scalar(select(Payment).where(Payment.client_key==f'{data.client_key}-0'))
+    if existing:
+        if existing.account_id!=account_id:raise HTTPException(409,'Clave de pago reutilizada')
+        return {'ok':True,'duplicate':True}
+    total,paid=acc_totals(db,a)
     payment_total=sum(cents(l.amount) for l in data.lines)
     if payment_total<=0 or payment_total>total-paid:raise HTTPException(409,'El pago excede el saldo o es inválido')
     normalized=[]
@@ -1961,7 +3190,6 @@ async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:
             if reserved+alloc.qty>item.qty-item.cancelled_qty:raise HTTPException(409,f'Cantidad de {item.name} ya asignada')
             expected+=alloc.qty*item.price_cents
         if expected!=payment_total:raise HTTPException(409,'Los importes deben coincidir con los productos asignados')
-    p=active_period(db)
     if any(tip_value>0 for line,value,tip_value,received in normalized) and db.scalar(
         select(TipDistribution.id).where(TipDistribution.period_id==p.id)
     ):
@@ -1987,6 +3215,7 @@ async def close_account(account_id:int,db:Session=Depends(db_session),user:User=
     if total<=0 or paid!=total:raise HTTPException(409,'La cuenta debe estar completamente pagada')
     a.status='paid';a.closed_at=now()
     release_table_for_account(db,a,user,'Cuenta pagada y cerrada')
+    mitote_extensions.close_reservation_for_account(db,a.id,user)
     audit(db,user,'account.close',id=a.id);db.commit();await notify();return {'ok':True}
 
 @app.get('/api/cash')
@@ -1994,16 +3223,29 @@ def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin','cashier')
     p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
     if not p:return {'open':False}
-    payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
-    totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
-    tips=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id)).all()
-    tip_totals={method:sum(x.cents for x in tips if x.method==method) for method in ('cash','card','transfer')}
+    totals={method:0 for method in ('cash','card','transfer')}
+    for method,value in db.execute(
+        select(Payment.method,func.coalesce(func.sum(Payment.cents),0))
+        .where(Payment.period_id==p.id).group_by(Payment.method)
+    ).all():
+        if method in totals:totals[method]=int(value or 0)
+    tip_totals={method:0 for method in ('cash','card','transfer')}
+    for method,value in db.execute(
+        select(PaymentTip.method,func.coalesce(func.sum(PaymentTip.cents),0))
+        .where(PaymentTip.period_id==p.id).group_by(PaymentTip.method)
+    ).all():
+        if method in tip_totals:tip_totals[method]=int(value or 0)
     moves=db.scalars(select(CashMovement).where(CashMovement.period_id==p.id)).all()
     net=sum((1 if x.kind=='in' else -1)*x.cents for x in moves if x.status=='approved')
     tip_payout_cash=tip_payout_cash_total(db,p.id)
     expected=p.opening_cents+totals['cash']+tip_totals['cash']+net-tip_payout_cash
     tip_distribution=db.scalar(select(TipDistribution).where(TipDistribution.period_id==p.id))
-    blocking=db.scalars(select(Account).where(Account.status.notin_(('paid','cancelled'))).order_by(Account.id)).all()
+    blocking_query=Account.status.notin_(('paid','cancelled'))
+    blocking_count=db.scalar(select(func.count(Account.id)).where(blocking_query)) or 0
+    blocking=db.scalars(
+        select(Account).where(blocking_query).order_by(Account.id).limit(50)
+    ).all()
+    blocking_data=account_dict_many(db,blocking)
     return {'open':True,'id':p.id,'opened_at':p.opened_at.isoformat(),'opening':amount(p.opening_cents),
             'cash':amount(totals['cash']),'card':amount(totals['card']),'transfer':amount(totals['transfer']),
             'tips':amount(sum(tip_totals.values())),'tip_cash':amount(tip_totals['cash']),
@@ -2011,14 +3253,58 @@ def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
             'tip_payout_cash':amount(tip_payout_cash),
             'tip_distribution':tip_distribution_dict(db,tip_distribution),
             'expected':amount(expected),'movements':[{'id':m.id,'kind':m.kind,'amount':amount(m.cents),'reason':m.reason,'status':m.status} for m in moves],
-            'blocking_count':len(blocking),'blocking_accounts':[account_dict(db,a) for a in blocking[:50]],
-            'can_close':not blocking and not any(m.status=='pending' for m in moves)}
-class MovementIn(BaseModel):kind:Literal['in','out'];amount:Decimal=Field(gt=0);reason:str=Field(min_length=3,max_length=400)
+            'blocking_count':int(blocking_count),'blocking_accounts':blocking_data,
+            'can_close':blocking_count==0 and not any(m.status=='pending' for m in moves)}
+class MovementIn(BaseModel):
+    kind:Literal['in','out']
+    amount:Decimal=Field(gt=0)
+    reason:str=Field(min_length=3,max_length=400)
+    client_key:Optional[str]=Field(default=None,min_length=8,max_length=100)
+
 @app.post('/api/cash/movements')
 async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depends(auth)):
-    allow(user,'owner','admin','cashier');p=active_period(db)
-    m=CashMovement(period_id=p.id,requester_id=user.id,kind=data.kind,cents=cents(data.amount),reason=data.reason,status='approved' if user.role in ('owner','admin') else 'pending',approved_by=user.id if user.role in ('owner','admin') else None)
-    db.add(m);audit(db,user,'cash.movement.request',kind=m.kind,cents=m.cents);db.commit();await notify();return {'id':m.id,'status':m.status}
+    allow(user,'owner','admin','cashier')
+    movement_cents=cents(data.amount)
+    reason=data.reason.strip()
+    client_key=(data.client_key or '').strip() or None
+
+    def duplicate_result():
+        if not client_key:
+            return None
+        existing=db.scalar(select(CashMovement).where(CashMovement.client_key==client_key))
+        if not existing:
+            return None
+        same=(existing.requester_id==user.id and existing.kind==data.kind and
+              existing.cents==movement_cents and existing.reason==reason)
+        if not same:
+            raise HTTPException(409,'La clave de movimiento ya fue utilizada con otros datos.')
+        return {'id':existing.id,'status':existing.status,'duplicate':True}
+
+    previous=duplicate_result()
+    if previous:
+        return previous
+    p=active_period(db)
+    # Segunda lectura después del bloqueo del turno: dos reintentos simultáneos
+    # con la misma clave devuelven un solo movimiento, nunca dos salidas/entradas.
+    previous=duplicate_result()
+    if previous:
+        return previous
+    m=CashMovement(client_key=client_key,period_id=p.id,requester_id=user.id,
+        kind=data.kind,cents=movement_cents,reason=reason,
+        status='approved' if user.role in ('owner','admin') else 'pending',
+        approved_by=user.id if user.role in ('owner','admin') else None)
+    db.add(m)
+    audit(db,user,'cash.movement.request',kind=m.kind,cents=m.cents,client_key=client_key)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        previous=duplicate_result()
+        if previous:
+            return previous
+        raise HTTPException(409,'No se pudo registrar el movimiento. Actualiza e inténtalo de nuevo.')
+    await notify()
+    return {'id':m.id,'status':m.status,'duplicate':False}
 class MoveDecision(BaseModel):approve:bool
 @app.post('/api/cash/movements/{movement_id}/decide')
 async def move_decide(movement_id:int,data:MoveDecision,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -2045,13 +3331,34 @@ async def close_cash(data:ClosePeriodIn,db:Session=Depends(db_session),user:User
     if tip_distribution and tip_distribution.total_cents!=tip_total:
         raise HTTPException(409,'El total de propinas cambió respecto al reparto. Solicita revisión de administración antes del corte')
     p.closed_at=now();p.counted_cents=cents(data.counted);p.closed_by=user.id;p.note=data.note
-    audit(db,user,'cash.close',period=p.id,counted=p.counted_cents,note=data.note);db.commit();await notify();return {'id':p.id,'closed':True}
+    db.flush()
+    # Cierre transaccional: sin el documento y la instantánea no se confirma el corte.
+    snapshot=cash_period_detail(p.id,db,user)
+    snapshot['archived']=True
+    snapshot['tips_total']=snapshot.get('tips_total') or amount(sum(period_tip_totals(db,p.id).values()))
+    snapshot['product_breakdown']=cash_cut_receipt.cut_product_breakdown(db,p)
+    pdf_blob=cash_cut_receipt.build_cut_ticket_pdf(snapshot)
+    db.add(CashCutArchive(period_id=p.id,
+                          detail_json=json.dumps(snapshot,ensure_ascii=False),
+                          pdf_blob=pdf_blob))
+    audit(db,user,'cash.close',period=p.id,counted=p.counted_cents,note=data.note,archived=True)
+    db.commit();await notify()
+    return {'id':p.id,'closed':True,'archived':True}
 class OpenPeriodIn(BaseModel):opening:Decimal=Field(ge=0)
 @app.post('/api/cash/open')
 async def open_cash(data:OpenPeriodIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin')
     if db.scalar(select(CashPeriod.id).where(CashPeriod.closed_at.is_(None))):raise HTTPException(409,'Ya existe un periodo abierto')
-    p=CashPeriod(opening_cents=cents(data.opening));db.add(p);audit(db,user,'cash.open',opening=p.opening_cents);db.commit();await notify();return {'id':p.id}
+    p=CashPeriod(opening_cents=cents(data.opening))
+    db.add(p)
+    audit(db,user,'cash.open',opening=p.opening_cents)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409,'Ya existe un periodo de caja abierto. Actualiza la pantalla.')
+    await notify()
+    return {'id':p.id}
 
 class TipDistributionIn(BaseModel):
     user_ids:list[int]=Field(min_length=1,max_length=100)
@@ -2270,6 +3577,13 @@ def ticket_pdf(account_id:int,db:Session=Depends(db_session),user:User=Depends(a
         headers={'Content-Disposition':f'attachment; filename="ElMitote_Ticket_{account.id}.pdf"','Cache-Control':'no-store'})
 
 def period_summary(db,p):
+    archived=db.get(CashCutArchive,p.id)
+    if archived:
+        detail=json.loads(archived.detail_json)
+        result={k:v for k,v in detail.items() if k not in ('accounts','payments','tips','movements')}
+        total_tip_pesos=sum(Decimal(str(detail.get(k) or '0')) for k in ('tip_cash','tip_card','tip_transfer'))
+        result['tips']=detail.get('tips_total') or f"{total_tip_pesos:.2f}"
+        return result
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
     totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
     tips=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id)).all()
@@ -2311,6 +3625,8 @@ def cash_period_detail(period_id:int,db:Session=Depends(db_session),user:User=De
     allow(user,'owner','admin','cashier')
     p=db.get(CashPeriod,period_id)
     if not p or not p.closed_at:raise HTTPException(404,'Turno cerrado no encontrado')
+    archived=db.get(CashCutArchive,p.id)
+    if archived:return json.loads(archived.detail_json)
     summary=period_summary(db,p)
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id).order_by(Payment.id)).all()
     moves=db.scalars(select(CashMovement).where(CashMovement.period_id==p.id).order_by(CashMovement.id)).all()
@@ -2321,6 +3637,7 @@ def cash_period_detail(period_id:int,db:Session=Depends(db_session),user:User=De
                           'method':x.method,'amount':amount(x.cents),
                           'tip':amount(db.scalar(select(PaymentTip.cents).where(PaymentTip.payment_id==x.id)) or 0),
                           'date':x.created_at.isoformat()} for x in payments]
+    summary['tips_total']=summary['tips']
     summary['tips']=[{'id':x.id,'payment_id':x.payment_id,'account_id':x.account_id,
                       'account':db.get(Account,x.account_id).name if db.get(Account,x.account_id) else '?',
                       'cashier':db.get(User,x.cashier_id).display if db.get(User,x.cashier_id) else '?',
@@ -2335,6 +3652,11 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
     allow(user,'owner','admin','cashier')
     p=db.get(CashPeriod,period_id)
     if not p or not p.closed_at:raise HTTPException(404,'Corte no encontrado')
+    archived=db.get(CashCutArchive,p.id)
+    if archived:
+        return Response(content=archived.pdf_blob,media_type='application/pdf',
+            headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"',
+                     'Cache-Control':'no-store'})
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id)).all()
     totals={method:sum(x.cents for x in payments if x.method==method) for method in ('cash','card','transfer')}
     tips=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id)).all()
@@ -2364,8 +3686,48 @@ def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(a
             entries.append(('Reparto · '+share['employee_name'],'$'+share['share']+' · entregado $'+share['paid']))
     entries.extend([('Entradas y salidas netas','$'+amount(net)),('Efectivo esperado','$'+amount(expected)),('Efectivo contado','$'+amount(p.counted_cents)),('Diferencia','$'+amount(p.counted_cents-expected))])
     table=Table(entries,colWidths=[220,150]);table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.4,colors.lightgrey),('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),8)]))
-    story.append(table);story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+(p.note or 'Sin observaciones'),style['Normal']))
+    from xml.sax.saxutils import escape as xml_escape
+    story.append(table);story.append(Spacer(1,14))
+    # Detalle inmutable de ventas y propinas del mismo turno.
+    sale_by_account={}
+    tip_by_payment={x.payment_id:x.cents for x in tips}
+    for payment in payments:
+        row=sale_by_account.setdefault(payment.account_id,{'sales':0,'tips':0})
+        row['sales']+=payment.cents
+        row['tips']+=tip_by_payment.get(payment.id,0)
+    story.append(Paragraph('Cuentas cobradas en este corte',style['Heading3']))
+    if sale_by_account:
+        sale_rows=[('Cuenta','Ventas','Propinas')]
+        for account_id in sorted(sale_by_account):
+            account=db.get(Account,account_id)
+            name=account.name if account else 'Cuenta'
+            row=sale_by_account[account_id]
+            sale_rows.append((Paragraph('#'+str(account_id)+' · '+xml_escape(name),style['Normal']),
+                              '$'+amount(row['sales']),'$'+amount(row['tips'])))
+        detail_table=Table(sale_rows,colWidths=[210,80,80],repeatRows=1)
+        detail_table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.3,colors.lightgrey),
+                                         ('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+        story.append(detail_table)
+    else:
+        story.append(Paragraph('Sin ventas registradas.',style['Normal']))
+    if moves:
+        story.append(Spacer(1,10))
+        story.append(Paragraph('Movimientos autorizados del corte',style['Heading3']))
+        move_rows=[('Tipo','Importe','Motivo')]
+        for movement in moves:
+            move_rows.append(('Entrada' if movement.kind=='in' else 'Salida',
+                ('$' if movement.kind=='in' else '-$')+amount(movement.cents),
+                Paragraph(xml_escape(movement.reason),style['Normal'])))
+        movements_table=Table(move_rows,colWidths=[75,75,220],repeatRows=1)
+        movements_table.setStyle(TableStyle([('LINEBELOW',(0,0),(-1,-1),.3,colors.lightgrey),
+                                            ('VALIGN',(0,0),(-1,-1),'TOP'),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+        story.append(movements_table)
+    story.append(Spacer(1,14));story.append(Paragraph('Observaciones: '+xml_escape(p.note or 'Sin observaciones'),style['Normal']))
     story.append(Spacer(1,10));story.append(Paragraph('Movimientos autorizados: '+str(len(moves)),style['Normal']))
     story.append(Paragraph('Documento de control interno · No fiscal',style['Normal']))
     doc.build(story)
     return Response(content=buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':f'attachment; filename="ElMitote_Corte_{p.id}.pdf"','Cache-Control':'no-store'})
+# Registrar modelos y rutas de extensiones antes del startup/metadata.create_all.
+import mitote_extensions  # noqa: E402
+import menu_photo_import  # noqa: E402
+import cash_cut_receipt  # noqa: E402

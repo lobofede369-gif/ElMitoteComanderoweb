@@ -1,0 +1,491 @@
+{
+  "version": "2026-11-04-fotos-menu-el-mitote",
+  "source": "Fotografías proporcionadas por el propietario. Precios expresados en MXN.",
+  "entries": [
+    {
+      "category": "BEBIDAS CALIENTES",
+      "name": "Café",
+      "price": 20,
+      "station": "bar",
+      "aliases": [
+        "Cafe"
+      ]
+    },
+    {
+      "category": "BEBIDAS CALIENTES",
+      "name": "Café con leche",
+      "price": 25,
+      "station": "bar",
+      "aliases": [
+        "Café con Leche"
+      ]
+    },
+    {
+      "category": "BEBIDAS CALIENTES",
+      "name": "Nescafé",
+      "price": 20,
+      "station": "bar",
+      "aliases": [
+        "Nescafé"
+      ]
+    },
+    {
+      "category": "BEBIDAS CALIENTES",
+      "name": "Té",
+      "price": 15,
+      "station": "bar",
+      "aliases": [
+        "Bebidas C"
+      ]
+    },
+    {
+      "category": "REFRESCOS",
+      "name": "Pepsi",
+      "price": 25,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "REFRESCOS",
+      "name": "Sangría",
+      "price": 25,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "REFRESCOS",
+      "name": "Manzanita",
+      "price": 25,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "REFRESCOS",
+      "name": "Squirt",
+      "price": 25,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "REFRESCOS",
+      "name": "Coca-Cola",
+      "price": 30,
+      "station": "bar",
+      "aliases": [
+        "Coca Cola"
+      ]
+    },
+    {
+      "category": "AGUA FRESCA DEL DÍA",
+      "name": "Agua fresca · Jarra 1 L",
+      "price": 40,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "AGUA FRESCA DEL DÍA",
+      "name": "Agua fresca · Jarra 2 L",
+      "price": 75,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "LIMONADA MINERAL",
+      "name": "Limonada mineral · Copa",
+      "price": 35,
+      "station": "bar",
+      "aliases": [
+        "Limonada copa"
+      ]
+    },
+    {
+      "category": "LIMONADA MINERAL",
+      "name": "Limonada mineral · Jarra 1 L",
+      "price": 70,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "LIMONADA MINERAL",
+      "name": "Limonada mineral · Jarra 2 L",
+      "price": 130,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "SODAS ITALIANAS",
+      "name": "Soda italiana · Frutos rojos",
+      "price": 50,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "SODAS ITALIANAS",
+      "name": "Soda italiana · Kiwi",
+      "price": 50,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "SODAS ITALIANAS",
+      "name": "Soda italiana · Blue Berry",
+      "price": 50,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "BEBIDAS CON ALCOHOL",
+      "name": "Paloma",
+      "price": 80,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "BEBIDAS CON ALCOHOL",
+      "name": "Cantarito",
+      "price": 80,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "BEBIDAS CON ALCOHOL",
+      "name": "Mezcalito",
+      "price": 80,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "BEBIDAS CON ALCOHOL",
+      "name": "Quemadita",
+      "price": 80,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "BEBIDAS CON ALCOHOL",
+      "name": "Piña colada",
+      "price": 80,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "BEBIDAS CON ALCOHOL",
+      "name": "Mojito",
+      "price": 80,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "CERVEZA",
+      "name": "Cerveza ½",
+      "price": 40,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "CERVEZA",
+      "name": "Cerveza Mega",
+      "price": 85,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "CERVEZA",
+      "name": "Michelada ½",
+      "price": 50,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "CERVEZA",
+      "name": "Megamiche",
+      "price": 110,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "CERVEZA",
+      "name": "Chelada ½",
+      "price": 45,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "CERVEZA",
+      "name": "Megachelada",
+      "price": 95,
+      "station": "bar",
+      "aliases": []
+    },
+    {
+      "category": "MENÚ INFANTIL",
+      "name": "Mini hotcakes",
+      "price": 90,
+      "station": "kitchen",
+      "aliases": [
+        "Mini hot cakes"
+      ]
+    },
+    {
+      "category": "MENÚ INFANTIL",
+      "name": "Burritos de pollo",
+      "price": 90,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "MENÚ INFANTIL",
+      "name": "Sándwich infantil",
+      "price": 85,
+      "station": "kitchen",
+      "aliases": [
+        "Sandwich"
+      ]
+    },
+    {
+      "category": "SNACKS",
+      "name": "Alitas",
+      "price": 85,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "SNACKS",
+      "name": "Boneless",
+      "price": 85,
+      "station": "kitchen",
+      "aliases": [
+        "Boneles"
+      ]
+    },
+    {
+      "category": "SNACKS",
+      "name": "Papas a la francesa",
+      "price": 80,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "SNACKS",
+      "name": "Papas gajo",
+      "price": 85,
+      "station": "kitchen",
+      "aliases": [
+        "Papas Gajo"
+      ]
+    },
+    {
+      "category": "SNACKS",
+      "name": "Nachos · Arrachera",
+      "price": 120,
+      "station": "kitchen",
+      "aliases": [
+        "Nachos Arrachera"
+      ]
+    },
+    {
+      "category": "SNACKS",
+      "name": "Nachos · Bistec",
+      "price": 110,
+      "station": "kitchen",
+      "aliases": [
+        "Nachos Bistec"
+      ]
+    },
+    {
+      "category": "SNACKS",
+      "name": "Nachos · Mixtos",
+      "price": 130,
+      "station": "kitchen",
+      "aliases": [
+        "Nachos Mixtos"
+      ]
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Queso Carne · Chico",
+      "price": 90,
+      "station": "kitchen",
+      "aliases": [
+        "Queso Carne Ch"
+      ]
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Queso Carne · Grande",
+      "price": 200,
+      "station": "kitchen",
+      "aliases": [
+        "Queso Carne G"
+      ]
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Choriqueso · Chico",
+      "price": 85,
+      "station": "kitchen",
+      "aliases": [
+        "Choriqueso Ch"
+      ]
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Choriqueso · Grande",
+      "price": 195,
+      "station": "kitchen",
+      "aliases": [
+        "Choriqueso G"
+      ]
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Pechuga asada",
+      "price": 160,
+      "station": "kitchen",
+      "aliases": [
+        "Pechuga Asada"
+      ]
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Pechuga empanizada",
+      "price": 170,
+      "station": "kitchen",
+      "aliases": [
+        "Pechuga Empanizada"
+      ]
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Tampiqueña",
+      "price": 210,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Parrillada",
+      "price": 230,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Arrachera",
+      "price": 220,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Costillas BBQ",
+      "price": 170,
+      "station": "kitchen",
+      "aliases": [
+        "Costillas bbq"
+      ]
+    },
+    {
+      "category": "PLATOS FUERTES",
+      "name": "Orden de tacos de asada",
+      "price": 120,
+      "station": "kitchen",
+      "aliases": [
+        "O. Tacos"
+      ]
+    },
+    {
+      "category": "ENTRADAS",
+      "name": "Paquecompartas",
+      "price": 290,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "ENTRADAS",
+      "name": "Sopes mixtos",
+      "price": 190,
+      "station": "kitchen",
+      "aliases": [
+        "Sopes Mixtos"
+      ]
+    },
+    {
+      "category": "ENTRADAS",
+      "name": "Frijoles gratinados",
+      "price": 95,
+      "station": "kitchen",
+      "aliases": [
+        "Frijoles Gratinados"
+      ]
+    },
+    {
+      "category": "ENTRADAS",
+      "name": "Queso fundido",
+      "price": 130,
+      "station": "kitchen",
+      "aliases": [
+        "Queso Fundido"
+      ]
+    },
+    {
+      "category": "ENTRADAS",
+      "name": "Plato de birria tatemada",
+      "price": 270,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "ESPECIALIDADES DE LA CASA",
+      "name": "Birria grande",
+      "price": 120,
+      "station": "kitchen",
+      "aliases": [
+        "Birria Grande"
+      ]
+    },
+    {
+      "category": "ESPECIALIDADES DE LA CASA",
+      "name": "Birria mediana",
+      "price": 100,
+      "station": "kitchen",
+      "aliases": [
+        "Birria Mediana"
+      ]
+    },
+    {
+      "category": "ESPECIALIDADES DE LA CASA",
+      "name": "Ramenbirria",
+      "price": 90,
+      "station": "kitchen",
+      "aliases": [
+        "Ramen Birria"
+      ]
+    },
+    {
+      "category": "ESPECIALIDADES DE LA CASA",
+      "name": "Orden de quesabirrias",
+      "price": 100,
+      "station": "kitchen",
+      "aliases": [
+        "O. Quesabirrias"
+      ]
+    },
+    {
+      "category": "ESPECIALIDADES DE LA CASA",
+      "name": "Birriaquiles",
+      "price": 110,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "ESPECIALIDADES DE LA CASA",
+      "name": "Gringa de birria",
+      "price": 100,
+      "station": "kitchen",
+      "aliases": [
+        "Gringa De Birria"
+      ]
+    }
+  ]
+}

@@ -376,3 +376,17 @@ body.pos-waiter .table-choice.occupied b{color:#f7e9ea}
  .login-card,.pos-more-panel,.premium-shortcut{animation:none!important}
  button,.pos-product,.pos-category{transition:none!important}
 }
+
+/* Carga inicial: feedback visual ligero sin bloquear la navegación. */
+.loading-screen{display:grid;gap:13px;padding:4px 0}
+.loading-screen-heading{display:flex;align-items:center;gap:12px;padding:12px 2px}
+.loading-screen-heading strong{display:block;color:#f2d58e;font-size:1rem}
+.loading-screen-heading p{margin:4px 0 0;color:#aeb8c2;font-size:.82rem}
+.loading-screen-indicator{width:13px;height:13px;flex:none;border-radius:50%;background:#f2c76c;box-shadow:0 0 0 5px #f2c76c22;animation:mitote-loading-pulse 1.2s ease-in-out infinite}
+.loading-screen-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.loading-skeleton{min-height:88px;border:1px solid #424b56;border-radius:12px;background:linear-gradient(100deg,#242a31 20%,#343c45 42%,#242a31 64%);background-size:220% 100%;animation:mitote-loading-shimmer 1.35s linear infinite}
+.loading-screen-wide{min-height:118px}
+@keyframes mitote-loading-shimmer{to{background-position-x:-220%}}
+@keyframes mitote-loading-pulse{50%{opacity:.55;box-shadow:0 0 0 8px #f2c76c10}}
+@media(max-width:520px){.loading-screen-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.loading-skeleton{min-height:76px}}
+@media(prefers-reduced-motion:reduce){.loading-skeleton,.loading-screen-indicator{animation:none!important}}
