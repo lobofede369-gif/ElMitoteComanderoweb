@@ -2,7 +2,7 @@
 
 /* Panel principal premium de El Mitote.
    Consume las API existentes: no introduce cifras ficticias ni modifica permisos. */
-async function showOverview() {
+window.showOverview = async function showOverview() {
   const results = await Promise.allSettled([
     api('/overview'),
     api('/tables'),
