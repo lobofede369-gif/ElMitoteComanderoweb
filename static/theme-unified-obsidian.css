@@ -1,0 +1,530 @@
+/* EL MITOTE COMANDAS · IDENTIDAD VISUAL GLOBAL OBSIDIAN GOLD
+   Aplicación completa: propietario, administrador, meseros, caja, cocina y barra.
+   Capa exclusivamente visual: no modifica acciones, permisos, datos ni flujos. */
+
+:root{
+  color-scheme:dark;
+  --bg:#08090b;
+  --panel:#1b2026;
+  --panel2:#252c34;
+  --line:#3e4853;
+  --yellow:#e8c474;
+  --red:#c94b59;
+  --green:#66d3a0;
+  --text:#f7f5f0;
+  --muted:#b9c1c9;
+  --pos-ink:#08090b;
+  --pos-panel:#1b2026;
+  --pos-soft:#252c34;
+  --pos-yellow:#e8c474;
+  --pos-red:#c94b59;
+  --mitote-gold-hi:#f5d995;
+  --mitote-border:#3e4853;
+  --premium-gold:#e8c474;
+  --premium-gold-light:#f5d995;
+  --premium-titanium:#252c34;
+  --premium-titanium-light:#343c45;
+  --premium-obsidian:#08090b;
+  --premium-muted:#b9c1c9;
+  --premium-edge:#3e4853;
+}
+
+html{
+  background:#08090b;
+  color-scheme:dark;
+  -webkit-text-size-adjust:100%;
+}
+body{
+  color:var(--text);
+  background:
+    radial-gradient(ellipse at 100% -8%,rgba(214,170,86,.075),transparent 34%),
+    radial-gradient(ellipse at 0% 72%,rgba(91,108,125,.055),transparent 38%),
+    linear-gradient(180deg,#0b0c0e 0%,#08090b 52%,#0d0e10 100%);
+}
+#app{color:var(--text)}
+main{color:var(--text)}
+#content{color:var(--text);min-width:0}
+::selection{background:rgba(232,196,116,.28);color:#fff8e9}
+
+/* Marco general, encabezados y navegación. */
+.topbar,
+body[data-pos-screen="overview"] .topbar{
+  background:linear-gradient(180deg,rgba(20,21,23,.98),rgba(9,10,12,.98));
+  border-bottom:1px solid rgba(218,178,100,.56);
+  box-shadow:0 5px 22px rgba(0,0,0,.28);
+}
+.brandline strong{color:#f3d38d}
+.brandline small{color:#b9c1c9}
+.navigation,
+body[data-pos-screen="overview"] .navigation{
+  background:linear-gradient(180deg,#14171b,#0f1114);
+  border-color:#343b43;
+}
+.navbtn{
+  color:#e5e4df;
+  border:1px solid transparent;
+  border-radius:13px;
+}
+.navbtn:hover{
+  background:#252a30;
+  border-color:#414953;
+}
+.navbtn.active{
+  color:#f5d995;
+  background:linear-gradient(135deg,#3a3325,#25282b);
+  border:1px solid #80663c;
+  box-shadow:inset 3px 0 #e8c474,0 4px 14px rgba(0,0,0,.22);
+}
+.heading h1{color:#f8f6f1}
+.heading .eyebrow,.eyebrow{color:#e8c474}
+#back,#refresh{border-radius:13px}
+.connection{color:#66d3a0}
+.connection.off{color:#ff8995}
+
+/* Tarjetas, paneles y bloques de información. */
+#content .card,
+#content .stat,
+#content .ticket,
+#content .pos-catalog,
+#content .pos-draft-card,
+#content .pos-account-picker,
+#content .pos-new-account-card,
+#content .table-live-section,
+#content .table-admin-card,
+#content .account-card,
+#content .prep-ticket,
+#content .cashier-history,
+#content .cashier-payment,
+#content .cashier-summary,
+#content .staff-pin-setup,
+#content .staff-user-card,
+#content .pos-more-link,
+#content .modifier-admin-group,
+#content .modifier-option,
+#content .pos-tile,
+#content .premium-shortcut{
+  color:var(--text);
+  border-color:var(--line);
+  border-radius:17px;
+}
+#content .card,
+#content .pos-catalog,
+#content .pos-draft-card,
+#content .pos-account-picker,
+#content .pos-new-account-card,
+#content .table-live-section,
+#content .table-admin-card,
+#content .account-card,
+#content .prep-ticket,
+#content .cashier-history,
+#content .cashier-payment,
+#content .cashier-summary,
+#content .staff-pin-setup,
+#content .staff-user-card{
+  background:linear-gradient(145deg,#222830 0%,#191e24 100%);
+  box-shadow:0 7px 20px rgba(0,0,0,.19),inset 0 1px rgba(255,255,255,.035);
+}
+#content .stat{
+  background:linear-gradient(145deg,#292f36 0%,#1c2127 100%);
+  border:1px solid #4b4a42;
+  border-top:2px solid #bd9653;
+  box-shadow:0 7px 20px rgba(0,0,0,.2);
+}
+#content .card h3,
+#content .ticket h3,
+#content .prep-ticket h3,
+#content .staff-user-card h3,
+#content .table-live-card h3,
+#content .account-card-title h3{
+  color:#f8f6f1;
+}
+#content .card p,
+#content .mini,
+#content .muted,
+#content .stat span,
+#content .account-card-meta,
+#content .table-live-meta{
+  color:#bac2ca;
+}
+#content .stat b,
+#content .price,
+#content .total,
+#content .account-card-values strong,
+#content .cashier-summary .total{
+  color:#f4d58e;
+  font-variant-numeric:tabular-nums;
+}
+#content .section{
+  color:#f4e6c5;
+  border-left-color:#b68d4e;
+}
+#content .lineitem{border-color:#3d4650}
+#content .divider{background:#3b444d}
+#content .empty{
+  color:#b9c1c9;
+  border-color:#56616c;
+  background:#191f25;
+}
+
+/* Controles de captura y selección. */
+#content label,
+#login label{
+  color:#e5e1d8;
+}
+#content input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+#content select,
+#content textarea,
+#login input:not([type="checkbox"]):not([type="radio"]){
+  color:#f7f5f0;
+  background:#11161c;
+  border:1px solid #46515c;
+  border-radius:12px;
+}
+#content input::placeholder,
+#content textarea::placeholder,
+#login input::placeholder{color:#929ca6}
+#content input:focus,
+#content select:focus,
+#content textarea:focus,
+#login input:focus{
+  border-color:#e8c474;
+  outline:2px solid rgba(232,196,116,.19);
+  outline-offset:1px;
+}
+#content input[type="checkbox"],
+#content input[type="radio"],
+#content input[type="range"]{accent-color:#e8c474}
+#content .formrow label,
+#content .formgrid label{color:#e5e1d8}
+#content .note{
+  color:#ffedc6;
+  background:#383020;
+  border-left-color:#e3bb6c;
+}
+#content .danger-note{
+  color:#ffd7dc;
+  background:#3d252b;
+  border-left-color:#d56a77;
+}
+
+/* Botones: oro para acciones principales, titanio para acciones secundarias. */
+button{border-radius:12px}
+button.primary,
+#content button.primary,
+#content .accounts-new-button,
+#content .staff-register-button{
+  color:#21180c;
+  background:linear-gradient(115deg,#f5dc9d 0%,#e4bc6d 58%,#f1d38f 100%);
+  border:1px solid #f2d38e;
+  box-shadow:0 5px 15px rgba(123,83,25,.2);
+}
+button.primary:not(:disabled):hover,
+#content button.primary:not(:disabled):hover{filter:brightness(1.035)}
+button.outline,
+#content button.outline{
+  color:#f2d48f;
+  background:rgba(222,181,101,.045);
+  border:1px solid #8a7045;
+}
+button.ghost,
+#content button.ghost{
+  color:#f0eee8;
+  background:linear-gradient(145deg,#30363e,#22272d);
+  border:1px solid #454e58;
+}
+#content .ticket .primary,
+#content .ticket.new .primary,
+#content .ticket.received .primary,
+#content .ticket.preparing .primary,
+#content .ticket.ready .primary,
+#content .prep-actions button.primary,
+#content .pos-draft-card [data-action="send-order"]{
+  color:#21180c!important;
+  background:linear-gradient(115deg,#f5dc9d 0%,#e4bc6d 58%,#f1d38f 100%)!important;
+  border:1px solid #f2d38e!important;
+  box-shadow:0 5px 15px rgba(123,83,25,.2)!important;
+}
+#content button.danger,
+#content button.red,
+#content .danger,
+#content .red{color:#fff!important}
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible{
+  outline:2px solid #f5d995;
+  outline-offset:2px;
+}
+
+/* Comandero, catálogo, categorías y borrador. */
+#content .pos-tile,
+#content .premium-shortcut{
+  background:linear-gradient(145deg,#252c34,#1b2026);
+  border:1px solid #414b55;
+  color:#f7f5f0;
+  box-shadow:0 7px 18px rgba(0,0,0,.2);
+}
+#content .pos-tile-icon,
+#content .premium-shortcut-icon{
+  background:linear-gradient(145deg,#4a3d27,#302d25);
+  border:1px solid #715c38;
+  color:#f5d995;
+}
+#content .pos-tile-title,
+#content .premium-shortcut>strong{color:#f8f6f1}
+#content .pos-tile-hint,
+#content .premium-shortcut>small{color:#bdc4cb}
+#content .pos-tile-primary{
+  color:#21180c!important;
+  background:linear-gradient(130deg,#f5d994,#dfb45f 68%,#f0cf87)!important;
+  border-color:#e8c474!important;
+}
+#content .pos-tile-primary .pos-tile-title,
+#content .pos-tile-primary .pos-tile-hint{color:#2a2114}
+#content .pos-category{
+  color:#ece9e1;
+  background:#2b323a;
+  border:1px solid #4a5560;
+  border-radius:11px;
+}
+#content .pos-category.active{
+  color:#241b0d;
+  background:#e8c474;
+  border-color:#f0d28e;
+}
+#content .pos-product{
+  color:#f7f5f0;
+  background:linear-gradient(150deg,#303740,#222830);
+  border:1px solid #4a5560;
+  border-radius:15px;
+  box-shadow:inset 0 1px rgba(255,255,255,.05);
+}
+#content .pos-product-name{color:#f8f6f1}
+#content .pos-product-meta{color:#b7c1ca}
+#content .pos-product-bottom strong{color:#f5d995}
+#content .pos-product-plus{
+  color:#21180c;
+  background:linear-gradient(135deg,#f5dc9d,#dfb45f);
+}
+#content .pos-qty-controls button{
+  color:#f6f3ec!important;
+  background:#303740!important;
+  border:1px solid #59636d!important;
+}
+#content .pos-qty-controls span{color:#f5d995!important}
+#content .pos-draft-card{border-top:2px solid #b99250!important}
+#content .pos-draft-total{
+  color:#f5f2eb;
+  background:#242a30;
+  border-color:#5b513d;
+  border-radius:12px;
+}
+#content .pos-draft-total strong{color:#f5d995}
+#content .pos-station-hint{
+  color:#ffedc6;
+  background:#383020;
+  border-color:#8b7045;
+}
+
+/* Mesas y cuentas: una misma superficie con acento dorado. */
+#content .table-live-card,
+#content .table-admin-card,
+#content .table-choice,
+#content .account-card{
+  background:linear-gradient(145deg,#252c34,#1b2026);
+  border-color:#414b55;
+}
+#content .table-live-card.table-live-occupied,
+#content .table-choice.selected,
+#content .table-choice:has(input:checked){
+  background:linear-gradient(145deg,#3b3427,#25282b);
+  border-color:#c5a05b;
+}
+#content .table-live-card.table-live-inactive{background:#20252b}
+#content .table-choice b{color:#f7f5ef}
+#content .table-choice small{color:#b9c1c9}
+#content .table-choice em{color:#f1d28d}
+#content .account-card-values{
+  background:#12171d;
+  border-color:#3d4751;
+}
+#content .account-card-values span{color:#b7c0c8}
+#content .account-card-footer button{
+  color:#f3d58f;
+  border-color:#927748;
+}
+
+/* Cocina y barra: superficies iguales, estados visibles mediante indicadores. */
+#content .ticket,
+#content .prep-ticket{
+  background:linear-gradient(145deg,#252c34,#1a2026);
+  border-color:#46515c;
+  border-radius:17px;
+}
+#content .ticket .lineitem,
+#content .prep-product{border-color:#3e4852}
+#content .ticket .lineitem>b,
+#content .prep-product b{color:#f7f5ef}
+#content .ticket .mini,
+#content .prep-ticket>.mini{color:#b9c2ca}
+#content .prep-total{
+  color:#f5eddd;
+  background:#302a20;
+  border-color:#7b6540;
+}
+#content .prep-total b,
+#content .prep-clock{color:#f5d995}
+#content .prep-flag{
+  background:#2c343c;
+  border-color:#4a5661;
+  color:#e4e9ed;
+}
+#content .prep-ok{background:#1b4034;border-color:#3d8065;color:#b8f0d3}
+#content .prep-warning{background:#403522;border-color:#80663b;color:#f5dda2}
+#content .prep-late{background:#43262d;border-color:#98515d;color:#ffc2ca}
+#content .ticket.new{background:linear-gradient(145deg,#33272c,#1d2025)}
+#content .ticket.received,
+#content .ticket.preparing,
+#content .ticket.ready{background:linear-gradient(145deg,#252c34,#1a2026)}
+
+/* Caja, cobros, propinas, inventario y personal. */
+#content .cashier-summary select,
+#content .cashier-summary input,
+#content #pay-form select{
+  color:#f7f5f0;
+  background:#11171d;
+  border-color:#46515c;
+}
+#content .cashier-history .lineitem,
+#content [id^="tip-payout-"] .lineitem{border-color:#3d4751}
+#content [id^="tip-payout-"]{
+  background:#20262d;
+  border-color:#414b55;
+}
+#content .modifier-admin-group,
+#content .modifier-option,
+#content .product-config-admin,
+#content details.product-config-admin>summary{
+  color:#f6f3ed;
+  background:linear-gradient(145deg,#252c34,#1a2026);
+  border-color:#46515c;
+}
+#content .product-config-content h4,
+#content .product-config-admin>summary:after{color:#f2d48f}
+#content .table-wrap,
+#content .card.table-wrap{background:#171c22}
+#content .table-wrap th,
+#content th{
+  color:#f4d58f;
+  background:#252c34;
+  border-color:#3e4853;
+}
+#content .table-wrap td,
+#content td{
+  color:#e1e4e6;
+  border-color:#3a444e;
+}
+#content .table-wrap tbody tr:nth-child(2n){background:rgba(255,255,255,.025)}
+#content .staff-pin-setup,
+#content .staff-user-card{border-color:#46515c}
+#content .staff-pin-status{color:#b8efd0}
+#content .staff-pin-status.pending{color:#f2c2a6}
+
+/* Estados: conservar semántica verde, ámbar y rojo. */
+#content .pill{
+  color:#edf0f2;
+  background:#303740;
+  border:1px solid #4a5560;
+}
+#content .pill.open,
+#content .pill.ready,
+#content .pill.approved,
+#content .pill.paid,
+#content .prep-ticket-ready .prep-flag{
+  color:#baf0d2;
+  background:#1a4033;
+  border-color:#3c8064;
+}
+#content .pill.pending,
+#content .pill.received,
+#content .pill.preparing{
+  color:#f7dfa7;
+  background:#403522;
+  border-color:#80683e;
+}
+#content .pill.new,
+#content .pill.rejected,
+#content .pill.out{
+  color:#ffc3ca;
+  background:#43262d;
+  border-color:#92505c;
+}
+#content .danger-note{border-left-color:#d56a77}
+#toast{
+  color:#fff0cd;
+  background:linear-gradient(145deg,#373020,#211d16);
+  border:1px solid #a98549;
+  box-shadow:0 12px 35px rgba(0,0,0,.55);
+}
+
+/* Dashboard, tarjetas de resumen y módulos de inicio. */
+body[data-pos-screen="overview"] .heading h1{color:#f6dfad}
+body[data-pos-screen="overview"] .heading .eyebrow{color:#e9bd63}
+body[data-pos-screen="overview"] #content .premium-dashboard-live{
+  color:#aee8c8;background:#18372c;border-color:#356b53;
+}
+body[data-pos-screen="overview"] #content .premium-dashboard-footer .card{
+  background:linear-gradient(145deg,#252c34,#191e24);
+  border-color:#414b55;
+}
+body[data-pos-screen="overview"] #content .premium-dashboard-footer h3{color:#f4d58f}
+.mitote-live-panel,
+.mitote-module-link{
+  color:#f4f0e7;
+  background:linear-gradient(145deg,#20262d,#14191e);
+  border-color:#4b4639;
+}
+.mitote-section-heading h3{color:#f5e6c4}
+.mitote-module-link{border-color:rgba(196,159,92,.38)}
+.mitote-module-link strong{color:#f2eadb}
+.mitote-module-link small{color:#b7b0a3}
+.mitote-quick-action{
+  color:#f7f2e8;
+  background:linear-gradient(145deg,#30291e,#151819);
+  border-color:#8b7045;
+}
+.mitote-quick-action strong{color:#f6e8c9}
+.mitote-quick-action small{color:#bcb5a8}
+
+/* Barra inferior en Android y móviles: fondo obsidiana y selección dorada. */
+@media(max-width:700px){
+  .navigation,
+  body.pos-waiter .navigation,
+  body[data-pos-screen="overview"] .navigation{
+    background:linear-gradient(180deg,#101216,#08090b);
+    border-top:1px solid #7e6337;
+    box-shadow:0 -8px 24px rgba(0,0,0,.52);
+  }
+  .navigation .navbtn.active,
+  body.pos-waiter .navigation .navbtn.active,
+  body.pos-waiter.pos-ui-ready .navigation .navbtn.active{
+    color:#f5d995;
+    background:linear-gradient(145deg,#3b3324,#24272a);
+    border:1px solid #8a7045;
+    box-shadow:inset 0 3px #e8c474;
+  }
+  #content .card,
+  #content .stat,
+  #content .ticket{box-shadow:0 3px 12px rgba(0,0,0,.24)}
+  #content input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  #content select,
+  #content textarea{font-size:16px}
+}
+@media(prefers-reduced-motion:reduce){
+  *,*:before,*:after{scroll-behavior:auto!important;transition-duration:.01ms!important;animation-duration:.01ms!important}
+}
+@media print{
+  body{background:#fff!important;color:#000!important}
+  #content .card,#content .stat,#content .ticket{background:#fff!important;color:#000!important;box-shadow:none!important}
+}
