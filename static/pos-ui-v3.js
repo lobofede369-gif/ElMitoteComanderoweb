@@ -132,7 +132,10 @@
       const area = document.createElement('section');
       area.className = 'pos-shortcuts';
       area.innerHTML = `<div class="pos-section-title"><span>ACCESOS RÁPIDOS</span><strong>Operación del restaurante</strong></div><div class="pos-tiles">${TILES.map((t,i)=>tileMarkup(t,i===1)).join('')}</div>`;
-      content.prepend(area);
+      const dashboard = $('.premium-dashboard', content);
+      const stats = dashboard?.querySelector('.statgrid');
+      if (stats) stats.after(area);
+      else content.prepend(area);
     } else if (state.screen === 'accounts' && state.user.role === 'waiter') {
       const area = document.createElement('section');
       area.className = 'pos-shortcuts';
@@ -282,6 +285,8 @@
       pending = false;
       if (!available()) return;
       const isWaiter = state.user.role === 'waiter';
+      document.body.dataset.posScreen = state.screen;
+      document.body.dataset.posRole = state.user.role;
       document.body.classList.toggle('pos-waiter', isWaiter);
       document.body.classList.toggle('pos-order-screen', isWaiter && state.screen === 'orders');
       document.body.classList.toggle('pos-new-screen', isWaiter && state.screen === 'new');

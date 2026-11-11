@@ -44,7 +44,7 @@ async function showPrepStation(history=false,all=false){
       (i.modifiers?.length?'<div class="mini">Extras: '+i.modifiers.map(m=>esc(m.name)).join(', ')+'</div>':'')+
       '<div class="row mini"><span>Producto: '+clockNode(t.created_at,i.ready_at,i.prep_minutes)+'</span><span>Límite: '+Number(i.prep_minutes)+' min</span></div>'+
       (!history&&t.status==='preparing'&&!i.ready?'<button class="outline small" data-action="prep-item-ready" data-id="'+Number(i.id)+'">✓ Producto listo</button>':'')+'</div>').join('');
-    return '<div class="card prep-ticket"><div class="row"><h3>'+esc(t.account)+' · #'+t.account_id+'</h3>'+pill(t.status)+'</div>'+
+    return '<div class="card prep-ticket prep-ticket-'+esc(t.status)+' prep-ticket-'+(t.station==='kitchen'?'kitchen':'bar')+'"><div class="row"><h3>'+esc(t.account)+' · #'+t.account_id+'</h3>'+pill(t.status)+'</div>'+
       '<div class="mini">'+(t.station==='kitchen'?'🍳 Cocina':'🥤 Barra')+' · '+esc(t.waiter)+' · Envío #'+t.batch_id+'</div>'+
       '<div class="prep-total"><div class="row"><b>Tiempo de la comanda</b>'+prepBadge(t.batch_timing)+'</div>'+
       '<div class="row"><span>'+clockNode(t.created_at,t.batch_ready?new Date(Date.parse(t.created_at)+t.batch_elapsed_seconds*1000).toISOString():null,t.batch_minutes)+'</span><span>Límite '+t.batch_minutes+' min</span></div></div>'+
