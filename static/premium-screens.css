@@ -210,3 +210,211 @@ body[data-pos-screen="cashier"] #content .cash-receipt-actions { display:flex; f
 @media (prefers-reduced-motion:reduce) {
   body[data-pos-screen] #content *, body[data-pos-screen] .navigation * { scroll-behavior:auto!important; transition:none!important; animation:none!important; }
 }
+
+/* AJUSTES FINALES APROBADOS · Personal, Cuentas, Cocina y Barra */
+
+/* PERSONAL: campos cómodos, tarjetas compactas y espacio real para el scroll
+   sobre la navegación inferior fija. */
+body[data-pos-screen="users"] #content .staff-pin-setup {
+  padding:16px;
+  border-top:2px solid #b99655;
+  background:linear-gradient(145deg,#252d35,#1d242b);
+}
+body[data-pos-screen="users"] #content .staff-pin-setup > h3 {
+  margin:0 0 7px;
+  color:#f7f5ee;
+  font-size:1.12rem;
+  font-weight:900;
+}
+body[data-pos-screen="users"] #content .staff-pin-setup > p:not(.mini) {
+  margin:0 0 12px;
+  color:#c1c9d0;
+  font-size:.83rem;
+  line-height:1.45;
+}
+body[data-pos-screen="users"] #content .staff-registration-form {
+  display:grid;
+  gap:11px;
+}
+body[data-pos-screen="users"] #content .staff-registration-form .formgrid {
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:10px;
+}
+body[data-pos-screen="users"] #content .staff-registration-form label,
+body[data-pos-screen="users"] #content .staff-pin-form label {
+  display:grid;
+  gap:7px;
+  min-width:0;
+  color:#e0e4e7;
+  font-size:.78rem;
+  font-weight:800;
+}
+body[data-pos-screen="users"] #content .staff-registration-form .staff-pin-field {
+  grid-column:1/-1;
+}
+body[data-pos-screen="users"] #content .staff-registration-form input,
+body[data-pos-screen="users"] #content .staff-registration-form select,
+body[data-pos-screen="users"] #content .staff-pin-form input {
+  box-sizing:border-box;
+  width:100%;
+  min-width:0;
+  min-height:48px;
+  padding:10px 13px;
+  border:1px solid #4b5864;
+  border-radius:12px;
+  background:#141a20;
+  color:#f7f6f2;
+  font-size:16px;
+}
+body[data-pos-screen="users"] #content .staff-register-button {
+  width:100%;
+  min-height:49px;
+  border-radius:12px;
+  font-weight:900;
+}
+body[data-pos-screen="users"] #content .staff-pin-setup > .mini {
+  margin:10px 0 0;
+  color:#b9c3cb;
+  font-size:.72rem;
+  line-height:1.4;
+}
+body[data-pos-screen="users"] #content .staff-users-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr));
+  gap:10px;
+}
+body[data-pos-screen="users"] #content .staff-user-card {
+  display:grid;
+  gap:8px;
+  min-width:0;
+  padding:14px;
+  background:linear-gradient(145deg,#252d35,#1d242b);
+}
+body[data-pos-screen="users"] #content .staff-user-card h3 {
+  margin:0;
+  color:#f7f5ee;
+  font-size:1rem;
+  font-weight:900;
+  overflow-wrap:anywhere;
+}
+body[data-pos-screen="users"] #content .staff-user-card > p {
+  margin:0;
+  color:#bec7ce;
+  font-size:.8rem;
+}
+body[data-pos-screen="users"] #content .staff-pin-status {
+  color:#8ee0b5;
+  font-size:.74rem;
+  font-weight:800;
+}
+body[data-pos-screen="users"] #content .staff-pin-status.pending {
+  color:#f2cf7a;
+}
+body[data-pos-screen="users"] #content .staff-pin-form {
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  align-items:end;
+  gap:9px;
+  margin-top:3px!important;
+  padding-top:10px;
+  border-top:1px solid #ffffff16;
+}
+body[data-pos-screen="users"] #content .staff-pin-form button {
+  min-height:46px;
+  white-space:nowrap;
+}
+body[data-pos-screen="users"] #content .staff-user-actions {
+  margin-top:0!important;
+}
+body[data-pos-screen="users"] #content::after {
+  content:"";
+  display:block;
+  height:calc(92px + env(safe-area-inset-bottom));
+}
+@media (max-width:390px) {
+  body[data-pos-screen="users"] #content .staff-registration-form .formgrid {
+    grid-template-columns:1fr;
+  }
+  body[data-pos-screen="users"] #content .staff-pin-form {
+    grid-template-columns:1fr;
+  }
+  body[data-pos-screen="users"] #content .staff-pin-form button {
+    width:100%;
+  }
+}
+
+/* CUENTAS: menos aire muerto y tarjetas más compactas sin ocultar acciones. */
+body[data-pos-screen="all"] #content .accounts-screen,
+body[data-pos-screen="accounts"] #content .accounts-screen {
+  gap:8px;
+}
+body[data-pos-screen="all"] #content .accounts-section-title,
+body[data-pos-screen="accounts"] #content .accounts-section-title {
+  margin-top:12px;
+  margin-bottom:8px;
+}
+body[data-pos-screen="all"] #content .accounts-list,
+body[data-pos-screen="accounts"] #content .accounts-list {
+  gap:9px;
+}
+#content .account-card {
+  gap:9px;
+  padding:12px;
+}
+#content .account-card-values {
+  gap:7px;
+  padding:8px;
+}
+#content .account-card-pending .account-card-values {
+  border-color:#806b42;
+  background:linear-gradient(110deg,rgba(94,72,34,.28),rgba(20,26,32,.82));
+}
+#content .account-card-pending .account-card-balance strong {
+  color:#ffe0a0;
+}
+#content .account-card-footer button {
+  min-height:42px;
+}
+
+/* COCINA Y BARRA: avisos más compactos y comandas demoradas imposibles de pasar por alto. */
+body[data-pos-screen="station"] #content .pos-station-hint,
+body[data-pos-screen="tickets"] #content .pos-station-hint {
+  margin-bottom:9px;
+  padding:9px 12px;
+  font-size:.76rem;
+  line-height:1.35;
+}
+body[data-pos-screen="station"] #content .prep-station-note,
+body[data-pos-screen="tickets"] #content .prep-station-note {
+  margin:9px 0;
+  padding:9px 12px;
+  border-left:4px solid #e5c36f;
+  border-radius:0 12px 12px 0;
+  background:linear-gradient(100deg,rgba(93,72,35,.5),rgba(43,39,30,.72));
+  color:#f0dfb7;
+  font-size:.76rem;
+  line-height:1.4;
+}
+body[data-pos-screen="station"] #content .prep-ticket-list,
+body[data-pos-screen="tickets"] #content .prep-ticket-list {
+  gap:10px;
+}
+#content .prep-ticket:has(.prep-late),
+#content .prep-ticket:has(.prep-clock-late) {
+  border-color:#a94b58;
+  border-left:6px solid #ff6578;
+  background:linear-gradient(145deg,#3b252c,#242329);
+  box-shadow:0 0 0 1px rgba(255,101,120,.15),0 8px 22px rgba(90,25,38,.2);
+}
+#content .prep-ticket .prep-flag.prep-late {
+  border-color:#d75a69;
+  background:#642b36;
+  color:#ffe0e3;
+  box-shadow:0 0 0 2px rgba(215,90,105,.12);
+}
+#content .prep-ticket .prep-clock-late {
+  color:#ff8290;
+  font-size:1.14rem;
+  text-shadow:0 0 14px rgba(255,101,120,.18);
+}

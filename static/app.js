@@ -643,11 +643,11 @@ async function showUsers(){
   const registration=owner?
     '<div class="card staff-pin-setup"><h3>Registrar personal</h3>'+
     '<p>Solo se necesita nombre y PIN de seis números. El Propietario asigna el perfil de trabajo.</p>'+
-    '<form id="staff-add" class="formrow"><div class="formgrid">'+
+    '<form id="staff-add" class="formrow staff-registration-form"><div class="formgrid">'+
     '<label>Nombre del empleado<input name="name" required minlength="2" maxlength="100" autocomplete="off" placeholder="Nombre y apellido"></label>'+
     '<label>Perfil asignado<select name="role"><option value="waiter">Mesero</option><option value="cashier">Caja</option><option value="kitchen">Cocina</option><option value="bar">Barra</option><option value="admin">Administrador</option></select></label>'+
-    '<label>PIN personal<input name="pin" type="password" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="new-password" required placeholder="6 números"></label>'+
-    '</div><button class="primary" type="submit">Registrar empleado</button></form>'+
+    '<label class="staff-pin-field">PIN personal<input name="pin" type="password" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="new-password" required placeholder="6 números"></label>'+
+    '</div><button class="primary staff-register-button" type="submit">Registrar empleado</button></form>'+
     '<p class="mini">Cada PIN debe ser exclusivo de una persona; no uses fechas o secuencias fáciles.</p></div>':
     '<p class="note">La asignación de PIN y el registro de empleados son exclusivos del Propietario.</p>';
   const cards=users.map(u=>{
@@ -655,16 +655,16 @@ async function showUsers(){
       '<span class="staff-pin-status">● PIN activado</span>':
       '<span class="staff-pin-status pending">● Falta configurar PIN</span>';
     const reset=owner?
-      '<form id="staff-pin-'+Number(u.id)+'" class="staff-pin-form" style="margin-top:12px">'+
+      '<form id="staff-pin-'+Number(u.id)+'" class="staff-pin-form">'+
       '<label>Asignar PIN de 6 números<input name="pin" type="password" inputmode="numeric" minlength="6" maxlength="6" pattern="[0-9]{6}" autocomplete="new-password" placeholder="••••••" required></label>'+
       '<button class="outline small" type="submit">'+(u.has_pin?'Cambiar PIN':'Activar PIN')+'</button></form>':'';
     const toggle=owner&&u.role!=='owner'?
-      '<div class="inline" style="margin-top:12px"><button class="ghost small" data-action="toggle-user" data-id="'+Number(u.id)+'" data-active="'+(!u.active)+'">'+(u.active?'Desactivar':'Activar')+'</button></div>':'';
-    return '<div class="card"><h3>'+esc(u.display)+'</h3><p>'+esc(labels[u.role]||u.role)+'</p>'+
+      '<div class="inline staff-user-actions"><button class="ghost small" data-action="toggle-user" data-id="'+Number(u.id)+'" data-active="'+(!u.active)+'">'+(u.active?'Desactivar':'Activar')+'</button></div>':'';
+    return '<div class="card staff-user-card"><h3>'+esc(u.display)+'</h3><p>'+esc(labels[u.role]||u.role)+'</p>'+
       pill(u.active?'open':'rejected')+'<div style="margin-top:8px">'+status+'</div>'+reset+toggle+'</div>';
   }).join('');
   return registration+'<h2 class="section">Personal y accesos</h2>'+
-    '<div class="cards">'+cards+'</div>'+
+    '<div class="cards staff-users-grid">'+cards+'</div>'+
     (owner?'<p class="mini">Al cambiar tu propio PIN se cierra tu sesión para proteger el acceso. Vuelve a entrar con el nuevo código.</p>':'');
 }
 async function showApprovals(){const rs=await api('/requests');return `<div class="cards">${rs.map(r=>`<div class="card"><div class="row"><h3>${r.kind==='reopen'?'Reapertura':'Cancelación'} · #${r.account_id}</h3>${pill(r.status)}</div><p>${esc(r.account)} · ${esc(r.requester)}</p><p>${esc(r.reason)}</p>${r.kind==='cancel'?`<p class="mini">Producto #${r.item_id} · ${r.qty} unidad(es)</p>`:''}${r.status==='pending'?`<div class="inline"><button class="primary small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="true">Autorizar</button><button class="ghost small" data-action="approve" data-id="${r.id}" data-kind="${r.kind}" data-ok="false">Rechazar</button></div>`:''}</div>`).join('')||'<div class="empty">No hay solicitudes.</div>'}</div>`}

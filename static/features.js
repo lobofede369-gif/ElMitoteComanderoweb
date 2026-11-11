@@ -53,8 +53,8 @@ async function showPrepStation(history=false,all=false){
   }).join('');
   const html='<div class="statgrid">'+stat('Comandas nuevas',newCount)+stat('En proceso',shown.filter(t=>t.status==='received'||t.status==='preparing').length)+
     stat('Con demora',shown.filter(t=>t.batch_timing==='late').length)+'</div>'+
-    (!history?'<div class="note">Cronómetros simultáneos por producto y por envío. Las nuevas adiciones a la cuenta comienzan un nuevo envío.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':'')+
-    '<div class="cards">'+(cards||'<div class="empty">No hay comandas en esta sección.</div>')+'</div>';
+    (!history?'<div class="note prep-station-note">Cronómetros simultáneos por producto y por envío. Las nuevas adiciones a la cuenta comienzan un nuevo envío.</div><p><button class="outline" data-action="enable-sound">🔔 Activar / probar sonido</button></p>':'')+
+    '<div class="cards prep-ticket-list">'+(cards||'<div class="empty">No hay comandas en esta sección.</div>')+'</div>';
   requestAnimationFrame(startPrepClock);
   return html;
 }
