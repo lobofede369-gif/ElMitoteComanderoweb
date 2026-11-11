@@ -121,6 +121,8 @@ class Product(Base):
     blocked=Column(Boolean,default=False)
     inventory_enabled=Column(Boolean,default=False)
     stock=Column(Integer,default=0)
+    inventory_only=Column(Boolean,default=False,nullable=False)
+    inventory_unit=Column(String(20),default='unidades',nullable=False)
     version=Column(Integer,default=1)
 
 class ArchivedProduct(Base):
@@ -220,6 +222,8 @@ class ProductModifierOption(Base):
     price_delta_cents=Column(Integer,default=0,nullable=False)
     active=Column(Boolean,default=True,nullable=False)
     sort_order=Column(Integer,default=0,nullable=False)
+    inventory_product_id=Column(Integer,ForeignKey('products.id'),nullable=True)
+    inventory_quantity=Column(Integer,default=1,nullable=False)
 
 class ProductPromotion(Base):
     __tablename__='product_promotions'
@@ -491,6 +495,16 @@ def bootstrap():
         cash_movement_columns={column['name'] for column in inspect(conn).get_columns('cash_movements')}
         if 'client_key' not in cash_movement_columns:
             conn.exec_driver_sql('ALTER TABLE cash_movements ADD COLUMN client_key VARCHAR(100) NULL')
+        product_columns={column['name'] for column in inspect(conn).get_columns('products')}
+        if 'inventory_only' not in product_columns:
+            conn.exec_driver_sql('ALTER TABLE products ADD COLUMN inventory_only BOOLEAN NOT NULL DEFAULT FALSE')
+        if 'inventory_unit' not in product_columns:
+            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN inventory_unit VARCHAR(20) NOT NULL DEFAULT 'unidades'")
+        modifier_columns={column['name'] for column in inspect(conn).get_columns('product_modifier_options')}
+        if 'inventory_product_id' not in modifier_columns:
+            conn.exec_driver_sql("ALTER TABLE product_modifier_options ADD COLUMN inventory_product_id INTEGER NULL REFERENCES products(id)")
+        if 'inventory_quantity' not in modifier_columns:
+            conn.exec_driver_sql("ALTER TABLE product_modifier_options ADD COLUMN inventory_quantity INTEGER NOT NULL DEFAULT 1")
         columns={column['name'] for column in inspect(conn).get_columns('ready_notification_events')}
         additions={
             'provider_accepted_at':'TIMESTAMP WITH TIME ZONE NULL',
@@ -959,7 +973,7 @@ def product_related_data(db, products):
 
 
 def product_dict(p,settings,db=None,related=None):
-    status='No disponible' if p.blocked or not p.active else ('Sin control' if not settings.inventory_on or not p.inventory_enabled else ('Agotado' if p.stock==0 else 'Stock bajo' if p.stock<=3 else 'Disponible'))
+    status='Solo inventario' if p.inventory_only else ('No disponible' if p.blocked or not p.active else ('Sin control' if not settings.inventory_on or not p.inventory_enabled else ('Agotado' if p.stock==0 else 'Stock bajo' if p.stock<=3 else 'Disponible')))
     variant_rows=[];group_rows=[];option_map={};promo_rows=[]
     if related is not None:
         variant_rows=related["variants"].get(p.id, [])
@@ -984,7 +998,8 @@ def product_dict(p,settings,db=None,related=None):
               for v in variant_rows]
     groups=[]
     for g in group_rows:
-        options=[{'id':o.id,'name':o.name,'price_delta':amount(o.price_delta_cents),'active':o.active,'sort_order':o.sort_order}
+        options=[{'id':o.id,'name':o.name,'price_delta':amount(o.price_delta_cents),'active':o.active,'sort_order':o.sort_order,
+                  'inventory_product_id':o.inventory_product_id,'inventory_quantity':o.inventory_quantity}
                  for o in option_map.get(g.id, [])]
         groups.append({'id':g.id,'name':g.name,'min_select':g.min_select,'max_select':g.max_select,'active':g.active,'options':options})
     promotions=[{'id':x.id,'name':x.name,'price':amount(x.price_cents) if x.price_cents is not None else None,'discount_percent':x.discount_percent,'weekdays':x.weekdays,'start_time':x.start_time,'end_time':x.end_time,'start_date':x.start_date,'end_date':x.end_date,'active':x.active}
@@ -994,7 +1009,9 @@ def product_dict(p,settings,db=None,related=None):
     return {'id':p.id,'name':p.name,'category':p.category,'station':p.station,'price':amount(p.price_cents),
             'current_price':amount(current_cents),'promotion':({'id':active_promo.id,'name':active_promo.name,'price':amount(current_cents),'fixed_price':amount(active_promo.price_cents) if active_promo.price_cents is not None else None,'discount_percent':active_promo.discount_percent} if active_promo else None),
             'variants':variants,'modifier_groups':groups,'promotions':promotions,
-            'active':p.active,'blocked':p.blocked,'inventory_enabled':p.inventory_enabled,'stock':p.stock,'version':p.version,'status':status}
+            'active':p.active,'blocked':p.blocked,'inventory_enabled':p.inventory_enabled,'stock':p.stock,
+            'inventory_only':p.inventory_only,'inventory_unit':p.inventory_unit,
+            'version':p.version,'status':status}
 
 def _pin_lookup(pin: str) -> str:
     return hmac.new(SECRET_KEY.encode('utf-8'),
@@ -1523,6 +1540,17 @@ class ModifierOptionIn(BaseModel):
     price_delta: Decimal = Field(default=Decimal('0'),ge=0)
     active: bool = True
     sort_order: int = Field(default=0,ge=0,le=10000)
+    inventory_product_id: Optional[int] = Field(default=None,ge=1)
+    inventory_quantity: int = Field(default=1,ge=1,le=100)
+
+class ModifierOptionInventoryIn(BaseModel):
+    inventory_product_id: Optional[int] = Field(default=None,ge=1)
+    inventory_quantity: int = Field(default=1,ge=1,le=100)
+
+class InventoryItemIn(BaseModel):
+    name: str = Field(min_length=2,max_length=160)
+    stock: int = Field(default=0,ge=0,le=100000)
+    unit: Literal['botellas','latas','unidades','kg','litros'] = 'botellas'
 
 class PromotionIn(BaseModel):
     name: str = Field(min_length=1,max_length=120)
@@ -1561,8 +1589,34 @@ async def add_modifier_group(product_id:int,data:ModifierGroupIn,db:Session=Depe
 async def add_modifier_option(group_id:int,data:ModifierOptionIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin');g=db.get(ProductModifierGroup,group_id)
     if not g:raise HTTPException(404,'Grupo de modificadores inexistente')
-    o=ProductModifierOption(group_id=g.id,name=data.name.strip(),price_delta_cents=cents(data.price_delta),active=data.active,sort_order=data.sort_order)
-    db.add(o);db.flush();audit(db,user,'product.modifier_option.create',group_id=g.id,option_id=o.id,name=o.name,price_delta=amount(o.price_delta_cents));db.commit();await notify();return {'id':o.id,'ok':True}
+    stock_item=None
+    if data.inventory_product_id is not None:
+        stock_item=db.get(Product,data.inventory_product_id)
+        if not stock_item or not stock_item.inventory_only or not stock_item.inventory_enabled:
+            raise HTTPException(400,'Selecciona un insumo con control de inventario activo')
+    o=ProductModifierOption(group_id=g.id,name=data.name.strip(),price_delta_cents=cents(data.price_delta),
+        active=data.active,sort_order=data.sort_order,
+        inventory_product_id=stock_item.id if stock_item else None,inventory_quantity=data.inventory_quantity)
+    db.add(o);db.flush()
+    audit(db,user,'product.modifier_option.create',group_id=g.id,option_id=o.id,name=o.name,
+          price_delta=amount(o.price_delta_cents),inventory_product_id=o.inventory_product_id)
+    db.commit();await notify();return {'id':o.id,'ok':True}
+
+@app.patch('/api/modifier-options/{option_id}/inventory')
+async def link_modifier_inventory(option_id:int,data:ModifierOptionInventoryIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    option=db.get(ProductModifierOption,option_id)
+    if not option:raise HTTPException(404,'Opción inexistente')
+    stock_item=None
+    if data.inventory_product_id is not None:
+        stock_item=db.get(Product,data.inventory_product_id)
+        if not stock_item or not stock_item.inventory_only or not stock_item.inventory_enabled:
+            raise HTTPException(400,'Selecciona un insumo con control de inventario activo')
+    option.inventory_product_id=stock_item.id if stock_item else None
+    option.inventory_quantity=data.inventory_quantity
+    audit(db,user,'product.modifier_option.inventory_link',option_id=option.id,
+          inventory_product_id=option.inventory_product_id,inventory_quantity=option.inventory_quantity)
+    db.commit();await notify();return {'ok':True}
 
 @app.patch('/api/modifier-options/{option_id}')
 async def toggle_modifier_option(option_id:int,data:ActiveToggleIn,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -1710,6 +1764,24 @@ async def inventory_adjustment(product_id:int,data:InventoryAdjustmentIn,db:Sess
           before=before,delta=delta,after=after,reason=data.reason.strip())
     db.commit();await notify();return {'stock':p.stock,'delta':delta}
 
+@app.post('/api/inventory/items')
+async def create_inventory_item(data:InventoryItemIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+    allow(user,'owner','admin')
+    name=data.name.strip()
+    duplicate=db.scalar(select(Product.id).where(
+        Product.inventory_only.is_(True),func.lower(Product.name)==name.lower()))
+    if duplicate:raise HTTPException(409,'Ya existe un insumo con ese nombre')
+    item=Product(name=name,category='Insumos',station='bar',price_cents=0,
+        active=False,blocked=True,inventory_enabled=True,stock=data.stock,
+        inventory_only=True,inventory_unit=data.unit)
+    db.add(item);db.flush()
+    db.add(InventoryMovement(product_id=item.id,actor_id=user.id,kind='opening',
+        quantity_change=item.stock,before_stock=0,after_stock=item.stock,
+        reason='Saldo inicial al registrar insumo',source_key=f'inventory-opening:{item.id}',created_at=now()))
+    audit(db,user,'inventory.item.create',product_id=item.id,name=item.name,stock=item.stock,unit=item.inventory_unit)
+    db.commit();await notify()
+    return {'id':item.id,'ok':True}
+
 @app.get('/api/inventory/movements')
 def inventory_movements(product_id:Optional[int]=None,kind:Optional[str]=None,
                         from_date:Optional[str]=None,to_date:Optional[str]=None,
@@ -1752,7 +1824,7 @@ def inventory_movements(product_id:Optional[int]=None,kind:Optional[str]=None,
     for movement,product,actor,account in rows:
         movements.append({
             'id':movement.id,'product_id':product.id,'product_name':product.name,
-            'category':product.category,'kind':movement.kind,
+            'category':product.category,'kind':movement.kind,'inventory_unit':product.inventory_unit,
             'quantity_change':movement.quantity_change,'before_stock':movement.before_stock,
             'after_stock':movement.after_stock,'reason':movement.reason,
             'actor_name':actor.display if actor else 'Sistema',
@@ -2504,18 +2576,41 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
     if a.status!='open':raise HTTPException(409,'La cuenta ya no admite nuevas comandas')
     # Lectura compartida del ajuste: permite varios envíos y bloquea cambios de inventario hasta confirmar.
     setting=db.execute(select(Setting).where(Setting.id==1).with_for_update(read=True)).scalar_one()
-    need={}
-    for line in data.items:need[line.product_id]=need.get(line.product_id,0)+line.qty
-    product_query=select(Product).where(Product.id.in_(need)).order_by(Product.id)
-    # Con inventario activo se requiere bloqueo exclusivo para descontar existencias sin sobreventa.
-    # Sin inventario, FOR SHARE mantiene estable el catálogo y permite envíos simultáneos.
+    order_product_ids={line.product_id for line in data.items}
+    selected_option_ids=sorted({option_id for line in data.items for option_id in line.modifier_option_ids})
+    selected_option_rows=db.scalars(select(ProductModifierOption).where(
+        ProductModifierOption.id.in_(selected_option_ids))).all() if selected_option_ids else []
+    selected_option_by_id={option.id:option for option in selected_option_rows}
+    if len(selected_option_by_id)!=len(selected_option_ids):
+        raise HTTPException(400,'Hay opciones de producto inexistentes')
+    mapped_stock_ids={option.inventory_product_id for option in selected_option_rows if option.inventory_product_id}
+    all_product_ids=order_product_ids|mapped_stock_ids
+    product_query=select(Product).where(Product.id.in_(all_product_ids)).order_by(Product.id)
+    # Bloquea existencias compartidas para evitar que dos comandas descuenten la misma botella.
     product_query=product_query.with_for_update() if setting.inventory_on else product_query.with_for_update(read=True)
     products={p.id:p for p in db.scalars(product_query)}
-    if len(products)!=len(need):raise HTTPException(400,'Hay productos inexistentes')
-    for pid,qty in need.items():
-        p=products[pid]
-        if not p.active or p.blocked:raise HTTPException(409,f'{p.name} no está disponible')
-        if setting.inventory_on and p.inventory_enabled and p.stock<qty:raise HTTPException(409,f'Sin existencias suficientes de {p.name}')
+    if len(products)!=len(all_product_ids):raise HTTPException(400,'Hay productos o insumos inexistentes')
+    need={}
+    for line in data.items:
+        product=products[line.product_id]
+        if product.inventory_only or not product.active or product.blocked:
+            raise HTTPException(409,f'{product.name} no está disponible')
+        if product.inventory_enabled:
+            need[product.id]=need.get(product.id,0)+line.qty
+        for option_id in line.modifier_option_ids:
+            option=selected_option_by_id.get(option_id)
+            if option and option.inventory_product_id:
+                stock_id=option.inventory_product_id
+                stock_item=products.get(stock_id)
+                if not stock_item or not stock_item.inventory_only or not stock_item.inventory_enabled:
+                    raise HTTPException(409,'El insumo vinculado ya no está disponible para inventario')
+                need[stock_id]=need.get(stock_id,0)+line.qty*option.inventory_quantity
+    if setting.inventory_on:
+        for stock_id,qty in need.items():
+            stock_item=products[stock_id]
+            if stock_item.stock<qty:
+                unit=stock_item.inventory_unit or 'unidades'
+                raise HTTPException(409,f'Sin existencias suficientes de {stock_item.name}: quedan {stock_item.stock} {unit}')
     prepared=[];stations=set()
     for line in data.items:
         p=products[line.product_id];stations.add(p.station)
@@ -2549,10 +2644,15 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         modifier_snapshot=[]
         for option in options:
             group=group_by_id.get(option.group_id) or db.get(ProductModifierGroup,option.group_id)
-            modifier_snapshot.append({'group':group.name if group else 'Extra','name':option.name,'price_delta':amount(option.price_delta_cents)})
+            stock_item=products.get(option.inventory_product_id) if option.inventory_product_id else None
+            modifier_snapshot.append({'group':group.name if group else 'Extra','name':option.name,
+                'price_delta':amount(option.price_delta_cents),'modifier_option_id':option.id,
+                'inventory_product_id':option.inventory_product_id,
+                'inventory_product_name':stock_item.name if stock_item else '',
+                'inventory_quantity':option.inventory_quantity})
         prepared.append({'line':line,'product':p,'variant':variant,'options':modifier_snapshot,
-                         'base_cents':promo_base,'modifier_cents':modifier_cents,'final_cents':final_price,
-                         'promo_name':promo.name if promo else ''})
+                         'selected_options':options,'base_cents':promo_base,'modifier_cents':modifier_cents,
+                         'final_cents':final_price,'promo_name':promo.name if promo else ''})
     batch=Batch(account_id=a.id,sent_by=user.id,client_key=data.client_key);db.add(batch)
     try:
         db.flush()
@@ -2573,14 +2673,14 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         line=row['line'];p=row['product'];variant=row['variant']
         item=OrderItem(batch_id=batch.id,product_id=p.id,name=p.name,station=p.station,price_cents=row['final_cents'],qty=line.qty,note=line.note.strip())
         db.add(item);db.flush()
-        created_order_items.append((item,p,line.qty))
+        created_order_items.append((item,p,line.qty,row['selected_options']))
         db.add(OrderItemMeta(order_item_id=item.id,variant_name=variant.name if variant else '',
             modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=mitote_extensions.product_prep_minutes(db,p.id,line.prep_minutes),
             release_after_minutes=line.release_after_minutes,promotion_name=row['promo_name'],
             base_price_cents=row['base_cents'],modifier_price_cents=row['modifier_cents']))
     # Una salida por línea de comanda: conserva producto, folio, mesa, usuario y hora.
     # La clave única batch/item evita duplicar movimientos si el envío se reintenta.
-    for item,p,qty in created_order_items:
+    for item,p,qty,selected_options in created_order_items:
         if setting.inventory_on and p.inventory_enabled:
             before=p.stock;p.stock-=qty;p.version+=1
             db.add(InventoryMovement(product_id=p.id,actor_id=user.id,account_id=a.id,
@@ -2589,6 +2689,18 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
                 reason=f'Salida por comanda enviada · cuenta #{a.id}',
                 account_name=a.name,table_name=table_name,
                 source_key=f'inventory-sale:{batch.id}:{item.id}',created_at=now()))
+        if setting.inventory_on:
+            for option in selected_options:
+                if not option.inventory_product_id:continue
+                stock_item=products[option.inventory_product_id]
+                delta=qty*option.inventory_quantity
+                before=stock_item.stock;stock_item.stock-=delta;stock_item.version+=1
+                db.add(InventoryMovement(product_id=stock_item.id,actor_id=user.id,account_id=a.id,
+                    batch_id=batch.id,order_item_id=item.id,kind='sale',quantity_change=-delta,
+                    before_stock=before,after_stock=stock_item.stock,
+                    reason=f'Salida por cerveza seleccionada · {p.name} · {option.name} · cuenta #{a.id}',
+                    account_name=a.name,table_name=table_name,
+                    source_key=f'inventory-sale:{batch.id}:{item.id}:modifier:{option.id}',created_at=now()))
     for station in stations:db.add(StationTicket(batch_id=batch.id,station=station))
     audit(db,user,'order.send',account_id=a.id,batch_id=batch.id,stations=sorted(stations),items=len(prepared))
     try:
@@ -2631,11 +2743,34 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
     account=owner_account(db,user,account_id,('open',))
     item=db.execute(select(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(OrderItem.id==item_id,Batch.account_id==account_id).with_for_update()).scalar_one_or_none()
     if not item:raise HTTPException(404,'Producto de la cuenta no encontrado')
-    product=db.execute(select(Product).where(Product.id==item.product_id).with_for_update()).scalar_one_or_none()
-    if not product or not product.active or product.blocked:raise HTTPException(409,'El producto ya no está disponible')
-    setting=db.get(Setting,1)
-    if setting.inventory_on and product.inventory_enabled and product.stock<data.qty:raise HTTPException(409,'No hay existencias suficientes para repetir el producto')
     old_meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==item.id))
+    try:
+        modifier_snapshot=json.loads(old_meta.modifiers_json or '[]') if old_meta else []
+    except Exception:
+        modifier_snapshot=[]
+    mapped=[m for m in modifier_snapshot if m.get('inventory_product_id')]
+    stock_need={}
+    for modifier in mapped:
+        stock_id=int(modifier['inventory_product_id'])
+        stock_need[stock_id]=stock_need.get(stock_id,0)+data.qty*int(modifier.get('inventory_quantity') or 1)
+    setting=db.get(Setting,1)
+    product_ids={item.product_id}|set(stock_need)
+    locked=db.scalars(select(Product).where(Product.id.in_(product_ids)).order_by(Product.id).with_for_update()).all()
+    products={p.id:p for p in locked}
+    product=products.get(item.product_id)
+    if not product or product.inventory_only or not product.active or product.blocked:
+        raise HTTPException(409,'El producto ya no está disponible')
+    for stock_id in stock_need:
+        stock_item=products.get(stock_id)
+        if not stock_item or not stock_item.inventory_only or not stock_item.inventory_enabled:
+            raise HTTPException(409,'El insumo vinculado ya no está disponible para inventario')
+    if setting.inventory_on:
+        if product.inventory_enabled and product.stock<data.qty:
+            raise HTTPException(409,f'Sin existencias suficientes de {product.name}')
+        for stock_id,required in stock_need.items():
+            stock_item=products[stock_id]
+            if stock_item.stock<required:
+                raise HTTPException(409,f'Sin existencias suficientes de {stock_item.name}: quedan {stock_item.stock} {stock_item.inventory_unit}')
     batch=Batch(account_id=account.id,sent_by=user.id,client_key=data.client_key);db.add(batch);db.flush()
     mitote_extensions.snapshot_batch_policy(db,batch.id)
     new_item=OrderItem(batch_id=batch.id,product_id=item.product_id,name=item.name,station=item.station,price_cents=item.price_cents,qty=data.qty,note=item.note)
@@ -2646,7 +2781,28 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
             base_price_cents=old_meta.base_price_cents,modifier_price_cents=old_meta.modifier_price_cents))
     else:
         db.add(OrderItemMeta(order_item_id=new_item.id,variant_name='',modifiers_json='[]',prep_minutes=15,release_after_minutes=0,base_price_cents=item.price_cents,modifier_price_cents=0))
-    if setting.inventory_on and product.inventory_enabled:product.stock-=data.qty;product.version+=1
+    occupancy=db.scalar(select(TableOccupancy).where(TableOccupancy.account_id==account.id))
+    assigned_table=db.get(DiningTable,occupancy.table_id) if occupancy else None
+    table_name=assigned_table.name if assigned_table else ''
+    if setting.inventory_on and product.inventory_enabled:
+        before=product.stock;product.stock-=data.qty;product.version+=1
+        db.add(InventoryMovement(product_id=product.id,actor_id=user.id,account_id=account.id,
+            batch_id=batch.id,order_item_id=new_item.id,kind='sale',quantity_change=-data.qty,
+            before_stock=before,after_stock=product.stock,
+            reason=f'Salida por comanda repetida · cuenta #{account.id}',
+            account_name=account.name,table_name=table_name,
+            source_key=f'inventory-sale:{batch.id}:{new_item.id}',created_at=now()))
+    if setting.inventory_on:
+        for modifier in mapped:
+            stock_item=products[int(modifier['inventory_product_id'])]
+            delta=data.qty*int(modifier.get('inventory_quantity') or 1)
+            before=stock_item.stock;stock_item.stock-=delta;stock_item.version+=1
+            db.add(InventoryMovement(product_id=stock_item.id,actor_id=user.id,account_id=account.id,
+                batch_id=batch.id,order_item_id=new_item.id,kind='sale',quantity_change=-delta,
+                before_stock=before,after_stock=stock_item.stock,
+                reason=f'Salida por cerveza seleccionada en comanda repetida · {item.name} · {modifier.get("name","")}',
+                account_name=account.name,table_name=table_name,
+                source_key=f'inventory-sale:{batch.id}:{new_item.id}:repeat:{stock_item.id}',created_at=now()))
     db.add(StationTicket(batch_id=batch.id,station=item.station))
     audit(db,user,'order.repeat',account_id=account.id,source_item_id=item.id,new_item_id=new_item.id,qty=data.qty,batch_id=batch.id)
     db.commit();await notify()
@@ -2696,18 +2852,26 @@ async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),u
                 station_ticket=db.scalar(select(StationTicket).where(StationTicket.batch_id==item.batch_id,StationTicket.station==item.station))
                 if station_ticket and station_ticket.status in ('preparing','ready'):
                     raise HTTPException(409,'No se puede devolver stock: la preparación ya comenzó')
-                p=db.execute(select(Product).where(Product.id==item.product_id).with_for_update()).scalar_one()
-                s=db.get(Setting,1)
-                if s.inventory_on and p.inventory_enabled:
-                    before=p.stock;p.stock+=r.qty;p.version+=1
-                    occupancy=db.scalar(select(TableOccupancy).where(TableOccupancy.account_id==a.id))
-                    assigned_table=db.get(DiningTable,occupancy.table_id) if occupancy else None
-                    db.add(InventoryMovement(product_id=p.id,actor_id=user.id,account_id=a.id,
-                        batch_id=item.batch_id,order_item_id=item.id,kind='return',quantity_change=r.qty,
-                        before_stock=before,after_stock=p.stock,
+                # Solo devuelve los insumos/productos que sí se descontaron al enviar la comanda.
+                # No crea existencias en pedidos anteriores ni si el inventario se apagó después.
+                sales=db.scalars(select(InventoryMovement).where(
+                    InventoryMovement.order_item_id==item.id,InventoryMovement.kind=='sale'
+                ).with_for_update()).all()
+                occupancy=db.scalar(select(TableOccupancy).where(TableOccupancy.account_id==a.id))
+                assigned_table=db.get(DiningTable,occupancy.table_id) if occupancy else None
+                for sale in sales:
+                    per_unit=abs(int(sale.quantity_change))//max(1,int(item.qty))
+                    delta=per_unit*r.qty
+                    if delta<1:continue
+                    stock_item=db.execute(select(Product).where(Product.id==sale.product_id).with_for_update()).scalar_one_or_none()
+                    if not stock_item:continue
+                    before=stock_item.stock;stock_item.stock+=delta;stock_item.version+=1
+                    db.add(InventoryMovement(product_id=stock_item.id,actor_id=user.id,account_id=a.id,
+                        batch_id=item.batch_id,order_item_id=item.id,kind='return',quantity_change=delta,
+                        before_stock=before,after_stock=stock_item.stock,
                         reason=f'Devolución autorizada por cancelación · cuenta #{a.id}',
                         account_name=a.name,table_name=assigned_table.name if assigned_table else '',
-                        source_key=f'inventory-return:{r.id}',created_at=now()))
+                        source_key=f'inventory-return:{r.id}:{sale.id}',created_at=now()))
     r.status='approved' if data.approve else 'rejected';r.decided_by=user.id
     audit(db,user,'approval.decide',id=r.id,approved=data.approve,return_stock=data.return_stock);db.commit();await notify();return {'ok':True}
 

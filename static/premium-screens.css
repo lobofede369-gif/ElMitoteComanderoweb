@@ -446,3 +446,9 @@ body[data-pos-screen="inventory"] #content .inventory-delta.negative { color:#ff
 body[data-pos-screen="inventory"] #content .inventory-movement-product { color:#f3e0b3; font-weight:850; overflow-wrap:anywhere; }
 body[data-pos-screen="inventory"] #content .inventory-history-note { padding:10px 12px; border-left:3px solid #d2ae5f; background:rgba(190,145,55,.09); border-radius:0 10px 10px 0; }
 @media(max-width:390px) { body[data-pos-screen="inventory"] #content .inventory-filter-card .formgrid { grid-template-columns:1fr; } }
+
+/* Insumos de inventario y vínculo de marcas con existencias */
+body[data-pos-screen="inventory"] #content .inventory-item-add-card { border-top:2px solid #d8b45f; }
+body[data-pos-screen="inventory"] #content .inventory-item-add-card input,
+body[data-pos-screen="inventory"] #content .inventory-item-add-card select,
+body[data-pos-screen="products"] #content .card select { box-sizing:border-box; width:100%; min-width:0; min-height:42px; padding:9px 10px; border:1px solid #46515c; border-radius:10px; background:#141a20; color:#f5f5f1; font-size:16px; }
