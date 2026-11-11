@@ -3,7 +3,7 @@
 body[data-pos-screen="overview"] .app-layout {
   background:
     linear-gradient(180deg,rgba(7,8,10,.88),rgba(7,8,10,.94)),
-    url('/static/assets/dashboard-ambiente.jpg') center/cover fixed;
+    url('/static/assets/dashboard-ambiente.jpg') center/cover;
 }
 body[data-pos-screen="overview"] .topbar {
   background:linear-gradient(90deg,rgba(10,10,10,.97),rgba(25,18,10,.94));
