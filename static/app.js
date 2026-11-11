@@ -204,11 +204,11 @@ async function start(authenticatedUser=null){try{
     const initialRender=render({preserveScroll:false});
     // La conexión de eventos se inicia mientras se consultan los primeros datos.
     listenEvents();
-    initialRender.then(()=>{
-      if(!state.user)return;
+    await initialRender;
+    if(state.user){
       if(state.user.role==='waiter')syncWaiterReadyAlerts(true).catch(()=>{});
       syncPushOnLogin().catch(()=>{});
-    });
+    }
   }catch(e){logout('expired');toast(e.message,true)}}
 async function go(screen,options={}){
   if(!state.user)return;
@@ -1120,4 +1120,6 @@ $('#content').addEventListener('submit',async e=>{e.preventDefault();const form=
 $('#content').addEventListener('change',e=>{if(e.target.id==='order-account'){state.account=Number(e.target.value);state.draft=[];persistWorkState();render()}if(e.target.id==='order-product'){const p=state.products.find(x=>x.id===Number(e.target.value));const box=$('#product-config');if(box)box.innerHTML=orderProductConfig(p)}if(e.target.id==='cashier-account'){state.account=Number(e.target.value);render()}if(e.target.id==='split-mode'){$('#split-products').hidden=e.target.value!=='products'}});
 window.addEventListener('online',()=>{$('#connection').textContent='● Conectado';$('#connection').classList.remove('off');render({preserveScroll:true})});window.addEventListener('offline',()=>{$('#connection').textContent='● Sin conexión';$('#connection').classList.add('off');stopAlarm()});
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
-if(state.token)start();
+if(window.MitoteStartup?.boot){
+  window.MitoteStartup.boot({hasToken:Boolean(state.token),restoreSession:()=>start()});
+}else if(state.token)start();
