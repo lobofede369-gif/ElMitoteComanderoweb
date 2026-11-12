@@ -1,0 +1,496 @@
+/* EL MITOTE COMANDAS · SISTEMA VISUAL UNIFICADO
+   Referencia aprobada: pantalla Cuentas del 11/11/2026.
+   Capa de presentación únicamente: no modifica lógica, permisos ni datos. */
+
+:root{
+  color-scheme:dark;
+  --bg:#08090b;
+  --panel:#20272e;
+  --panel2:#252d35;
+  --line:#46515d;
+  --yellow:#e8c474;
+  --text:#f7f5f0;
+  --muted:#b8c1c9;
+  --green:#66d3a0;
+  --red:#c94b59;
+  --mitote-bg:#08090b;
+  --mitote-panel:#20272e;
+  --mitote-panel-soft:#252d35;
+  --mitote-line:#46515d;
+  --mitote-gold:#e8c474;
+  --mitote-gold-soft:#5a492b;
+  --mitote-text:#f7f5f0;
+  --mitote-muted:#b8c1c9;
+}
+
+/* Fondo de referencia: negro limpio como la pantalla Cuentas.
+   Las fotografías aprobadas permanecen dentro de los paneles que ya las usan. */
+html,body{background:#08090b!important;color:#f7f5f0}
+.app-layout,
+body[data-pos-screen="overview"] .app-layout{
+  background:#08090b!important;
+}
+main,#content{background:transparent!important;color:#f7f5f0}
+#content{min-width:0}
+::selection{background:rgba(232,196,116,.28);color:#fff8e9}
+
+/* Encabezado y navegación. */
+.topbar,
+body[data-pos-screen="overview"] .topbar{
+  background:linear-gradient(180deg,#111316 0%,#08090b 100%)!important;
+  border-bottom:1px solid #80683f!important;
+  box-shadow:0 5px 20px rgba(0,0,0,.28);
+}
+.brandline strong{color:#f5d995!important}
+.brandline small{color:#b8c1c9!important}
+.topright .connection{color:#66d3a0!important}
+.topright .connection.off{color:#ff8995!important}
+.navigation,
+body[data-pos-screen="overview"] .navigation{
+  background:linear-gradient(180deg,#121519 0%,#08090b 100%)!important;
+  border-color:#80683f!important;
+}
+.navbtn{
+  color:#e7e6e1!important;
+  border:1px solid transparent!important;
+  border-radius:13px!important;
+}
+.navbtn:hover{background:#252b31!important;border-color:#414b55!important}
+.navbtn.active{
+  color:#f5d995!important;
+  background:linear-gradient(145deg,#3a3325,#25282c)!important;
+  border:1px solid #927749!important;
+  box-shadow:inset 0 3px #e8c474,0 4px 14px rgba(0,0,0,.22)!important;
+}
+.heading h1{color:#f7f5f0!important}
+.heading .eyebrow,.eyebrow{color:#e8c474!important}
+#back,#refresh,.heading-actions button{
+  border-radius:13px!important;
+}
+#back.outline,#refresh.outline,
+.heading-actions button.outline{
+  color:#f4d58e!important;
+  background:rgba(232,196,116,.035)!important;
+  border:1px solid #8b7146!important;
+}
+
+/* Jerarquía de secciones. */
+#content>.section,
+#content .section{
+  color:#f5e8c8!important;
+  border-left:4px solid #b99250!important;
+  padding-left:12px;
+  font-weight:850;
+  letter-spacing:-.015em;
+}
+#content h2,#content h3{color:#f7f5f0}
+#content p,#content .mini,#content .muted{color:#bac2ca}
+#content .lineitem{border-color:#3d4751!important}
+#content .divider{background:#3d4751!important}
+#content .empty{
+  color:#b9c1c9!important;
+  background:#171d23!important;
+  border:1px dashed #53606b!important;
+  border-radius:14px;
+}
+
+/* Tarjetas base: mismo gris titanio de Cuentas en todos los módulos. */
+#content .card,
+#content .ticket,
+#content .pos-catalog,
+#content .pos-draft-card,
+#content .pos-account-picker,
+#content .pos-new-account-card,
+#content .table-live-section,
+#content .table-admin-card,
+#content .cashier-summary,
+#content .cashier-products,
+#content .cashier-discounts,
+#content .cashier-payment,
+#content .cashier-history,
+#content .inventory-control-card,
+#content .inventory-item-add-card,
+#content .inventory-filter-card,
+#content .inventory-product-card,
+#content .inventory-movement-card,
+#content .staff-pin-setup,
+#content .staff-user-card,
+#content .prep-ticket,
+#content .modifier-admin-group,
+#content .modifier-option,
+#content .product-config-admin,
+#content .pos-more-link,
+#content .premium-shortcut,
+#content .mitote-live-panel{
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35 0%,#1d242b 100%)!important;
+  border:1px solid #46515d!important;
+  border-radius:17px!important;
+  box-shadow:0 5px 16px rgba(0,0,0,.20),inset 0 1px rgba(255,255,255,.025)!important;
+}
+#content .card h3,
+#content .ticket h3,
+#content .prep-ticket h3,
+#content .staff-user-card h3,
+#content .table-live-card h3,
+#content .account-card-title h3{color:#f7f5f0!important}
+#content .card p,
+#content .card .mini,
+#content .card .muted,
+#content .ticket .mini,
+#content .prep-ticket .mini{color:#bac2ca!important}
+
+/* Estadísticas: borde superior dorado y valores crema. */
+#content .stat{
+  min-width:0;
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#292f36 0%,#1c2228 100%)!important;
+  border:1px solid #46515d!important;
+  border-top:2px solid #b99250!important;
+  border-radius:17px!important;
+  box-shadow:0 5px 16px rgba(0,0,0,.2)!important;
+}
+#content .stat b,
+#content .price,
+#content .total,
+#content .inventory-stock-number,
+#content .inventory-delta{
+  color:#f5d995!important;
+  font-variant-numeric:tabular-nums;
+}
+#content .stat span{color:#c1c8ce!important}
+
+/* Cuentas: conservar su composición y extender su acabado al resto de listas. */
+#content .account-card{
+  background:linear-gradient(145deg,#262e37 0%,#1d242b 100%)!important;
+  border:1px solid #46515d!important;
+  border-left:5px solid #8b9aa8!important;
+  border-radius:17px!important;
+  box-shadow:0 5px 16px rgba(0,0,0,.22)!important;
+}
+#content .account-card-open,
+#content .account-card-pending{border-left-color:#e4bd67!important}
+#content .account-card-paid{border-left-color:#66c99e!important}
+#content .account-card-merged,
+#content .account-card-cancelled{border-left-color:#7c8791!important}
+#content .account-card-values{
+  background:#12171d!important;
+  border:1px solid #3e4852!important;
+  border-radius:13px!important;
+}
+#content .account-card-values span{color:#bac2ca!important}
+#content .account-card-values strong{color:#f5d995!important}
+#content .account-card-meta,
+#content .account-card-reference{color:#b8c1c9!important}
+
+/* Mesas: misma tarjeta titanio, con acento de estado a la izquierda. */
+#content .table-live-card{
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-left:5px solid #66c99e!important;
+  border-radius:16px!important;
+}
+#content .table-live-card.table-live-occupied{
+  background:linear-gradient(145deg,#292e32,#1d242b)!important;
+  border-left-color:#e4bd67!important;
+}
+#content .table-live-card.table-live-inactive{border-left-color:#7c8791!important}
+#content .table-live-meta,
+#content .table-live-assignment span,
+#content .table-live-assignment small{color:#bac2ca!important}
+#content .table-live-assignment strong{color:#f5d995!important}
+#content .table-live-icon{background:#403724!important;color:#f5d995!important}
+
+/* Cocina y barra: tickets uniformes; el estado se reconoce por el borde y badge. */
+#content .ticket,
+#content .prep-ticket{
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-left:5px solid #8b9aa8!important;
+  border-radius:17px!important;
+}
+#content .ticket.new,
+#content .prep-ticket-new{border-left-color:#d47a82!important}
+#content .ticket.received,
+#content .prep-ticket-received{border-left-color:#8dbcf1!important}
+#content .ticket.preparing,
+#content .prep-ticket-preparing{border-left-color:#e4bd67!important}
+#content .ticket.ready,
+#content .prep-ticket-ready{border-left-color:#66c99e!important}
+#content .prep-total{
+  color:#f7f5f0!important;
+  background:#141a20!important;
+  border:1px solid #5a4b32!important;
+  border-radius:13px!important;
+}
+#content .prep-total b,#content .prep-clock{color:#f5d995!important}
+#content .prep-flag{border-radius:999px!important}
+
+/* Caja y cobros: paneles de la misma familia, importes en dorado. */
+#content .cashier-summary,
+#content .cashier-products,
+#content .cashier-discounts,
+#content .cashier-payment,
+#content .cashier-history{
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:17px!important;
+}
+#content .cashier-summary{border-top:2px solid #b99250!important}
+#content .cashier-summary select,
+#content #pay-form select,
+#content #pay-form input{
+  color:#f7f5f0!important;
+  background:#12181e!important;
+  border:1px solid #46515d!important;
+  border-radius:12px!important;
+}
+#content #pay-form label{
+  color:#e5e1d8!important;
+  background:#1a2027!important;
+  border:1px solid #46515d!important;
+  border-radius:13px!important;
+}
+#content .cashier-summary .total{color:#f5d995!important}
+
+/* Menú, catálogo, inventario y modificadores. */
+#content .pos-category{
+  color:#e8e7e2!important;
+  background:#252d35!important;
+  border:1px solid #46515d!important;
+  border-radius:11px!important;
+}
+#content .pos-category.active{
+  color:#241b0d!important;
+  background:#e8c474!important;
+  border-color:#e8c474!important;
+}
+#content .pos-product{
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#29313a,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:15px!important;
+}
+#content .pos-product-name{color:#f7f5f0!important}
+#content .pos-product-meta{color:#bac2ca!important}
+#content .pos-product-bottom strong{color:#f5d995!important}
+#content .pos-product-plus{
+  color:#241b0d!important;
+  background:linear-gradient(135deg,#f5d995,#dfb45f)!important;
+}
+#content .pos-qty-controls button{
+  color:#f7f5f0!important;
+  background:#303740!important;
+  border:1px solid #59636d!important;
+}
+#content .pos-qty-controls span{color:#f5d995!important}
+#content .pos-draft-total{
+  color:#f7f5f0!important;
+  background:#12181e!important;
+  border:1px solid #46515d!important;
+  border-radius:13px!important;
+}
+#content .pos-draft-total strong{color:#f5d995!important}
+#content .inventory-product-card,
+#content .inventory-movement-card{
+  padding:15px!important;
+}
+#content .inventory-movement-card.is-out{border-left:4px solid #d47a82!important}
+#content .inventory-movement-card.is-in{border-left:4px solid #66c99e!important}
+#content .inventory-delta.negative{color:#ff9da6!important}
+#content .inventory-delta.positive{color:#80e0b2!important}
+#content .inventory-product-actions button{min-height:40px}
+#content details.product-config-admin,
+#content details.product-config-admin>summary{
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border-color:#46515d!important;
+}
+#content .modifier-admin-group,
+#content .modifier-option{background:#20272e!important}
+
+/* Personal, autorizaciones, auditoría y reportes. */
+#content .staff-pin-setup,
+#content .staff-user-card{background:linear-gradient(145deg,#252d35,#1d242b)!important}
+#content .staff-registration-form input,
+#content .staff-registration-form select,
+#content .staff-pin-form input{
+  color:#f7f5f0!important;
+  background:#12181e!important;
+  border:1px solid #46515d!important;
+  border-radius:12px!important;
+}
+#content .staff-pin-status{color:#80e0b2!important}
+#content .staff-pin-status.pending{color:#f3d28c!important}
+#content .card.table-wrap,
+#content .table-wrap{background:#171d23!important;border-color:#46515d!important}
+#content .table-wrap th,
+#content th{
+  color:#f5d995!important;
+  background:#252d35!important;
+  border-color:#46515d!important;
+}
+#content .table-wrap td,
+#content td{color:#e1e4e6!important;border-color:#3d4751!important}
+#content .table-wrap tbody tr:nth-child(2n){background:rgba(255,255,255,.025)!important}
+
+/* Formularios y controles: alto contraste y tacto cómodo. */
+#content label{color:#e5e1d8!important}
+#content input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+#content select,
+#content textarea,
+#login input:not([type="checkbox"]):not([type="radio"]){
+  color:#f7f5f0!important;
+  background:#12181e!important;
+  border:1px solid #46515d!important;
+  border-radius:12px!important;
+}
+#content input::placeholder,
+#content textarea::placeholder,
+#login input::placeholder{color:#929ca6!important}
+#content input:focus,
+#content select:focus,
+#content textarea:focus,
+#login input:focus{
+  border-color:#e8c474!important;
+  outline:2px solid rgba(232,196,116,.18)!important;
+  outline-offset:1px;
+}
+#content input[type="checkbox"],
+#content input[type="radio"],
+#content input[type="range"]{accent-color:#e8c474}
+
+/* Botones: dorado para acciones principales, titanio para secundarias,
+   rojo reservado a acciones destructivas o de riesgo. */
+#content button.primary:not(.red):not(.danger),
+#content .accounts-new-button,
+#content .staff-register-button{
+  color:#241b0d!important;
+  background:linear-gradient(115deg,#f5dc9d 0%,#e4bc6d 58%,#f1d38f 100%)!important;
+  border:1px solid #f2d38e!important;
+  border-radius:12px!important;
+  box-shadow:0 4px 13px rgba(123,83,25,.18)!important;
+}
+#content button.outline,
+#content .account-card-footer button{
+  color:#f4d58e!important;
+  background:rgba(232,196,116,.035)!important;
+  border:1px solid #927749!important;
+  border-radius:12px!important;
+}
+#content button.ghost{
+  color:#f0eee8!important;
+  background:linear-gradient(145deg,#303740,#22272d)!important;
+  border:1px solid #46515d!important;
+  border-radius:12px!important;
+}
+#content button.red,
+#content button.danger,
+#content .red{color:#fff!important}
+#content button:focus-visible,
+#content a:focus-visible{
+  outline:2px solid #f5d995!important;
+  outline-offset:2px;
+}
+
+/* Estados operativos: semántica intacta. */
+#content .pill{
+  color:#edf0f2!important;
+  background:#303740!important;
+  border:1px solid #4a5560!important;
+  border-radius:999px!important;
+}
+#content .pill.open,
+#content .pill.ready,
+#content .pill.approved,
+#content .pill.paid{
+  color:#baf0d2!important;
+  background:#1a4033!important;
+  border-color:#3c8064!important;
+}
+#content .pill.pending,
+#content .pill.received,
+#content .pill.preparing{
+  color:#f7dfa7!important;
+  background:#403522!important;
+  border-color:#80683e!important;
+}
+#content .pill.new,
+#content .pill.rejected,
+#content .pill.out{
+  color:#ffc3ca!important;
+  background:#43262d!important;
+  border-color:#92505c!important;
+}
+#content .note{
+  color:#ffedc6!important;
+  background:#383020!important;
+  border-left:3px solid #e3bb6c!important;
+}
+#content .danger-note{
+  color:#ffd7dc!important;
+  background:#3d252b!important;
+  border-left-color:#d56a77!important;
+}
+#toast{
+  color:#fff0cd!important;
+  background:linear-gradient(145deg,#373020,#211d16)!important;
+  border:1px solid #a98549!important;
+}
+
+/* Menú Más y overlays. */
+.pos-more-panel{
+  color:#f7f5f0!important;
+  background:linear-gradient(180deg,#20272e,#111519)!important;
+  border:1px solid #46515d!important;
+  border-top:2px solid #b99250!important;
+}
+.pos-more-link{
+  color:#f7f5f0!important;
+  background:#252d35!important;
+  border:1px solid #46515d!important;
+}
+.pos-more-link.active{
+  color:#f5d995!important;
+  background:#393225!important;
+  border-color:#927749!important;
+}
+
+/* Móvil, tablet y escritorio: conservar la distribución funcional de cada rol. */
+@media(max-width:700px){
+  .navigation,
+  body.pos-waiter .navigation,
+  body[data-pos-screen="overview"] .navigation{
+    background:linear-gradient(180deg,#121519 0%,#08090b 100%)!important;
+    border-top:1px solid #80683f!important;
+    box-shadow:0 -8px 24px rgba(0,0,0,.48)!important;
+  }
+  .navigation .navbtn.active,
+  body.pos-waiter .navigation .navbtn.active,
+  body.pos-waiter.pos-ui-ready .navigation .navbtn.active{
+    color:#f5d995!important;
+    background:linear-gradient(145deg,#3a3325,#25282c)!important;
+    border:1px solid #927749!important;
+    box-shadow:inset 0 3px #e8c474!important;
+  }
+  #content .card{padding:15px}
+  #content .ticket,#content .prep-ticket{padding:15px}
+  #content input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  #content select,#content textarea{font-size:16px}
+  .heading-actions{gap:7px}
+  .heading-actions button{min-height:42px;padding:8px 10px}
+}
+@media(min-width:701px){
+  .navigation{background:linear-gradient(180deg,#171c22,#0d1014)!important}
+  .navigation .navbtn.active{
+    box-shadow:inset 3px 0 #e8c474,0 4px 14px rgba(0,0,0,.2)!important;
+  }
+}
+@media(prefers-reduced-motion:reduce){
+  #content *, .navigation *{scroll-behavior:auto!important;transition:none!important;animation:none!important}
+}
+@media print{
+  html,body,.app-layout,main,#content{background:#fff!important;color:#000!important}
+  #content .card,#content .stat,#content .ticket,#content .prep-ticket{background:#fff!important;color:#000!important;box-shadow:none!important}
+}
