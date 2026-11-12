@@ -1,0 +1,849 @@
+/* EL MITOTE · ETAPA 2
+   Pulido específico de los módulos usando Cuentas como referencia.
+   No altera estructura funcional, eventos, permisos ni datos. */
+
+/* Ritmo común y límites de ancho para listas y paneles. */
+#content .accounts-screen,
+#content .table-screen,
+#content .cashier-screen,
+#content .inventory-ledger,
+#content .premium-dashboard{
+  min-width:0;
+}
+#content .cards{
+  gap:12px;
+}
+#content .formrow{
+  gap:13px;
+}
+#content .formgrid{
+  gap:10px;
+}
+#content .inline{
+  gap:8px;
+}
+#content .stack{
+  gap:10px;
+}
+#content .row{
+  min-width:0;
+}
+#content .row>*{
+  min-width:0;
+}
+#content .section{
+  margin:22px 0 12px;
+}
+
+/* Inicio: conserva el panel fotográfico de marca y lleva los accesos a la
+   misma familia de tarjetas de Cuentas. */
+#content .premium-dashboard-heading{
+  align-items:center;
+  gap:14px;
+}
+#content .premium-dashboard-heading h2,
+#content .premium-dashboard-second h2{
+  color:#f7f5f0!important;
+  letter-spacing:-.025em;
+}
+#content .premium-dashboard-live{
+  color:#aee8c8!important;
+  background:#123328!important;
+  border:1px solid #356b53!important;
+}
+#content .premium-shortcut-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(min(100%,205px),1fr));
+  gap:10px;
+}
+#content .premium-shortcut{
+  display:grid;
+  grid-template-columns:48px minmax(0,1fr) 18px;
+  grid-template-rows:auto auto;
+  align-items:center;
+  column-gap:11px;
+  row-gap:5px;
+  min-height:106px;
+  padding:13px;
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:16px!important;
+  box-shadow:0 5px 15px rgba(0,0,0,.2)!important;
+  text-align:left;
+}
+#content .premium-shortcut-icon{
+  grid-column:1;
+  grid-row:1 / span 2;
+  display:grid;
+  place-items:center;
+  width:46px;
+  height:46px;
+  color:#f5d995!important;
+  background:linear-gradient(145deg,#493b25,#302d25)!important;
+  border:1px solid #745d38!important;
+  border-radius:13px!important;
+}
+#content .premium-shortcut>strong{
+  grid-column:2;
+  color:#f7f5f0!important;
+  font-size:.98rem;
+  line-height:1.2;
+}
+#content .premium-shortcut>small{
+  grid-column:2;
+  color:#bac2ca!important;
+  font-size:.74rem;
+  line-height:1.35;
+}
+#content .premium-shortcut-arrow{
+  grid-column:3;
+  grid-row:1 / span 2;
+  color:#e8c474!important;
+  font-size:1.4rem;
+}
+#content .premium-shortcut:active{transform:scale(.992)}
+#content .premium-dashboard-footer .card{
+  border-top:2px solid #b99250!important;
+}
+
+/* Lanzador de operaciones para perfiles de mesero. */
+#content .pos-shortcuts{
+  display:grid;
+  gap:12px;
+  margin:0 0 14px;
+}
+#content .pos-section-title{
+  display:grid;
+  gap:5px;
+  padding:0 2px 9px;
+  border-bottom:1px solid #3d4751;
+}
+#content .pos-section-title>span,
+#content .pos-kicker{
+  color:#e8c474!important;
+  font-size:.68rem;
+  font-weight:900;
+  letter-spacing:.13em;
+}
+#content .pos-section-title>strong{
+  color:#f7f5f0!important;
+  font-size:1.1rem;
+}
+#content .pos-tiles{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:10px;
+}
+#content .pos-tile{
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  justify-content:flex-start;
+  min-width:0;
+  min-height:120px;
+  padding:14px;
+  gap:9px;
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:16px!important;
+  box-shadow:0 5px 15px rgba(0,0,0,.2)!important;
+  text-align:left;
+}
+#content .pos-tile-icon{
+  display:grid;
+  place-items:center;
+  width:43px;
+  height:43px;
+  color:#f5d995!important;
+  background:#403724!important;
+  border:1px solid #715c38!important;
+  border-radius:13px!important;
+}
+#content .pos-tile-title{
+  color:#f7f5f0!important;
+  font-size:1rem;
+  font-weight:900;
+}
+#content .pos-tile-hint{
+  color:#bac2ca!important;
+  font-size:.76rem;
+}
+#content .pos-tile-primary{
+  color:#241b0d!important;
+  background:linear-gradient(135deg,#f5d995,#dfb45f)!important;
+  border-color:#e8c474!important;
+}
+#content .pos-tile-primary .pos-tile-icon{
+  color:#352713!important;
+  background:#e8c36f!important;
+}
+#content .pos-tile-primary .pos-tile-title,
+#content .pos-tile-primary .pos-tile-hint{color:#2a2112!important}
+
+/* Comandero: catálogo, búsqueda, categorías, productos y borrador. */
+#content .pos-account-picker,
+#content .pos-details-card,
+#content .pos-bill-card,
+#content .pos-draft-card,
+#content .pos-catalog{
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:17px!important;
+  box-shadow:0 5px 16px rgba(0,0,0,.2)!important;
+}
+#content .pos-account-picker,
+#content .pos-details-card,
+#content .pos-bill-card{padding:15px!important}
+#content .pos-account-picker{border-top:2px solid #b99250!important}
+#content .pos-account-picker label{color:#e5e1d8!important}
+#content .pos-catalog{padding:14px!important}
+#content .pos-catalog-top{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:10px;
+  margin-bottom:12px;
+}
+#content .pos-catalog-top h3{
+  margin:3px 0 0;
+  color:#f7f5f0!important;
+  font-size:1.1rem;
+}
+#content .pos-catalog-toolbar{
+  display:flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:8px;
+}
+#content .pos-product-count{
+  color:#bac2ca!important;
+  font-size:.74rem;
+}
+#content .pos-open-draft{
+  min-height:39px;
+  padding:8px 12px;
+  color:#f5d995!important;
+  background:#30291e!important;
+  border:1px solid #80683f!important;
+  border-radius:11px!important;
+}
+#content .pos-open-draft b{
+  display:inline-grid;
+  place-items:center;
+  min-width:21px;
+  height:21px;
+  margin-left:4px;
+  color:#241b0d!important;
+  background:#e8c474!important;
+  border-radius:50%;
+}
+#content .pos-catalog-fields{
+  display:grid;
+  grid-template-columns:minmax(90px,.65fr) minmax(0,2fr);
+  gap:10px;
+  margin-bottom:10px;
+}
+#content .pos-catalog-fields label{
+  color:#e5e1d8!important;
+  font-size:.78rem;
+}
+#content .pos-catalog-fields input,
+#content .pos-search-wrap input{
+  min-height:44px;
+  color:#f7f5f0!important;
+  background:#12181e!important;
+  border:1px solid #46515d!important;
+  border-radius:12px!important;
+}
+#content .pos-search-wrap{
+  position:relative;
+  display:flex;
+  align-items:center;
+  margin:0 0 11px;
+}
+#content .pos-search-icon{
+  position:absolute;
+  left:12px;
+  color:#e8c474!important;
+  font-size:1.2rem;
+  pointer-events:none;
+}
+#content .pos-search-wrap input{padding-left:38px!important}
+#content .pos-categories{
+  display:flex;
+  gap:7px;
+  overflow-x:auto;
+  padding:2px 1px 9px;
+  scrollbar-width:thin;
+}
+#content .pos-category{
+  flex:0 0 auto;
+  min-height:39px;
+  padding:8px 13px;
+  color:#e8e7e2!important;
+  background:#252d35!important;
+  border:1px solid #46515d!important;
+  border-radius:999px!important;
+  font-size:.78rem;
+  font-weight:800;
+}
+#content .pos-category.active{
+  color:#241b0d!important;
+  background:#e8c474!important;
+  border-color:#e8c474!important;
+}
+#content .pos-product-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(min(100%,155px),1fr));
+  gap:9px;
+}
+#content .pos-product{
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  justify-content:space-between;
+  min-width:0;
+  min-height:112px;
+  padding:12px;
+  gap:7px;
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#29313a,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:15px!important;
+  text-align:left;
+}
+#content .pos-product-name{
+  color:#f7f5f0!important;
+  font-size:.9rem;
+  font-weight:850;
+  overflow-wrap:anywhere;
+}
+#content .pos-product-meta{
+  color:#bac2ca!important;
+  font-size:.72rem;
+}
+#content .pos-product-bottom{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  width:100%;
+  gap:8px;
+}
+#content .pos-product-bottom strong{
+  color:#f5d995!important;
+  font-size:1rem;
+  font-variant-numeric:tabular-nums;
+}
+#content .pos-product-plus{
+  display:grid;
+  place-items:center;
+  width:32px;
+  height:32px;
+  color:#241b0d!important;
+  background:linear-gradient(135deg,#f5d995,#dfb45f)!important;
+  border-radius:10px!important;
+  font-size:1.25rem;
+  font-weight:900;
+}
+#content .pos-search-empty{
+  padding:15px;
+  color:#bac2ca!important;
+  background:#151b21;
+  border:1px dashed #53606b;
+  border-radius:12px;
+  text-align:center;
+}
+#content .pos-catalog-help{
+  margin:11px 0 0;
+  color:#aeb8c1!important;
+  font-size:.74rem;
+}
+#content .pos-draft-card{
+  border-top:2px solid #b99250!important;
+  padding:15px!important;
+}
+#content .pos-draft-heading,
+#content .pos-details-heading{
+  color:#f5e8c8!important;
+}
+#content .pos-draft-total{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:9px;
+  padding:11px;
+  color:#f7f5f0!important;
+  background:#12181e!important;
+  border:1px solid #5a4b32!important;
+  border-radius:12px!important;
+}
+#content .pos-draft-total span{color:#bac2ca!important}
+#content .pos-draft-total strong{color:#f5d995!important}
+#content .pos-qty-controls{
+  display:flex;
+  align-items:center;
+  gap:7px;
+}
+#content .pos-qty-controls button{
+  min-width:38px;
+  min-height:38px;
+  padding:5px;
+  color:#f7f5f0!important;
+  background:#303740!important;
+  border:1px solid #59636d!important;
+  border-radius:10px!important;
+}
+#content .pos-qty-controls span{color:#f5d995!important;font-weight:900}
+#content .pos-bill-card{border-left:4px solid #b99250!important}
+#content .pos-advanced{
+  margin-top:10px;
+  padding:12px;
+  color:#f7f5f0!important;
+  background:#171e24!important;
+  border:1px solid #46515d!important;
+  border-radius:13px!important;
+}
+#content .pos-advanced>summary{
+  color:#f5d995!important;
+  font-weight:850;
+  cursor:pointer;
+}
+
+/* Configuración de producto y modificadores dentro de la comanda. */
+#content .order-config-block{
+  display:grid;
+  gap:11px;
+  padding:13px;
+  color:#f7f5f0!important;
+  background:#171e24!important;
+  border:1px solid #46515d!important;
+  border-radius:13px!important;
+}
+#content .modifier-group{
+  min-width:0;
+  margin:0;
+  padding:12px;
+  color:#f7f5f0!important;
+  background:#20272e!important;
+  border:1px solid #46515d!important;
+  border-radius:12px!important;
+}
+#content .modifier-group legend{
+  padding:0 6px;
+  color:#f5d995!important;
+  font-weight:850;
+}
+#content .modifier-group legend small{color:#bac2ca!important}
+#content .modifier-options{
+  display:grid;
+  gap:7px;
+}
+#content .modifier-option{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:10px;
+  color:#f7f5f0!important;
+  background:#151b21!important;
+  border:1px solid #3d4751!important;
+  border-radius:11px!important;
+}
+#content .modifier-option span{color:#f7f5f0!important}
+#content .modifier-option b{color:#f5d995!important;white-space:nowrap}
+#content .modifier-option input{width:auto;min-height:0;accent-color:#e8c474}
+
+/* Mesas y apertura de cuenta: selección clara y estados diferenciados. */
+#content .table-live-heading,
+#content .table-admin-heading{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:10px;
+}
+#content .table-live-heading h2{color:#f7f5f0!important}
+#content .table-live-count{
+  padding:7px 11px;
+  color:#f5d995!important;
+  background:#30291e!important;
+  border:1px solid #80683f!important;
+  border-radius:999px!important;
+  font-size:.75rem;
+  font-weight:850;
+}
+#content .table-live-grid,
+#content .table-admin-grid,
+#content .table-choice-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr));
+  gap:10px;
+}
+#content .table-choice{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  min-width:0;
+  padding:13px;
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:14px!important;
+}
+#content .table-choice.selected,
+#content .table-choice:has(input:checked){
+  background:linear-gradient(145deg,#3b3427,#25282b)!important;
+  border-color:#c5a05b!important;
+  box-shadow:inset 0 0 0 1px rgba(232,196,116,.15)!important;
+}
+#content .table-choice b{color:#f7f5f0!important}
+#content .table-choice small{color:#bac2ca!important}
+#content .table-choice em{color:#f5d995!important;font-style:normal;font-weight:850}
+#content .table-choice input{width:auto;min-height:0;accent-color:#e8c474}
+#content .table-choice.occupied{
+  opacity:.58;
+  background:#171d23!important;
+  border-style:dashed!important;
+}
+
+/* Avisos de mesero, reservas y paneles de llegada. */
+#content .waiter-ready-card{
+  display:grid;
+  gap:10px;
+  padding:15px!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #80683f!important;
+  border-top:2px solid #b99250!important;
+  border-radius:17px!important;
+}
+#content .waiter-ready-card h3{color:#f5e8c8!important}
+#content .waiter-ready-card .lineitem{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:10px;
+  padding:11px 0;
+  border-color:#46515d!important;
+}
+#content .reservation-table,
+#content .reservation-waiter{
+  min-height:44px;
+  color:#f7f5f0!important;
+  background:#12181e!important;
+  border:1px solid #46515d!important;
+  border-radius:12px!important;
+}
+
+/* Cocina y barra: la tarjeta mantiene el orden visual de Cuentas, el borde
+   izquierdo conserva el estado operativo de cada comanda. */
+#content .prep-ticket-list{display:grid;gap:11px}
+#content .prep-station-note{
+  padding:11px 13px;
+  color:#f5e8c8!important;
+  background:#30291e!important;
+  border:1px solid #80683f!important;
+  border-left:4px solid #e8c474!important;
+  border-radius:0 13px 13px 0!important;
+}
+#content .prep-ticket{
+  gap:10px;
+  padding:15px!important;
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-left:5px solid #8b9aa8!important;
+  border-radius:17px!important;
+}
+#content .prep-ticket-new{border-left-color:#d47a82!important}
+#content .prep-ticket-received{border-left-color:#8dbcf1!important}
+#content .prep-ticket-preparing{border-left-color:#e4bd67!important}
+#content .prep-ticket-ready{border-left-color:#66c99e!important}
+#content .prep-ticket h3{color:#f7f5f0!important}
+#content .prep-product{
+  padding:10px 0;
+  color:#f7f5f0!important;
+  border-bottom:1px solid #3d4751!important;
+}
+#content .prep-actions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+}
+#content .prep-actions button{flex:1 1 150px}
+#content .prep-bars{display:grid;gap:8px}
+#content .prep-bar-row{
+  display:grid;
+  grid-template-columns:minmax(90px,.8fr) minmax(0,2fr) auto;
+  align-items:center;
+  gap:9px;
+  color:#bac2ca!important;
+}
+#content .prep-bar-track{
+  overflow:hidden;
+  height:8px;
+  background:#11171d!important;
+  border:1px solid #3d4751!important;
+  border-radius:999px!important;
+}
+#content .prep-bar-track>*{border-radius:999px}
+#content .prep-flag{
+  padding:5px 9px;
+  color:#e7e9eb!important;
+  background:#303740!important;
+  border:1px solid #4a5560!important;
+  border-radius:999px!important;
+}
+#content .prep-ok{color:#baf0d2!important;background:#1a4033!important;border-color:#3c8064!important}
+#content .prep-warning{color:#f7dfa7!important;background:#403522!important;border-color:#80683e!important}
+#content .prep-late{color:#ffc3ca!important;background:#43262d!important;border-color:#92505c!important}
+
+/* Caja, historial, propinas y reparto. */
+#content .cashier-screen{gap:12px}
+#content .cashier-summary{
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #80683f!important;
+  border-top:2px solid #b99250!important;
+}
+#content .cashier-summary .row{
+  padding:7px 0;
+  border-bottom:1px solid #3d4751;
+}
+#content .cashier-summary .row:last-child{border-bottom:0}
+#content .cashier-summary .total{color:#f5d995!important}
+#content .cashier-products,
+#content .cashier-discounts,
+#content .cashier-payment,
+#content .cashier-history{
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:17px!important;
+}
+#content .cashier-discount-section .section,
+#content .cashier-section-title{color:#f5e8c8!important}
+#content #cash-history .card,
+#content #period-detail .card,
+#content [id^="tip-payout-"]{
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:15px!important;
+}
+#content [id^="tip-payout-"]{
+  padding:12px;
+  margin-top:9px;
+}
+#content #tip-distribution-form .stack>label{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  padding:10px 12px;
+  background:#151b21;
+  border:1px solid #3d4751;
+  border-radius:11px;
+}
+#content #tip-distribution-form input[type="checkbox"]{width:auto;min-height:0}
+#content .cashier-empty{
+  color:#bac2ca!important;
+  background:#171d23!important;
+  border:1px dashed #53606b!important;
+}
+
+/* Menú y mantenimiento de productos. */
+#content .product-config-admin{
+  overflow:hidden;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:16px!important;
+}
+#content .product-config-admin>summary{
+  padding:13px;
+  color:#f7f5f0!important;
+  cursor:pointer;
+  list-style:none;
+}
+#content .product-config-admin>summary::-webkit-details-marker{display:none}
+#content .product-config-admin>summary:after{
+  content:"＋";
+  float:right;
+  color:#f5d995;
+  font-weight:900;
+}
+#content .product-config-admin[open]>summary:after{content:"−"}
+#content .product-config-content{
+  display:grid;
+  gap:12px;
+  padding:0 13px 14px;
+  border-top:1px solid #46515d;
+}
+#content .product-config-content h4{
+  margin:8px 0 0;
+  color:#f5d995!important;
+  font-size:.9rem;
+}
+#content .modifier-admin-group{
+  display:grid;
+  gap:8px;
+  padding:12px;
+  color:#f7f5f0!important;
+  background:#171e24!important;
+  border:1px solid #46515d!important;
+  border-radius:13px!important;
+}
+#content .modifier-option{color:#f7f5f0!important}
+
+/* Inventario: resumen y movimientos con la misma jerarquía de las estadísticas. */
+#content .inventory-summary-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(min(100%,145px),1fr));
+  gap:9px;
+}
+#content .inventory-summary-grid .card{
+  display:grid;
+  gap:5px;
+  padding:13px;
+  background:linear-gradient(145deg,#292f36,#1c2228)!important;
+  border:1px solid #46515d!important;
+  border-top:2px solid #b99250!important;
+  border-radius:15px!important;
+}
+#content .inventory-summary-grid b{
+  color:#f5d995!important;
+  font-size:1.45rem;
+  font-variant-numeric:tabular-nums;
+}
+#content .inventory-summary-grid span{color:#bac2ca!important;font-size:.76rem}
+#content .inventory-history-list{display:grid;gap:9px}
+#content .inventory-history-note{
+  padding:11px 13px;
+  color:#f5e8c8!important;
+  background:#30291e!important;
+  border-left:3px solid #b99250!important;
+  border-radius:0 12px 12px 0!important;
+}
+#content .inventory-movement-product{color:#f5e8c8!important}
+#content .inventory-product-actions button{min-height:42px}
+
+/* Personal y accesos: lectura rápida, controles con buen tamaño táctil. */
+#content .staff-users-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));
+  gap:10px;
+}
+#content .staff-user-card{
+  display:grid;
+  align-content:start;
+  gap:9px;
+  padding:15px!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:16px!important;
+}
+#content .staff-user-card h3{margin:0;color:#f7f5f0!important}
+#content .staff-user-actions{display:flex;gap:8px;flex-wrap:wrap}
+#content .staff-pin-field{min-width:0}
+#content .staff-pin-form{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) auto;
+  align-items:end;
+  gap:8px;
+  margin-top:8px;
+}
+#content .staff-pin-form button{min-height:44px}
+
+/* Autorizaciones y auditoría: lectura consistente en listas y tablas. */
+#content .table-wrap{
+  overflow-x:auto;
+  border:1px solid #46515d!important;
+  border-radius:15px!important;
+}
+#content .table-wrap table{min-width:620px}
+#content .table-wrap th{
+  position:sticky;
+  top:0;
+  color:#f5d995!important;
+  background:#252d35!important;
+}
+#content .table-wrap td{color:#e1e4e6!important}
+#content .table-wrap tbody tr:hover{background:rgba(232,196,116,.055)!important}
+
+/* Drawer Más: coincide con el resto de los paneles, sin tocar su navegación. */
+.pos-more-backdrop{background:rgba(0,0,0,.72)!important;backdrop-filter:blur(3px)}
+.pos-more-panel{
+  color:#f7f5f0!important;
+  background:linear-gradient(180deg,#252d35 0%,#11161b 100%)!important;
+  border:1px solid #80683f!important;
+  border-top:3px solid #b99250!important;
+  box-shadow:0 20px 60px rgba(0,0,0,.55)!important;
+}
+.pos-more-head{
+  border-bottom:1px solid #46515d!important;
+}
+.pos-more-head h2{color:#f5e8c8!important}
+.pos-close{
+  color:#f5d995!important;
+  background:#30291e!important;
+  border:1px solid #80683f!important;
+}
+.pos-more-link{
+  color:#f7f5f0!important;
+  background:linear-gradient(145deg,#252d35,#1d242b)!important;
+  border:1px solid #46515d!important;
+  border-radius:13px!important;
+}
+.pos-more-link.active{
+  color:#f5d995!important;
+  background:#393225!important;
+  border-color:#927749!important;
+}
+
+/* Pantallas estrechas: no permitir desbordes ni controles diminutos. */
+@media(max-width:700px){
+  #content .premium-shortcut-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  #content .premium-shortcut{grid-template-columns:42px minmax(0,1fr) 14px;min-height:100px;padding:10px}
+  #content .premium-shortcut-icon{width:40px;height:40px}
+  #content .pos-catalog{padding:11px!important}
+  #content .pos-product-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  #content .pos-product{min-height:100px;padding:10px}
+  #content .table-live-grid,
+  #content .table-admin-grid,
+  #content .table-choice-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  #content .table-choice{padding:10px;align-items:flex-start}
+  #content .waiter-ready-card .lineitem{align-items:flex-start}
+  #content .waiter-ready-card .lineitem>.row{width:100%;justify-content:flex-start}
+  #content .staff-pin-form{grid-template-columns:1fr}
+  #content .prep-bar-row{grid-template-columns:minmax(75px,.8fr) minmax(0,1.5fr) auto}
+}
+@media(max-width:390px){
+  #content .premium-shortcut-grid{grid-template-columns:1fr}
+  #content .pos-catalog-fields{grid-template-columns:1fr}
+  #content .table-live-grid,
+  #content .table-admin-grid,
+  #content .table-choice-grid{grid-template-columns:1fr}
+  #content .prep-bar-row{grid-template-columns:1fr auto}
+  #content .prep-bar-track{grid-column:1/-1;grid-row:2}
+}
+@media(min-width:1000px){
+  #content .pos-product-grid{grid-template-columns:repeat(auto-fit,minmax(175px,1fr))}
+  #content .table-live-grid{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+}
+@media(prefers-reduced-motion:reduce){
+  #content .premium-shortcut,
+  #content .pos-tile,
+  #content .pos-product{transition:none!important}
+}
+@media print{
+  /* El ticket de corte conserva su formato de papel para imprimir. */
+  #content .cash-receipt{
+    background:#fff!important;
+    color:#111!important;
+    box-shadow:none!important;
+  }
+}
