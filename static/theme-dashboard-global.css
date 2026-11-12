@@ -1,0 +1,291 @@
+/* EL MITOTE · IDENTIDAD VISUAL DEL PANEL PRINCIPAL EN TODOS LOS MÓDULOS
+   Capa visual únicamente: no altera lógica, eventos, permisos ni datos. */
+:root{
+ --mitote-home-bg:#08090b;--mitote-home-gold:#e8c477;--mitote-home-cream:#fff4dc;
+ --mitote-home-muted:#c9c3b9;--mitote-home-line:rgba(205,166,93,.58);
+ --mitote-home-green:#64dfa0;
+}
+/* Fondo ambiental aprobado de Inicio, reutilizado en toda la aplicación. */
+html,body{background:#08090b!important;color:var(--mitote-home-cream)}
+.app-layout{
+ background:linear-gradient(180deg,rgba(7,8,10,.76),rgba(7,8,10,.84) 48%,rgba(7,8,10,.90)),
+ url('/static/assets/dashboard-ambiente.jpg') center center/cover!important;
+ background-attachment:fixed!important;
+}
+main,#content{background:transparent!important;color:var(--mitote-home-cream)}
+#content{min-width:0}
+.topbar{
+ background:linear-gradient(90deg,rgba(8,9,10,.97),rgba(25,18,10,.94)),
+ url('/static/assets/dashboard-ambiente.jpg') center/cover!important;
+ border-bottom:1px solid rgba(230,188,98,.58)!important;
+ box-shadow:0 5px 22px rgba(0,0,0,.32)!important;
+}
+.brandline strong{color:#f6dfad!important}
+.brandline small{color:#c9c3b9!important}
+.topright .connection{color:var(--mitote-home-green)!important}
+.navigation{
+ background:linear-gradient(180deg,rgba(10,10,10,.96),rgba(8,8,8,.88)),
+ url('/static/assets/dashboard-ambiente.jpg') center bottom/cover!important;
+ border-color:rgba(218,174,84,.4)!important;
+ box-shadow:0 -8px 24px rgba(0,0,0,.36)!important;
+}
+.navbtn{color:#e8e2d6!important;border:1px solid transparent!important;border-radius:14px!important}
+.navbtn:hover{background:rgba(232,196,116,.08)!important;border-color:rgba(232,196,116,.24)!important}
+.navbtn.active{
+ color:#f5d995!important;background:linear-gradient(145deg,rgba(67,49,22,.96),rgba(31,27,21,.98))!important;
+ border:1px solid #a98549!important;box-shadow:inset 0 3px #e8c474,0 4px 14px rgba(0,0,0,.28)!important;
+}
+.heading h1{color:#fff4dc!important}
+.heading .eyebrow,.eyebrow{color:#e8c477!important}
+#back.outline,#refresh.outline,.heading-actions button.outline{
+ color:#f4d58e!important;background:rgba(26,21,14,.76)!important;
+ border:1px solid rgba(178,139,72,.72)!important;border-radius:13px!important;
+}
+/* Paneles y tarjetas: carbón cálido y reflejos dorados como el Panel principal. */
+#content .card,#content .account-card,#content .ticket,#content .prep-ticket,
+#content .pos-catalog,#content .pos-draft-card,#content .pos-account-picker,
+#content .pos-new-account-card,#content .table-live-section,#content .table-admin-card,
+#content .table-create-card,#content .cashier-summary,#content .cashier-products,
+#content .cashier-discounts,#content .cashier-payment,#content .cashier-history,
+#content .cashier-discount-section,#content .inventory-control-card,
+#content .inventory-item-add-card,#content .inventory-filter-card,
+#content .inventory-product-card,#content .inventory-movement-card,
+#content .staff-pin-setup,#content .staff-user-card,#content .modifier-admin-group,
+#content .modifier-option,#content .product-config-admin,#content .pos-more-link,
+#content .waiter-ready-card,#content .table-choice{
+ color:var(--mitote-home-cream)!important;
+ background:linear-gradient(145deg,rgba(47,36,20,.94),rgba(19,19,17,.97) 58%,rgba(10,13,13,.98))!important;
+ border:1px solid var(--mitote-home-line)!important;border-radius:18px!important;
+ box-shadow:0 8px 22px rgba(0,0,0,.28),inset 0 1px rgba(255,255,255,.045)!important;
+}
+#content .card h3,#content .ticket h3,#content .prep-ticket h3,
+#content .staff-user-card h3,#content .table-live-card h3,
+#content .account-card-title h3{color:#fff4dc!important}
+#content .card p,#content .card .mini,#content .card .muted,
+#content .ticket .mini,#content .prep-ticket .mini,
+#content .account-card-meta,#content .table-live-meta{color:var(--mitote-home-muted)!important}
+#content .lineitem{border-color:rgba(226,192,120,.22)!important}
+#content .divider{background:rgba(226,192,120,.25)!important}
+#content .empty{
+ color:#c9c3b9!important;background:rgba(10,12,12,.82)!important;
+ border:1px dashed rgba(205,166,93,.58)!important;border-radius:15px!important;
+}
+/* Indicadores y estadísticas con acabado de las tarjetas del Inicio. */
+#content .stat{
+ position:relative;overflow:hidden;color:#fff4dc!important;
+ background:linear-gradient(145deg,rgba(53,40,19,.94),rgba(13,15,15,.98))!important;
+ border:1px solid rgba(210,170,90,.58)!important;border-top:2px solid #c59c4d!important;
+ border-radius:17px!important;box-shadow:0 7px 20px rgba(0,0,0,.25)!important;
+}
+#content .stat:after{
+ content:"";position:absolute;top:-22px;right:-30px;width:90px;height:90px;
+ background:radial-gradient(circle,rgba(240,201,118,.12),transparent 68%);pointer-events:none;
+}
+#content .stat b,#content .price,#content .total,#content .inventory-stock-number,
+#content .inventory-delta,#content .account-card-values strong{
+ color:#f5d995!important;font-variant-numeric:tabular-nums;
+}
+#content .stat span{color:#e6e0d4!important}
+#content>.section,#content .section{
+ color:#f8e7c4!important;border-left:4px solid #e7bd65!important;
+ padding-left:12px;font-weight:850;
+}
+#content h2,#content h3{color:#fff4dc}
+#content p,#content .mini,#content .muted{color:var(--mitote-home-muted)}
+/* Cuentas y mesas: jerarquía y saldos conservados, con el acabado del Inicio. */
+#content .account-card{border-left:5px solid #e4bd67!important}
+#content .account-card-open,#content .account-card-pending{border-left-color:#e4bd67!important}
+#content .account-card-paid{border-left-color:#66c99e!important}
+#content .account-card-merged,#content .account-card-cancelled{border-left-color:#858b8f!important}
+#content .account-card-values{
+ background:rgba(8,11,12,.78)!important;border:1px solid rgba(205,166,93,.35)!important;
+ border-radius:14px!important;
+}
+#content .account-card-values span,#content .account-card-reference{color:#c9c3b9!important}
+#content .account-card-values strong{color:#f5d995!important}
+#content .table-live-card{
+ color:#fff4dc!important;background:linear-gradient(145deg,rgba(45,35,20,.94),rgba(13,17,16,.98))!important;
+ border:1px solid rgba(205,166,93,.52)!important;border-left:5px solid #64c99a!important;border-radius:17px!important;
+}
+#content .table-live-card.table-live-occupied{border-left-color:#e4bd67!important}
+#content .table-live-card.table-live-inactive{border-left-color:#858b8f!important}
+#content .table-live-assignment span,#content .table-live-assignment small{color:#c9c3b9!important}
+#content .table-live-assignment strong{color:#f5d995!important}
+#content .table-live-icon{background:rgba(231,184,91,.14)!important;color:#f1ca75!important}
+#content .table-choice{min-height:72px}
+#content .table-choice b{color:#fff4dc!important}
+#content .table-choice small{color:#c9c3b9!important}
+#content .table-choice em{color:#f5d995!important}
+#content .table-choice:has(input:checked){border-color:#e8c477!important;background:rgba(111,78,28,.3)!important}
+#content .table-choice.occupied{opacity:.62}
+/* Cocina y barra: estados de preparación conservan sus colores semánticos. */
+#content .ticket,#content .prep-ticket{
+ background:linear-gradient(145deg,rgba(43,34,21,.96),rgba(13,16,16,.98))!important;
+ border:1px solid rgba(205,166,93,.5)!important;border-left:5px solid #b99250!important;border-radius:17px!important;
+}
+#content .ticket.new,#content .prep-ticket-new{border-left-color:#d47a82!important}
+#content .ticket.received,#content .prep-ticket-received{border-left-color:#8dbcf1!important}
+#content .ticket.preparing,#content .prep-ticket-preparing{border-left-color:#e4bd67!important}
+#content .ticket.ready,#content .prep-ticket-ready{border-left-color:#66c99e!important}
+#content .prep-total{
+ color:#fff4dc!important;background:rgba(8,11,12,.82)!important;
+ border:1px solid rgba(205,166,93,.45)!important;border-radius:13px!important;
+}
+#content .prep-total b,#content .prep-clock{color:#f5d995!important}
+#content .prep-flag{border-radius:999px!important}
+/* Menú y comandero: catálogo, productos, modificadores y cantidades. */
+#content .pos-category{
+ color:#f0e6d1!important;background:rgba(35,29,20,.94)!important;
+ border:1px solid rgba(205,166,93,.4)!important;border-radius:12px!important;
+}
+#content .pos-category.active{
+ color:#241b0d!important;background:linear-gradient(135deg,#f5d995,#dfb45f)!important;border-color:#f2d38e!important;
+}
+#content .pos-product{
+ color:#fff4dc!important;background:linear-gradient(145deg,rgba(51,39,22,.96),rgba(15,18,17,.98))!important;
+ border:1px solid rgba(205,166,93,.45)!important;border-radius:15px!important;
+}
+#content .pos-product-name{color:#fff4dc!important}
+#content .pos-product-meta{color:#c9c3b9!important}
+#content .pos-product-bottom strong,#content .pos-qty-controls span{color:#f5d995!important}
+#content .pos-product-plus{color:#241b0d!important;background:linear-gradient(135deg,#f5d995,#dfb45f)!important}
+#content .pos-qty-controls button{
+ color:#fff4dc!important;background:rgba(55,43,24,.95)!important;
+ border:1px solid rgba(205,166,93,.5)!important;border-radius:10px!important;
+}
+#content .pos-draft-total{
+ color:#fff4dc!important;background:rgba(8,11,12,.82)!important;
+ border:1px solid rgba(205,166,93,.42)!important;border-radius:13px!important;
+}
+#content .pos-draft-total strong{color:#f5d995!important}
+#content .inventory-product-card,#content .inventory-movement-card{padding:15px!important}
+#content .inventory-movement-card.is-out{border-left:4px solid #d47a82!important}
+#content .inventory-movement-card.is-in{border-left:4px solid #66c99e!important}
+#content .inventory-delta.negative{color:#ff9da6!important}
+#content .inventory-delta.positive{color:#80e0b2!important}
+#content .inventory-product-actions button{min-height:40px}
+#content details.product-config-admin,#content details.product-config-admin>summary{
+ color:#fff4dc!important;background:linear-gradient(145deg,rgba(47,36,20,.95),rgba(13,16,16,.98))!important;
+ border-color:rgba(205,166,93,.5)!important;
+}
+#content .modifier-admin-group,#content .modifier-option{
+ background:rgba(31,25,17,.82)!important;border-color:rgba(205,166,93,.32)!important;
+}
+/* Caja, cobros, propinas e inventario. */
+#content .cashier-summary,#content .cashier-products,#content .cashier-discounts,
+#content .cashier-payment,#content .cashier-history,#content .cashier-discount-section{
+ background:linear-gradient(145deg,rgba(47,36,20,.95),rgba(13,16,16,.98))!important;
+ border:1px solid rgba(205,166,93,.52)!important;border-radius:18px!important;
+}
+#content .cashier-summary{border-top:2px solid #c59c4d!important}
+#content .cashier-summary select,#content #pay-form select,#content #pay-form input{
+ color:#fff4dc!important;background:rgba(8,11,12,.88)!important;
+ border:1px solid rgba(205,166,93,.38)!important;border-radius:12px!important;
+}
+#content #pay-form label{
+ color:#f0e6d1!important;background:rgba(31,25,17,.82)!important;
+ border:1px solid rgba(205,166,93,.34)!important;border-radius:13px!important;
+}
+#content .cashier-summary .total{color:#f5d995!important}
+#content [id^="tip-payout-"]{
+ background:rgba(31,25,17,.82)!important;border:1px solid rgba(205,166,93,.38)!important;border-radius:14px!important;
+}
+/* Personal, autorizaciones, reportes y auditoría. */
+#content .staff-pin-setup,#content .staff-user-card{
+ background:linear-gradient(145deg,rgba(47,36,20,.95),rgba(13,16,16,.98))!important;
+}
+#content .staff-registration-form input,#content .staff-registration-form select,#content .staff-pin-form input{
+ color:#fff4dc!important;background:rgba(8,11,12,.88)!important;
+ border:1px solid rgba(205,166,93,.42)!important;border-radius:12px!important;
+}
+#content .staff-pin-status{color:#80e0b2!important}
+#content .staff-pin-status.pending{color:#f3d28c!important}
+#content .card.table-wrap,#content .table-wrap{
+ background:rgba(12,14,14,.92)!important;border:1px solid rgba(205,166,93,.45)!important;border-radius:16px!important;
+}
+#content .table-wrap th,#content th{
+ color:#f5d995!important;background:rgba(51,39,22,.98)!important;border-color:rgba(205,166,93,.34)!important;
+}
+#content .table-wrap td,#content td{color:#eee7d9!important;border-color:rgba(205,166,93,.2)!important}
+#content .table-wrap tbody tr:nth-child(2n){background:rgba(255,255,255,.025)!important}
+/* Formularios y botones. */
+#content label{color:#f0e6d1!important}
+#content input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+#content select,#content textarea,#login input:not([type="checkbox"]):not([type="radio"]){
+ color:#fff4dc!important;background:rgba(8,11,12,.9)!important;
+ border:1px solid rgba(205,166,93,.42)!important;border-radius:12px!important;
+}
+#content input::placeholder,#content textarea::placeholder,#login input::placeholder{color:#9e988c!important}
+#content input:focus,#content select:focus,#content textarea:focus,#login input:focus{
+ border-color:#e8c477!important;outline:2px solid rgba(232,196,116,.2)!important;outline-offset:1px;
+}
+#content input[type="checkbox"],#content input[type="radio"],#content input[type="range"]{accent-color:#e8c477}
+#content button.primary:not(.red):not(.danger),#content .accounts-new-button,#content .staff-register-button{
+ color:#241b0d!important;background:linear-gradient(115deg,#f5dc9d,#e4bc6d 58%,#f1d38f)!important;
+ border:1px solid #f2d38e!important;border-radius:13px!important;box-shadow:0 4px 13px rgba(123,83,25,.2)!important;
+}
+#content button.outline,#content .account-card-footer button{
+ color:#f4d58e!important;background:rgba(25,20,13,.76)!important;
+ border:1px solid rgba(178,139,72,.78)!important;border-radius:13px!important;
+}
+#content button.ghost{
+ color:#f0e6d1!important;background:linear-gradient(145deg,rgba(51,39,22,.95),rgba(23,22,18,.98))!important;
+ border:1px solid rgba(205,166,93,.4)!important;border-radius:12px!important;
+}
+#content button.red,#content button.danger,#content .red{color:#fff!important}
+#content button:focus-visible,#content a:focus-visible{outline:2px solid #f5d995!important;outline-offset:2px}
+/* Estados de operación: semántica de color intacta. */
+#content .pill{
+ color:#f0e6d1!important;background:rgba(49,39,24,.9)!important;
+ border:1px solid rgba(205,166,93,.38)!important;border-radius:999px!important;
+}
+#content .pill.open,#content .pill.ready,#content .pill.approved,#content .pill.paid{
+ color:#baf0d2!important;background:rgba(16,75,48,.78)!important;border-color:#3c8064!important;
+}
+#content .pill.pending,#content .pill.received,#content .pill.preparing{
+ color:#f7dfa7!important;background:rgba(83,60,24,.82)!important;border-color:#80683e!important;
+}
+#content .pill.new,#content .pill.rejected,#content .pill.out{
+ color:#ffc3ca!important;background:rgba(78,34,40,.82)!important;border-color:#92505c!important;
+}
+#content .note{color:#ffedc6!important;background:rgba(56,43,22,.9)!important;border-left:3px solid #e3bb6c!important}
+#content .danger-note{color:#ffd7dc!important;background:rgba(61,37,43,.94)!important;border-left-color:#d56a77!important}
+#toast{color:#fff0cd!important;background:linear-gradient(145deg,#373020,#211d16)!important;border:1px solid #a98549!important}
+/* Menú Más y estados de carga. */
+#content .pos-more-panel,.pos-more-panel{
+ color:#fff4dc!important;background:linear-gradient(180deg,rgba(47,36,20,.97),rgba(10,12,12,.98))!important;
+ border:1px solid rgba(205,166,93,.56)!important;border-top:2px solid #c59c4d!important;
+}
+#content .pos-more-link{
+ color:#fff4dc!important;background:rgba(38,30,18,.92)!important;border:1px solid rgba(205,166,93,.38)!important;
+}
+#content .pos-more-link.active{color:#f5d995!important;background:rgba(81,60,27,.72)!important;border-color:#a98549!important}
+#content .loading-skeleton{background:linear-gradient(90deg,rgba(47,36,20,.65),rgba(100,78,40,.28),rgba(47,36,20,.65))!important}
+#content .loading-screen-heading{color:#fff4dc!important}
+#content .loading-screen-heading p{color:#c9c3b9!important}
+/* Adaptación a móvil/tablet/PC sin cambiar la distribución funcional. */
+@media(max-width:700px){
+ .app-layout{background-attachment:scroll!important;background-position:center top!important}
+ .navigation{
+  background:linear-gradient(180deg,rgba(10,10,10,.97),rgba(8,8,8,.91)),
+  url('/static/assets/dashboard-ambiente.jpg') center bottom/cover!important;
+  border-top:1px solid rgba(218,174,84,.52)!important;
+ }
+ .navigation .navbtn.active{
+  color:#f5d995!important;background:linear-gradient(145deg,rgba(67,49,22,.96),rgba(31,27,21,.98))!important;
+  border:1px solid #a98549!important;box-shadow:inset 0 3px #e8c474!important;
+ }
+ #content .card,#content .ticket,#content .prep-ticket{padding:15px}
+ #content input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+ #content select,#content textarea{font-size:16px}
+ .heading-actions{gap:7px}
+ .heading-actions button{min-height:42px;padding:8px 10px}
+}
+@media(min-width:701px){
+ .navigation{background:linear-gradient(180deg,rgba(20,17,12,.97),rgba(8,9,10,.96)),url('/static/assets/dashboard-ambiente.jpg') center/cover!important}
+}
+@media(prefers-reduced-motion:reduce){#content *, .navigation *{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+@media print{
+ html,body,.app-layout,main,#content{background:#fff!important;color:#000!important}
+ #content .card,#content .stat,#content .ticket,#content .prep-ticket{background:#fff!important;color:#000!important;box-shadow:none!important}
+}
