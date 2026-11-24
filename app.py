@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, Literal
+from types import SimpleNamespace
 
 import jwt
 from argon2 import PasswordHasher
@@ -33,6 +34,7 @@ DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./comandas.db')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 SECRET_KEY = os.getenv('SECRET_KEY', '')
+ISIS_API_TOKEN = os.getenv('ISIS_API_TOKEN', '')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '')
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'propietario')
 VAPID_PUBLIC_KEY = os.getenv('VAPID_PUBLIC_KEY', '').strip()
@@ -786,6 +788,35 @@ def auth(authorization:Optional[str]=Header(None),db:Session=Depends(db_session)
 def allow(user,*roles):
     if user.role not in roles: raise HTTPException(403,'Sin permiso para esta operación')
 
+def auth_isis(authorization: Optional[str] = Header(None), db: Session = Depends(db_session)):
+    # Vía servidor a servidor para Isis. Copia el patrón de
+    # /api/reservations/ingest: nunca incrustar el secreto en JS público.
+    if not ISIS_API_TOKEN:
+        raise HTTPException(503, 'Integración Isis sin configurar')
+    candidate = authorization[7:] if authorization and authorization.startswith('Bearer ') else ''
+    if not hmac.compare_digest(candidate, ISIS_API_TOKEN):
+        raise HTTPException(401, 'Integración no autorizada')
+    owner = db.scalar(select(User).where(User.role == 'owner', User.active == True))
+    if not owner:
+        raise HTTPException(503, 'Sin usuario propietario activo')
+    # Usuario sintético: el id es el del propietario real (las FK de
+    # cuentas/ocupación/claves lo exigen) y display='Isis' marca el actor.
+    return SimpleNamespace(id=owner.id, username='isis', display='Isis',
+                            role='owner', active=True,
+                            session_version=owner.session_version)
+
+def auth_either(authorization: Optional[str] = Header(None), db: Session = Depends(db_session)):
+    # Doble vía: Bearer de Isis O JWT de usuario. Si el token Isis no
+    # está configurado, la vía Isis no existe y se usa solo el JWT.
+    if authorization and authorization.startswith('Bearer ') and ISIS_API_TOKEN:
+        if hmac.compare_digest(authorization[7:], ISIS_API_TOKEN):
+            return auth_isis(authorization, db)
+    return auth(authorization, db)
+
+@app.get('/api/isis/ping')
+def isis_ping(user=Depends(auth_isis)):
+    return {'ok': True, 'actor': 'Isis', 'role': user.role}
+
 def owner_account(db,user,account_id,allowed=('open','pending')):
     acc=db.execute(select(Account).where(Account.id==account_id).with_for_update()).scalar_one_or_none()
     if not acc: raise HTTPException(404,'Cuenta inexistente')
@@ -1358,7 +1389,7 @@ class StaffCreateIn(BaseModel):
     pin: str = Field(min_length=6, max_length=6, pattern=r'^[0-9]{6}$')
 
 @app.post('/api/staff')
-async def create_staff(data: StaffCreateIn, db: Session = Depends(db_session), user: User = Depends(auth)):
+async def create_staff(data: StaffCreateIn, db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, 'owner')
     name = data.name.strip()
     if len(name) < 2:
@@ -1389,7 +1420,7 @@ class StaffPinIn(BaseModel):
 
 @app.patch('/api/staff/{user_id}/pin')
 async def assign_staff_pin(user_id: int, data: StaffPinIn,
-                           db: Session = Depends(db_session), user: User = Depends(auth)):
+                           db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, 'owner')
     target = db.get(User, user_id)
     if not target:
@@ -1406,7 +1437,7 @@ async def assign_staff_pin(user_id: int, data: StaffPinIn,
 
 class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:str=Field(min_length=2,max_length=100);role:Literal['admin','cashier','waiter','kitchen','bar'];secret:str=Field(min_length=6,max_length=6)
 @app.get('/api/users')
-def users(db:Session=Depends(db_session),user:User=Depends(auth)):
+def users(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     rows=db.scalars(select(User).order_by(User.id)).all()
     user_ids=[row.id for row in rows]
@@ -1415,7 +1446,7 @@ def users(db:Session=Depends(db_session),user:User=Depends(auth)):
     return [{'id':u.id,'username':u.username,'display':u.display,'role':u.role,
              'active':u.active,'has_pin':u.id in pin_ids} for u in rows]
 @app.post('/api/users')
-async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner')
     # Compatibilidad con clientes anteriores: nunca crear empleados sin PIN.
     if not _pin_format(data.secret):raise HTTPException(400,'El PIN debe tener exactamente seis números')
@@ -1436,7 +1467,7 @@ async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(
 
 class UserUpdateIn(BaseModel): active:Optional[bool]=None;secret:Optional[str]=None
 @app.patch('/api/users/{user_id}')
-async def update_user(user_id:int,data:UserUpdateIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def update_user(user_id:int,data:UserUpdateIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner')
     target=db.execute(select(User).where(User.id==user_id).with_for_update()).scalar_one_or_none()
     if not target:raise HTTPException(404,'Usuario no encontrado')
@@ -1457,12 +1488,12 @@ async def update_user(user_id:int,data:UserUpdateIn,db:Session=Depends(db_sessio
     return {'ok':True}
 
 @app.get('/api/settings')
-def settings(db:Session=Depends(db_session),user:User=Depends(auth)):
+def settings(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     s=db.get(Setting,1);return {'inventory_on':s.inventory_on,'inventory_reviewed':s.inventory_reviewed}
 class SettingsIn(BaseModel): inventory_on:bool;confirmed_recount:bool=False
 @app.put('/api/settings')
-async def set_settings(data:SettingsIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def set_settings(data:SettingsIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     s=db.execute(select(Setting).where(Setting.id==1).with_for_update()).scalar_one()
     if data.inventory_on and not s.inventory_on and not data.confirmed_recount:raise HTTPException(409,'Confirma el recuento de existencias antes de activar inventario')
@@ -1470,7 +1501,7 @@ async def set_settings(data:SettingsIn,db:Session=Depends(db_session),user:User=
     audit(db,user,'inventory.global',old=old,new=s.inventory_on);db.commit();await notify();return {'ok':True}
 
 @app.get('/api/products')
-def products(db:Session=Depends(db_session),user:User=Depends(auth)):
+def products(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     s=db.get(Setting,1)
     query=select(Product).outerjoin(ArchivedProduct,ArchivedProduct.product_id==Product.id).where(
         ArchivedProduct.product_id.is_(None)).order_by(Product.category,Product.name)
@@ -1563,7 +1594,7 @@ class PromotionIn(BaseModel):
     end_date: Optional[str] = Field(default=None,max_length=10)
 
 @app.post('/api/products/{product_id}/variants')
-async def add_product_variant(product_id:int,data:ProductVariantIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def add_product_variant(product_id:int,data:ProductVariantIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     p=db.get(Product,product_id)
     if not p:raise HTTPException(404,'Producto inexistente')
@@ -1578,7 +1609,7 @@ async def toggle_product_variant(variant_id:int,data:ActiveToggleIn,db:Session=D
     v.active=data.active;audit(db,user,'product.variant.toggle',variant_id=v.id,active=v.active);db.commit();await notify();return {'ok':True}
 
 @app.post('/api/products/{product_id}/modifier-groups')
-async def add_modifier_group(product_id:int,data:ModifierGroupIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def add_modifier_group(product_id:int,data:ModifierGroupIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     if not db.get(Product,product_id):raise HTTPException(404,'Producto inexistente')
     if data.min_select>data.max_select:raise HTTPException(400,'La selección mínima no puede superar la máxima')
@@ -1603,7 +1634,7 @@ async def add_modifier_option(group_id:int,data:ModifierOptionIn,db:Session=Depe
     db.commit();await notify();return {'id':o.id,'ok':True}
 
 @app.patch('/api/modifier-options/{option_id}/inventory')
-async def link_modifier_inventory(option_id:int,data:ModifierOptionInventoryIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def link_modifier_inventory(option_id:int,data:ModifierOptionInventoryIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     option=db.get(ProductModifierOption,option_id)
     if not option:raise HTTPException(404,'Opción inexistente')
@@ -1625,7 +1656,7 @@ async def toggle_modifier_option(option_id:int,data:ActiveToggleIn,db:Session=De
     o.active=data.active;audit(db,user,'product.modifier_option.toggle',option_id=o.id,active=o.active);db.commit();await notify();return {'ok':True}
 
 @app.post('/api/products/{product_id}/promotions')
-async def add_product_promotion(product_id:int,data:PromotionIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def add_product_promotion(product_id:int,data:PromotionIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     if not db.get(Product,product_id):raise HTTPException(404,'Producto inexistente')
     if (data.price is None)==(data.discount_percent is None):raise HTTPException(400,'Indica un precio promocional o un porcentaje de descuento, pero no ambos')
@@ -1649,7 +1680,7 @@ async def toggle_product_promotion(promotion_id:int,data:ActiveToggleIn,db:Sessi
     promo.active=data.active;audit(db,user,'product.promotion.toggle',promotion_id=promo.id,active=promo.active);db.commit();await notify();return {'ok':True}
 
 @app.post('/api/products')
-async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     p=Product(name=data.name.strip(),category=data.category.strip()[:80],station=data.station,price_cents=cents(data.price),active=data.active,blocked=data.blocked,inventory_enabled=data.inventory_enabled,stock=data.stock)
     db.add(p);db.flush()
@@ -1659,7 +1690,7 @@ async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=De
             reason='Saldo inicial al crear producto',source_key=f'inventory-opening:{p.id}',created_at=now()))
     audit(db,user,'product.create',name=p.name);db.commit();await notify();return {'id':p.id}
 @app.get('/api/products/archived')
-def archived_products(db:Session=Depends(db_session),user:User=Depends(auth)):
+def archived_products(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     rows=db.execute(select(ArchivedProduct,Product).join(
         Product,Product.id==ArchivedProduct.product_id).order_by(ArchivedProduct.archived_at.desc()).limit(150)).all()
@@ -1668,7 +1699,7 @@ def archived_products(db:Session=Depends(db_session),user:User=Depends(auth)):
             for a,p in rows]
 
 @app.post('/api/products/{product_id}/archive')
-async def archive_product(product_id:int,data:ProductArchiveIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def archive_product(product_id:int,data:ProductArchiveIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
     if not p:raise HTTPException(404,'Producto inexistente')
@@ -1685,7 +1716,7 @@ class ProductRestoreIn(BaseModel):
     expected_version:int=Field(ge=1)
 
 @app.post('/api/products/{product_id}/restore')
-async def restore_product(product_id:int,data:ProductRestoreIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def restore_product(product_id:int,data:ProductRestoreIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
     a=db.get(ArchivedProduct,product_id)
@@ -1698,7 +1729,7 @@ async def restore_product(product_id:int,data:ProductRestoreIn,db:Session=Depend
     return {'ok':True,'restored':True}
 
 @app.put('/api/products/{product_id}')
-async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
     if not p:raise HTTPException(404,'Producto inexistente')
@@ -1724,7 +1755,7 @@ async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_sessi
     audit(db,user,'product.update',id=p.id,before=before,after=product_dict(p,db.get(Setting,1),db));db.commit();await notify();return {'ok':True}
 class RestockIn(BaseModel): delta:int=Field(gt=0,le=100000);reason:str=Field(min_length=3,max_length=400);expected_version:int
 @app.post('/api/products/{product_id}/restock')
-async def restock(product_id:int,data:RestockIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def restock(product_id:int,data:RestockIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
     if not p:raise HTTPException(404,'Producto inexistente')
@@ -1743,7 +1774,7 @@ class InventoryAdjustmentIn(BaseModel):
     expected_version:int=Field(ge=1)
 
 @app.post('/api/products/{product_id}/inventory-adjustment')
-async def inventory_adjustment(product_id:int,data:InventoryAdjustmentIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def inventory_adjustment(product_id:int,data:InventoryAdjustmentIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     p=db.execute(select(Product).where(Product.id==product_id).with_for_update()).scalar_one_or_none()
     if not p:raise HTTPException(404,'Producto inexistente')
@@ -1765,7 +1796,7 @@ async def inventory_adjustment(product_id:int,data:InventoryAdjustmentIn,db:Sess
     db.commit();await notify();return {'stock':p.stock,'delta':delta}
 
 @app.post('/api/inventory/items')
-async def create_inventory_item(data:InventoryItemIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def create_inventory_item(data:InventoryItemIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     name=data.name.strip()
     duplicate=db.scalar(select(Product.id).where(
@@ -1785,7 +1816,7 @@ async def create_inventory_item(data:InventoryItemIn,db:Session=Depends(db_sessi
 @app.get('/api/inventory/movements')
 def inventory_movements(product_id:Optional[int]=None,kind:Optional[str]=None,
                         from_date:Optional[str]=None,to_date:Optional[str]=None,
-                        limit:int=120,db:Session=Depends(db_session),user:User=Depends(auth)):
+                        limit:int=120,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     filters=[]
     if product_id is not None:filters.append(InventoryMovement.product_id==product_id)
@@ -1875,7 +1906,7 @@ def dining_table_dict_many(db,tables):
 
 
 @app.get('/api/tables')
-def dining_tables(db:Session=Depends(db_session),user:User=Depends(auth)):
+def dining_tables(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier','waiter')
     q=select(DiningTable).order_by(DiningTable.area,DiningTable.sort_order,DiningTable.id)
     if user.role not in ('owner','admin'):
@@ -1891,7 +1922,7 @@ class DiningTableIn(BaseModel):
     sort_order:int=Field(default=0,ge=0,le=10000)
 
 @app.post('/api/tables')
-async def create_dining_table(data:DiningTableIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def create_dining_table(data:DiningTableIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     name=data.name.strip()
     area=data.area.strip()
@@ -1911,7 +1942,7 @@ async def create_dining_table(data:DiningTableIn,db:Session=Depends(db_session),
     return {'id':t.id,'ok':True}
 
 @app.put('/api/tables/{table_id}')
-async def update_dining_table(table_id:int,data:DiningTableIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def update_dining_table(table_id:int,data:DiningTableIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     t=db.execute(select(DiningTable).where(DiningTable.id==table_id).with_for_update()).scalar_one_or_none()
     if not t:raise HTTPException(404,'Mesa no encontrada')
@@ -1933,7 +1964,7 @@ async def update_dining_table(table_id:int,data:DiningTableIn,db:Session=Depends
     return {'ok':True}
 
 @app.get('/api/accounts')
-def accounts(db:Session=Depends(db_session),user:User=Depends(auth)):
+def accounts(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier','waiter')
     p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
     if not p:return []  # Los cierres anteriores se consultan solo desde el historial de caja.
@@ -1979,7 +2010,7 @@ class AccountIn(BaseModel):
     client_key:Optional[str]=Field(default=None,max_length=80)
 
 @app.post('/api/accounts')
-async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','waiter')
     client_key=(data.client_key or '').strip()
     payload={'name':(data.name or '').strip(),'table_id':data.table_id}
@@ -2048,7 +2079,7 @@ class VoidAccountIn(BaseModel):
     reason:str=Field(min_length=3,max_length=400)
 
 @app.post('/api/accounts/{account_id}/void')
-async def void_account(account_id:int,data:VoidAccountIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def void_account(account_id:int,data:VoidAccountIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner')
     active_period(db)
     a=owner_account(db,user,account_id,('open','pending'))
@@ -2062,7 +2093,7 @@ async def void_account(account_id:int,data:VoidAccountIn,db:Session=Depends(db_s
     return {'ok':True,'id':a.id,'status':'cancelled'}
 
 @app.get('/api/accounts/{account_id}')
-def account_detail(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+def account_detail(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier','waiter')
     a=owner_account(db,user,account_id,allowed=None)
     batches=db.scalars(select(Batch).where(
@@ -2138,7 +2169,7 @@ def account_detail(account_id:int,db:Session=Depends(db_session),user:User=Depen
 
 @app.get('/api/cashier/overview')
 def cashier_overview(account_id:Optional[int]=None,db:Session=Depends(db_session),
-                     user:User=Depends(auth)):
+                     user:User=Depends(auth_either)):
     """Una sola respuesta para lista de cobros y detalle inicial seleccionado."""
     allow(user,'owner','admin','cashier')
     pending=[row for row in accounts(db,user) if row['status']=='pending']
@@ -2149,7 +2180,7 @@ def cashier_overview(account_id:Optional[int]=None,db:Session=Depends(db_session
 
 class ReassignIn(BaseModel): owner_id:int;reason:str=Field(min_length=3,max_length=400)
 @app.post('/api/accounts/{account_id}/reassign')
-async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner');a=owner_account(db,user,account_id)
     dest=db.get(User,data.owner_id)
     if not dest or not dest.active or dest.role!='waiter':raise HTTPException(400,'El destino debe ser un mesero activo')
@@ -2215,7 +2246,7 @@ def account_table_occupancy(db, account_id):
     ).scalar_one_or_none()
 
 @app.get('/api/accounts/{account_id}/history')
-def account_history(account_id: int, db: Session = Depends(db_session), user: User = Depends(auth)):
+def account_history(account_id: int, db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, 'owner', 'admin', 'waiter')
     account = owner_account(db, user, account_id, allowed=None)
     rows = db.scalars(select(Audit).order_by(Audit.id.desc()).limit(500)).all()
@@ -2244,7 +2275,7 @@ def account_history(account_id: int, db: Session = Depends(db_session), user: Us
 
 @app.post('/api/accounts/{account_id}/rename')
 async def rename_account(account_id: int, data: AccountRenameIn,
-                         db: Session = Depends(db_session), user: User = Depends(auth)):
+                         db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, 'owner')
     account = owner_account(db, user, account_id, ('open', 'pending'))
     account_manager_access(user, account)
@@ -2263,7 +2294,7 @@ async def rename_account(account_id: int, data: AccountRenameIn,
 
 @app.post('/api/accounts/{account_id}/transfer-table')
 async def transfer_account_table(account_id: int, data: AccountTableTransferIn,
-                                 db: Session = Depends(db_session), user: User = Depends(auth)):
+                                 db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, 'owner')
     account = owner_account(db, user, account_id, ('open', 'pending'))
     account_manager_access(user, account)
@@ -2300,7 +2331,7 @@ async def transfer_account_table(account_id: int, data: AccountTableTransferIn,
 
 @app.post('/api/accounts/{account_id}/merge')
 async def merge_accounts(account_id: int, data: AccountMergeIn,
-                         db: Session = Depends(db_session), user: User = Depends(auth)):
+                         db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, 'owner')
     if data.target_account_id == account_id:
         raise HTTPException(400, 'Selecciona otra cuenta como destino')
@@ -2380,7 +2411,7 @@ async def merge_accounts(account_id: int, data: AccountMergeIn,
 
 @app.post('/api/accounts/{account_id}/split')
 async def split_account(account_id: int, data: AccountSplitIn,
-                        db: Session = Depends(db_session), user: User = Depends(auth)):
+                        db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, 'owner')
     source = owner_account(db, user, account_id, ('open', 'pending'))
     account_manager_access(user, source)
@@ -2503,7 +2534,7 @@ async def split_account(account_id: int, data: AccountSplitIn,
 
 @app.post('/api/accounts/{account_id}/reopen-closed')
 async def reopen_closed_account(account_id: int, data: AccountReopenClosedIn,
-                                db: Session = Depends(db_session), user: User = Depends(auth)):
+                                db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, 'owner')
     account = db.execute(
         select(Account).where(Account.id == account_id).with_for_update()
@@ -2562,7 +2593,7 @@ class OrderIn(BaseModel):
     client_key:str=Field(min_length=8,max_length=100)
 
 @app.post('/api/accounts/{account_id}/orders')
-async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','waiter')
     period=active_period_for_work(db)
     if db.scalar(select(TipDistribution.id).where(TipDistribution.period_id==period.id)):
@@ -2734,7 +2765,7 @@ class RepeatOrderIn(BaseModel):
     client_key:str=Field(min_length=8,max_length=100)
 
 @app.post('/api/accounts/{account_id}/items/{item_id}/repeat')
-async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','waiter');active_period_for_work(db)
     existing=db.scalar(select(Batch).where(Batch.client_key==data.client_key))
     if existing:
@@ -2811,14 +2842,14 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
     return {'batch_id':batch.id,'duplicate':False}
 
 @app.post('/api/accounts/{account_id}/request-bill')
-async def request_bill(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def request_bill(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','waiter');a=owner_account(db,user,account_id,('open',))
     total,paid=acc_totals(db,a)
     if total<=0:raise HTTPException(409,'La cuenta no tiene productos')
     a.status='pending';audit(db,user,'account.request_bill',id=a.id);db.commit();await notify();return {'ok':True}
 class ApprovalIn(BaseModel):kind:Literal['reopen','cancel'];reason:str=Field(min_length=3,max_length=400);item_id:Optional[int]=None;qty:Optional[int]=None
 @app.post('/api/accounts/{account_id}/requests')
-async def request_approval(account_id:int,data:ApprovalIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def request_approval(account_id:int,data:ApprovalIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','waiter');a=owner_account(db,user,account_id)
     if data.kind=='reopen':
         if a.status!='pending' or acc_totals(db,a)[1]>0:raise HTTPException(409,'Solo cuentas pendientes sin abonos pueden reabrirse')
@@ -2828,12 +2859,12 @@ async def request_approval(account_id:int,data:ApprovalIn,db:Session=Depends(db_
     r=Approval(account_id=a.id,requester_id=user.id,kind=data.kind,item_id=data.item_id,qty=data.qty,reason=data.reason)
     db.add(r);audit(db,user,'approval.request',kind=data.kind,account_id=a.id);db.commit();await notify();return {'id':r.id}
 @app.get('/api/requests')
-def requests(db:Session=Depends(db_session),user:User=Depends(auth)):
+def requests(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     return [{'id':r.id,'account_id':r.account_id,'account':db.get(Account,r.account_id).name,'kind':r.kind,'item_id':r.item_id,'qty':r.qty,'reason':r.reason,'status':r.status,'requester':db.get(User,r.requester_id).display} for r in db.scalars(select(Approval).order_by(Approval.id.desc()).limit(100))]
 class DecisionIn(BaseModel):approve:bool;return_stock:bool=False
 @app.post('/api/requests/{request_id}/decide')
-async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     r=db.execute(select(Approval).where(Approval.id==request_id).with_for_update()).scalar_one_or_none()
     if not r:raise HTTPException(404,'Solicitud inexistente')
@@ -2876,7 +2907,7 @@ async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),u
     audit(db,user,'approval.decide',id=r.id,approved=data.approve,return_stock=data.return_stock);db.commit();await notify();return {'ok':True}
 
 @app.get('/api/tickets')
-def tickets(db:Session=Depends(db_session),user:User=Depends(auth)):
+def tickets(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','kitchen','bar')
     p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
     if not p:return []
@@ -2964,7 +2995,7 @@ async def deliver_ready_alert(event_id:int,db:Session=Depends(db_session),user:U
 
 class StatusIn(BaseModel):status:Literal['received','preparing','ready']
 @app.post('/api/tickets/{ticket_id}/status')
-async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','kitchen','bar')
     t=db.execute(select(StationTicket).where(StationTicket.id==ticket_id).with_for_update()).scalar_one_or_none()
     if not t:raise HTTPException(404,'Comanda inexistente')
@@ -3077,7 +3108,7 @@ class AccountDiscountIn(BaseModel):
     reason:str=Field(min_length=3,max_length=400)
 
 @app.post('/api/accounts/{account_id}/discounts')
-async def apply_account_discount(account_id:int,data:AccountDiscountIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def apply_account_discount(account_id:int,data:AccountDiscountIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     account=owner_account(db,user,account_id,('open','pending'))
     if db.scalar(select(Payment.id).where(Payment.account_id==account.id).limit(1)):
@@ -3123,7 +3154,7 @@ async def apply_account_discount(account_id:int,data:AccountDiscountIn,db:Sessio
 
 @app.post('/api/accounts/{account_id}/discounts/{discount_id}/void')
 async def void_account_discount(account_id:int,discount_id:int,data:VoidAccountIn,
-                                db:Session=Depends(db_session),user:User=Depends(auth)):
+                                db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     account=owner_account(db,user,account_id,('open','pending'))
     if db.scalar(select(Payment.id).where(Payment.account_id==account.id).limit(1)):
@@ -3146,7 +3177,7 @@ class PaymentLine(BaseModel):
 class AllocationLine(BaseModel):item_id:int;qty:int=Field(gt=0)
 class PaymentIn(BaseModel):client_key:str=Field(min_length=8,max_length=100);lines:list[PaymentLine]=Field(min_length=1,max_length=10);allocations:list[AllocationLine]=[]
 @app.post('/api/accounts/{account_id}/payments')
-async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier')
     # Comparación exacta: LIKE considera '%' y '_' comodines de SQL.
     existing=db.scalar(select(Payment).where(Payment.client_key==f'{data.client_key}-0'))
@@ -3209,7 +3240,7 @@ async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:
     return {'ok':True,'due':amount(total-paid-payment_total),'tips':amount(tip_total),'duplicate':False}
 
 @app.post('/api/accounts/{account_id}/close')
-async def close_account(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def close_account(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier');a=owner_account(db,user,account_id,('pending',))
     total,paid=acc_totals(db,a)
     if total<=0 or paid!=total:raise HTTPException(409,'La cuenta debe estar completamente pagada')
@@ -3219,7 +3250,7 @@ async def close_account(account_id:int,db:Session=Depends(db_session),user:User=
     audit(db,user,'account.close',id=a.id);db.commit();await notify();return {'ok':True}
 
 @app.get('/api/cash')
-def cash(db:Session=Depends(db_session),user:User=Depends(auth)):
+def cash(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier')
     p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
     if not p:return {'open':False}
@@ -3262,7 +3293,7 @@ class MovementIn(BaseModel):
     client_key:Optional[str]=Field(default=None,min_length=8,max_length=100)
 
 @app.post('/api/cash/movements')
-async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier')
     movement_cents=cents(data.amount)
     reason=data.reason.strip()
@@ -3307,7 +3338,7 @@ async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depe
     return {'id':m.id,'status':m.status,'duplicate':False}
 class MoveDecision(BaseModel):approve:bool
 @app.post('/api/cash/movements/{movement_id}/decide')
-async def move_decide(movement_id:int,data:MoveDecision,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def move_decide(movement_id:int,data:MoveDecision,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin');m=db.execute(select(CashMovement).where(CashMovement.id==movement_id).with_for_update()).scalar_one_or_none()
     if not m or m.status!='pending':raise HTTPException(409,'Movimiento no pendiente')
     p=active_period(db)
@@ -3316,7 +3347,7 @@ async def move_decide(movement_id:int,data:MoveDecision,db:Session=Depends(db_se
     audit(db,user,'cash.movement.decide',id=m.id,approve=data.approve);db.commit();await notify();return {'ok':True}
 class ClosePeriodIn(BaseModel):counted:Decimal=Field(ge=0);note:str=Field(default='',max_length=400)
 @app.post('/api/cash/close')
-async def close_cash(data:ClosePeriodIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def close_cash(data:ClosePeriodIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin');p=active_period(db)
     blocking=db.execute(select(Account.id,Account.name,Account.status).where(Account.status.notin_(('paid','cancelled'))).order_by(Account.id).limit(12)).all()
     if blocking:
@@ -3346,7 +3377,7 @@ async def close_cash(data:ClosePeriodIn,db:Session=Depends(db_session),user:User
     return {'id':p.id,'closed':True,'archived':True}
 class OpenPeriodIn(BaseModel):opening:Decimal=Field(ge=0)
 @app.post('/api/cash/open')
-async def open_cash(data:OpenPeriodIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def open_cash(data:OpenPeriodIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     if db.scalar(select(CashPeriod.id).where(CashPeriod.closed_at.is_(None))):raise HTTPException(409,'Ya existe un periodo abierto')
     p=CashPeriod(opening_cents=cents(data.opening))
@@ -3371,7 +3402,7 @@ class TipPayoutIn(BaseModel):
     note:str=Field(default='',max_length=400)
 
 @app.get('/api/tips/pool/current')
-def tips_pool_current(db:Session=Depends(db_session),user:User=Depends(auth)):
+def tips_pool_current(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     period=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
     history=db.scalars(select(TipDistribution).order_by(TipDistribution.id.desc()).limit(20)).all()
@@ -3392,7 +3423,7 @@ def tips_pool_current(db:Session=Depends(db_session),user:User=Depends(auth)):
     }
 
 @app.post('/api/tips/pool/current/distribution')
-async def create_tip_distribution(data:TipDistributionIn,db:Session=Depends(db_session),user:User=Depends(auth)):
+async def create_tip_distribution(data:TipDistributionIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     period=active_period(db)
     period=db.execute(select(CashPeriod).where(CashPeriod.id==period.id).with_for_update()).scalar_one()
@@ -3435,7 +3466,7 @@ async def create_tip_distribution(data:TipDistributionIn,db:Session=Depends(db_s
 
 @app.post('/api/tips/pool/distributions/{distribution_id}/shares/{share_id}/payouts')
 async def record_tip_payout(distribution_id:int,share_id:int,data:TipPayoutIn,
-                            db:Session=Depends(db_session),user:User=Depends(auth)):
+                            db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     existing=db.scalar(select(TipPayout).where(TipPayout.client_key==data.client_key))
     if existing:
@@ -3479,7 +3510,7 @@ async def record_tip_payout(distribution_id:int,share_id:int,data:TipPayoutIn,
             'pending':amount(share.share_cents-paid-payout_cents)}
 
 @app.get('/api/audit')
-def audit_log(db:Session=Depends(db_session),user:User=Depends(auth)):
+def audit_log(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
     return [{'id':a.id,'actor':db.get(User,a.actor_id).display if a.actor_id and db.get(User,a.actor_id) else 'Sistema','action':a.action,'detail':json.loads(a.detail),'date':a.created_at.isoformat()} for a in db.scalars(select(Audit).order_by(Audit.id.desc()).limit(100))]
 
@@ -3561,7 +3592,7 @@ def build_account_pdf(db,account,prebill=False):
     return buf.getvalue()
 
 @app.get('/api/accounts/{account_id}/prebill.pdf')
-def account_prebill_pdf(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+def account_prebill_pdf(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier','waiter')
     account=owner_account(db,user,account_id,allowed=None)
     payload=build_account_pdf(db,account,prebill=True)
@@ -3569,7 +3600,7 @@ def account_prebill_pdf(account_id:int,db:Session=Depends(db_session),user:User=
         headers={'Content-Disposition':f'inline; filename="ElMitote_PreCuenta_{account.id}.pdf"','Cache-Control':'no-store'})
 
 @app.get('/api/accounts/{account_id}/ticket.pdf')
-def ticket_pdf(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+def ticket_pdf(account_id:int,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier','waiter')
     account=owner_account(db,user,account_id,allowed=None)
     payload=build_account_pdf(db,account,prebill=False)
@@ -3615,13 +3646,13 @@ def period_summary(db,p):
             'cancelled_accounts':sum(a.status=='cancelled' for a in accounts),'note':p.note or ''}
 
 @app.get('/api/cash/history')
-def cash_history(db:Session=Depends(db_session),user:User=Depends(auth)):
+def cash_history(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier')
     ps=db.scalars(select(CashPeriod).where(CashPeriod.closed_at.is_not(None)).order_by(CashPeriod.id.desc()).limit(50)).all()
     return [period_summary(db,p) for p in ps]
 
 @app.get('/api/cash/periods/{period_id}')
-def cash_period_detail(period_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+def cash_period_detail(period_id:int,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier')
     p=db.get(CashPeriod,period_id)
     if not p or not p.closed_at:raise HTTPException(404,'Turno cerrado no encontrado')
@@ -3648,7 +3679,7 @@ def cash_period_detail(period_id:int,db:Session=Depends(db_session),user:User=De
     return summary
 
 @app.get('/api/cash/periods/{period_id}/report.pdf')
-def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(auth)):
+def cash_report(period_id:int,db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier')
     p=db.get(CashPeriod,period_id)
     if not p or not p.closed_at:raise HTTPException(404,'Corte no encontrado')
