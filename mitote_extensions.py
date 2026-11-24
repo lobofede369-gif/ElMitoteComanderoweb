@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app import (
     app, Base, Batch, Account, DiningTable, TableOccupancy, Product, ArchivedProduct, CashPeriod, OrderItem,
     OrderItemMeta, StationTicket, Payment, PaymentTip, Audit, User,
-    SessionLocal, db_session, auth, allow, audit, active_period, TipDistribution, now, notify,
+    SessionLocal, db_session, auth, auth_either, allow, audit, active_period, TipDistribution, now, notify,
     push_to, fcm_to, ticket_status, StatusIn, amount
 )
 
@@ -124,7 +124,7 @@ class ProductPrepIn(BaseModel):
 
 
 @app.get("/api/preparation/config")
-def prep_config(db: Session = Depends(db_session), user: User = Depends(auth)):
+def prep_config(db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner", "admin")
     p = policy(db)
     configs = {row.product_id: row.minutes for row in db.scalars(select(ProductPrep))}
@@ -138,7 +138,7 @@ def prep_config(db: Session = Depends(db_session), user: User = Depends(auth)):
 
 
 @app.put("/api/preparation/config")
-async def put_prep_config(data: PrepPolicyIn, db: Session = Depends(db_session), user: User = Depends(auth)):
+async def put_prep_config(data: PrepPolicyIn, db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner", "admin")
     p = policy(db)
     if not p:
@@ -154,7 +154,7 @@ async def put_prep_config(data: PrepPolicyIn, db: Session = Depends(db_session),
 
 @app.put("/api/preparation/products/{product_id}")
 async def put_product_prep(product_id: int, data: ProductPrepIn, db: Session = Depends(db_session),
-                           user: User = Depends(auth)):
+                           user: User = Depends(auth_either)):
     allow(user, "owner", "admin")
     if not db.get(Product, product_id):
         raise HTTPException(404, "Producto no encontrado")
@@ -170,7 +170,7 @@ async def put_product_prep(product_id: int, data: ProductPrepIn, db: Session = D
 
 
 @app.get("/api/preparation/tickets")
-def preparation_tickets(db: Session = Depends(db_session), user: User = Depends(auth)):
+def preparation_tickets(db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner", "admin", "kitchen", "bar")
     active = db.scalar(select(CashPeriod).where(
         CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
@@ -283,7 +283,7 @@ def preparation_tickets(db: Session = Depends(db_session), user: User = Depends(
 
 
 @app.post("/api/preparation/items/{item_id}/ready")
-async def mark_item_ready(item_id: int, db: Session = Depends(db_session), user: User = Depends(auth)):
+async def mark_item_ready(item_id: int, db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner", "admin", "kitchen", "bar")
     item = db.get(OrderItem, item_id)
     if not item:
@@ -373,7 +373,7 @@ async def ingest_reservation(data: ReservationIn, authorization: Optional[str] =
 
 
 @app.post("/api/reservations")
-async def add_reservation(data: ReservationIn, db: Session = Depends(db_session), user: User = Depends(auth)):
+async def add_reservation(data: ReservationIn, db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner", "admin")
     row, duplicate = create_reservation(db, data, "manual", user)
     db.commit()
@@ -382,7 +382,7 @@ async def add_reservation(data: ReservationIn, db: Session = Depends(db_session)
 
 
 @app.get("/api/reservations")
-def reservations(db: Session = Depends(db_session), user: User = Depends(auth)):
+def reservations(db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner", "admin")
     rows = db.scalars(select(Reservation).order_by(Reservation.scheduled_at.desc()).limit(200)).all()
     return [reservation_dict(x) for x in rows]
@@ -394,7 +394,7 @@ class ReservationStatusIn(BaseModel):
 
 @app.post("/api/reservations/{reservation_id}/status")
 async def change_reservation_status(reservation_id: int, data: ReservationStatusIn,
-                                    db: Session = Depends(db_session), user: User = Depends(auth)):
+                                    db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner", "admin")
     row = db.execute(select(Reservation).where(Reservation.id == reservation_id).with_for_update()).scalar_one_or_none()
     if row is None:
@@ -419,7 +419,7 @@ class ReservationArrivalIn(BaseModel):
 
 @app.post("/api/reservations/{reservation_id}/arrive")
 async def reservation_arrival(reservation_id: int, data: ReservationArrivalIn,
-                              db: Session = Depends(db_session), user: User = Depends(auth)):
+                              db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner", "admin")
     row = db.execute(select(Reservation).where(Reservation.id == reservation_id).with_for_update()).scalar_one_or_none()
     if row is None:
@@ -475,7 +475,7 @@ class AnalyticsQuery(BaseModel):
 
 @app.get("/api/owner/analytics")
 def owner_analytics(start: date, end: date, scope: Literal["current","history"] = "current",
-                    db: Session = Depends(db_session), user: User = Depends(auth)):
+                    db: Session = Depends(db_session), user: User = Depends(auth_either)):
     allow(user, "owner")
     if end < start or (end - start).days > 93:
         raise HTTPException(400, "El periodo debe ser de 1 a 94 días")
