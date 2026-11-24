@@ -178,6 +178,7 @@ function logout(reason='manual'){
   state.apiInflight.clear();
   state.token='';state.user=null;state.screen='';state.navStack=[];state.waiterReadyInitialized=false;state.waiterReadySeen=new Set();
   localStorage.removeItem('mitote-token');sessionStorage.removeItem('mitote-token');localStorage.removeItem('mitote-screen');
+  const isisPanel=$('#isis-panel');if(isisPanel)isisPanel.hidden=true;
   $('#app').hidden=true;$('#login').hidden=false;stopAlarm();
 }
 function refreshNav(){const list=sections[state.user.role]||[];$('#nav').innerHTML=list.map(([id,icon,title])=>`<button class="navbtn ${state.screen===id?'active':''}" data-nav="${id}"><span style="font-size:1.15rem">${icon}</span>${title}</button>`).join('');$('#role-name').textContent=`${state.user.display} · ${labels[state.user.role]}`;$('#page-title').textContent=(list.find(x=>x[0]===state.screen)||list[0]||[])[2]||'Inicio';const back=$('#back');if(back)back.hidden=state.navStack.length===0;}
@@ -186,6 +187,14 @@ async function start(authenticatedUser=null){try{
       typeof authenticatedUser.display==='string'&&sections[authenticatedUser.role]
       ?authenticatedUser:null;
     state.user=validUser||await api('/me');
+    // Isis embebida: solo ve el panel de voz, nunca el dashboard normal.
+    if(state.user.username==='isis'){
+      $('#login').hidden=true;$('#app').hidden=true;
+      const panel=$('#isis-panel');if(panel)panel.hidden=false;
+      if(window.IsisVoice)window.IsisVoice.show(state);
+      else document.addEventListener('DOMContentLoaded',()=>window.IsisVoice&&window.IsisVoice.show(state));
+      return;
+    }
     if(window.MitoteAndroid){try{window.MitoteAndroid.syncSession(state.token,state.user.role)}catch(e){}}
     restoreWorkState();
     $('#login').hidden=true;$('#app').hidden=false;

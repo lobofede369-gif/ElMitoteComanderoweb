@@ -1,0 +1,29 @@
+/* Isis embebida en El Mitote: panel solo por voz, sencillo y elegante,
+   minimalista. Colores del Mitote: amarillo #ffc400, rojo #e01e26,
+   negro #0d0906, crema #fff6e0. Mucho aire, poco texto, sin cajas. */
+#isis-panel{min-height:100dvh;background:#0d0906;color:#fff6e0;display:flex;flex-direction:column;align-items:center;padding:28px 22px 32px;box-sizing:border-box}
+#isis-panel[hidden]{display:none}
+.isis-head{width:100%;max-width:420px;display:flex;justify-content:space-between;align-items:center}
+.isis-head strong{color:#ffc400;letter-spacing:.35em;font-size:.95rem;font-weight:600}
+.isis-head small{color:#cdbfa8;font-size:.7rem;letter-spacing:.15em}
+.isis-exit{background:none;border:0;color:#cdbfa8;padding:8px 0;font-size:.85rem}
+.isis-orb{width:150px;height:150px;border-radius:50%;margin:48px 0 18px;position:relative;
+  background:radial-gradient(circle at 50% 42%,#ffd83d 0%,#ffc400 32%,#e01e26 78%,#7c0a10 100%);
+  box-shadow:0 0 28px rgba(255,196,0,.28);
+  display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,196,0,.45)}
+.isis-orb::after{content:"ISIS";color:#140d06;font-weight:700;letter-spacing:.32em;font-size:1rem}
+.isis-orb.listening{animation:isis-pulse 1.4s ease-in-out infinite}
+.isis-orb.thinking{box-shadow:0 0 28px rgba(224,30,38,.4)}
+.isis-orb.speaking{animation:isis-pulse 1s ease-in-out infinite}
+@keyframes isis-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.04);opacity:.92}}
+#isis-status{color:#cdbfa8;min-height:1.4em;text-align:center;font-size:.9rem}
+#isis-mic{margin-top:22px;background:none;border:1px solid #ffc400;color:#ffc400;border-radius:999px;padding:13px 28px;font-size:.95rem;font-weight:600;letter-spacing:.05em}
+#isis-mic.stop{border-color:#e01e26;color:#e01e26}
+.isis-card{width:100%;max-width:420px;background:none;border:0;padding:0;margin-top:34px;text-align:center}
+.isis-card h3{display:none}
+#isis-heard{color:#cdbfa8;font-size:.85rem;margin:6px 0;line-height:1.5}
+#isis-reply{color:#fff6e0;font-size:1.05rem;margin:6px 0;line-height:1.6}
+.isis-hint{color:#cdbfa8;font-size:.8rem;text-align:center;max-width:420px;margin-top:26px;letter-spacing:.12em}
+.isis-voice-row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:18px}
+.isis-voice-row button{background:none;border:0;color:#cdbfa8;padding:6px 8px;font-size:.8rem;text-decoration:underline}
+#isis-voice-state{color:#8a7d68;font-size:.75rem;text-align:center;margin-top:6px}
