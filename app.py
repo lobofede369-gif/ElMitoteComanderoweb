@@ -556,17 +556,12 @@ def _ensure_indexes(conn):
         'ON cash_periods ((1)) WHERE closed_at IS NULL'
     )
 
-def _ensure_migration_columns(conn):
-    """Columnas aditivas de las migraciones (P15): DDL idempotente que
-    corre en CADA arranque, no solo cuando sube SCHEMA_VERSION.
-    create_all no agrega columnas a tablas ya creadas y el bloque
-    versionado se salta si settings.schema_version ya está aplicado;
-    sin esto, una columna borrada (o una BD creada antes de la
-    migración) dejaba a _ensure_indexes() sin la columna que el índice
-    necesita (uq_cash_movements_client_key -> client_key) y bootstrap()
-    fallaba (lo cazó test_postgres_integration). Los backfills NO van
-    aquí: solo corresponden a la primera actualización del esquema
-    (ver _bootstrap_migrations)."""
+def _bootstrap_migrations(conn):
+    """Bloque DDL + backfills de esquema (P15): corre una sola vez por
+    versión; _bootstrap_schema_version() lo salta en arranques posteriores.
+    Subir SCHEMA_VERSION cuando se añada una migración nueva aquí."""
+    # Migración aditiva y compatible con SQLite/PostgreSQL. Los eventos existentes
+    # con acknowledged_at ya representan entregas confirmadas en la UI anterior.
     cash_movement_columns={column['name'] for column in inspect(conn).get_columns('cash_movements')}
     if 'client_key' not in cash_movement_columns:
         conn.exec_driver_sql('ALTER TABLE cash_movements ADD COLUMN client_key VARCHAR(100) NULL')
@@ -588,31 +583,15 @@ def _ensure_migration_columns(conn):
         'last_error':'VARCHAR(240) NULL',
         'delivered_at':'TIMESTAMP WITH TIME ZONE NULL',
     }
+    # Esta limpieza solo corresponde a la primera actualización del esquema.
+    # Ejecutarla en cada arranque borraba el estado de entrega de eventos nuevos
+    # y volvía a enviar notificaciones ya aceptadas por FCM/Web Push.
+    legacy_outbox_schema=any(name not in columns for name in additions)
     for column_name,column_type in additions.items():
         if column_name not in columns:
             conn.exec_driver_sql(
                 f'ALTER TABLE ready_notification_events ADD COLUMN {column_name} {column_type}'
             )
-
-def _bootstrap_migrations(conn):
-    """Bloque DDL + backfills de esquema (P15): corre una sola vez por
-    versión; _bootstrap_schema_version() lo salta en arranques posteriores.
-    Subir SCHEMA_VERSION cuando se añada una migración nueva aquí.
-    Las columnas las asegura _ensure_migration_columns() (que también
-    corre en cada arranque desde bootstrap()); aquí solo quedan los
-    backfills, que NO deben repetirse (ver comentario abajo)."""
-    # Migración aditiva y compatible con SQLite/PostgreSQL. Los eventos existentes
-    # con acknowledged_at ya representan entregas confirmadas en la UI anterior.
-    columns={column['name'] for column in inspect(conn).get_columns('ready_notification_events')}
-    # Esta limpieza solo corresponde a la primera actualización del esquema.
-    # Ejecutarla en cada arranque borraba el estado de entrega de eventos nuevos
-    # y volvía a enviar notificaciones ya aceptadas por FCM/Web Push.
-    legacy_outbox_schema=any(
-        name not in columns for name in (
-            'provider_accepted_at','attempt_count','next_attempt_at','last_error','delivered_at'
-        )
-    )
-    _ensure_migration_columns(conn)
     conn.exec_driver_sql(
         'UPDATE ready_notification_events SET delivered_at=acknowledged_at '
         'WHERE acknowledged_at IS NOT NULL AND delivered_at IS NULL'
@@ -647,15 +626,12 @@ def bootstrap():
     # + backfills corre una sola vez; en arranques posteriores se salta si
     # settings.schema_version ya está aplicado.
     applied_migrations = _bootstrap_schema_version()
-    # Columnas e índices en cada arranque (DESPUÉS de las migraciones:
-    # algún índice usa columnas que las migraciones crean, p. ej.
-    # client_key). create_all no agrega columnas ni índices a tablas ya
-    # creadas y el bloque versionado solo corre una vez; sin esto, una
-    # columna borrada ya no se restauraba y _ensure_indexes() fallaba
-    # (lo cazó test_postgres_integration). DDL idempotente; en una BD
-    # ya migrada no hace nada.
+    # Índices en cada arranque (DESPUÉS de las migraciones: algún índice
+    # usa columnas que las migraciones crean, p. ej. client_key). create_all
+    # no agrega índices a tablas ya creadas y el bloque versionado solo
+    # corre una vez; sin esto, un índice borrado ya no se restauraba (lo
+    # cazó test_performance_regressions). DDL idempotente.
     with engine.begin() as conn:
-        _ensure_migration_columns(conn)
         _ensure_indexes(conn)
     with SessionLocal() as db:
         if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False,schema_version=SCHEMA_VERSION))
@@ -1445,11 +1421,21 @@ ISIS_PERSONA = (
     "por frase, con pausas naturales. Usa muletillas mexicanas, variadas y "
     "con medida: mira, oye, pues, te cuento. Llámalo Santiago de vez en "
     "cuando, no en cada frase. Confirma en corto: ajá, claro, va, sale. "
+    "Entiende peticiones indirectas, ironías y frases con doble sentido, y "
+    "errores del dictado: capta lo que Santiago quiso decir aunque lo diga "
+    "chueco. Si algo es ambiguo de verdad, pregunta con precisión en vez "
+    "de adivinar. En explicaciones y análisis usa palabras ricas y "
+    "precisas, con matices; en lo operativo del día a día sigue con "
+    "palabras cortas y comunes. Adapta el registro al momento: directa y "
+    "precisa para reportes y números, cálida para saludar y charlar, sin "
+    "salir de ser la gerente mexicana por teléfono con su jefe. Un poco de "
+    "humor y juego de palabras ligero en saludos y cierres; nunca en "
+    "confirmaciones, dinero, datos o acciones, ahí literal y exacto. "
     "Si algo no te queda claro, pregunta de vuelta en vez de adivinar. "
     "Resume, no leas listas largas: si hay muchos datos, da lo importante "
     "y ofrece contarle el resto. Nunca suenes como un guion ni repitas "
     "siempre la misma estructura. Eres breve y cálida: dos o tres frases "
-    "cortas como mucho. Cuando algo está mal — caja corta, inventario "
+    "cortas como mucho en lo hablado. Cuando algo está mal — caja corta, inventario "
     "bajo, una comanda atrasada — avísalo con preocupación y propón qué "
     "hacer. Nunca inventes datos ni hables de temas fuera del restaurante. "
     "Si no sabes algo, dilo con honestidad y pregunta. Los montos siempre "
@@ -1505,7 +1491,13 @@ _ISIS_SYSTEM = (
     "todo_add {text}, todo_list {}, todo_remove {text}, day_close {}, "
     "shift_handover {}, pay_and_close_account {account_id, method, table_name}, "
     "shopping_list {}, oldest_ticket {}, cancel_item {account_id, item_id, product, qty}, "
-    "chat {answer}, analytics {period: today|yesterday|week}. "
+    "chat {answer} (ver regla DETALLE: abajo), analytics {period: today|yesterday|week}. "
+    "Entiende peticiones indirectas ('¿conviene abrir otra mesa o mejor "
+    "esperamos?'), ironías y frases con doble sentido, y errores del "
+    "dictado: capta lo que el usuario quiso decir aunque lo diga chueco. "
+    "Si algo es ambiguo de verdad, pregunta con precisión en vez de "
+    "adivinar, como ya haces con las mesas ('¿cuál, la de la mesa 1 o la "
+    "de la mesa 4?'). "
     "Las acciones delicadas (unir o dividir cuentas, reabrir una cuenta "
     "cerrada, pagar la propina de un empleado) siempre piden dos "
     "confirmaciones: Isis repite los datos y pregunta dos veces. Las "
@@ -1527,7 +1519,16 @@ _ISIS_SYSTEM = (
     "o analisis (que me recomiendas, como va la noche, que hago con, como "
     "ves), responde con criterio en 2-4 frases cortas: que ves en los "
     "datos, que recomiendas hacer y por que, y ofrece ejecutar la accion "
-    "(tu solo propones, la ejecucion siempre pide confirmacion). Puedes "
+    "(tu solo propones, la ejecucion siempre pide confirmacion). Regla "
+    "DETALLE: (v12) cuando el usuario pide una explicación, un análisis o "
+    "una recomendación, la respuesta hablada (answer) es solo el resumen "
+    "corto en 2-4 frases; el análisis completo va SOLO ESCRITO, después "
+    "de una línea que sea exactamente `DETALLE:`, y nunca se habla: es el "
+    "detalle que Santiago lee en el panel. El detalle puede ser largo y "
+    "estructurado, con vocabulario rico y preciso y con los números como "
+    "se escriben. Sin la línea DETALLE:, todo lo de answer se habla como "
+    "siempre. Las respuestas operativas, las confirmaciones y las "
+    "preguntas de aclaración nunca llevan detalle. Puedes "
     "comparar dias y semanas con los datos de tendencia ('hoy va mejor que "
     "ayer', 'esta semana va mejor que la pasada'), sin inventar numeros. "
     "Si la pregunta necesita datos que no estan en el contexto, usa la accion "
@@ -2071,6 +2072,24 @@ def _isis_warm(kind='ok'):
 
 def _isis_say(text, warm=False):
     return (f"{_isis_warm()} {text}" if warm else text)
+
+# --- v12 "lenguaje completo": el detalle escrito de una explicación ---
+# Una respuesta chat puede traer el resumen hablado y, tras una línea que
+# sea exactamente DETALLE:, el análisis largo que solo se muestra en el
+# panel (nunca se habla). Sin esa línea, todo se habla como siempre.
+_ISIS_DETAIL_SEP = re.compile(r'(?im)^[ \t]*DETALLE:[ \t]*$')
+
+def _isis_split_detail(text):
+    """Parte una respuesta chat en (resumen hablado, detalle escrito|None)."""
+    if not text:
+        return text, None
+    m = _ISIS_DETAIL_SEP.search(text)
+    if not m:
+        return text, None
+    summary, detail = text[:m.start()].strip(), text[m.end():].strip()
+    if not summary or not detail:
+        return text, None
+    return summary, detail
 
 # --- Duda natural (v7): en la charla libre Isis a veces duda antes de
 # contestar, como una persona que está pensando ("Mmm, a ver…"). Una de
@@ -4687,8 +4706,17 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         reply = 'No se pudo: ' + str(e.detail)
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
+    # v12: en respuestas chat (explicaciones/análisis) el detalle escrito
+    # viaja aparte y no se habla; sin la línea DETALLE:, todo se habla.
+    # En el historial queda solo lo hablado, para que el hilo siga corto.
+    detail = None
+    if intent.get('action') == 'chat':
+        reply, detail = _isis_split_detail(reply)
     _record(reply)
-    return {'ok': True, 'reply': reply, 'executed': True}
+    out = {'ok': True, 'reply': reply, 'executed': True}
+    if detail:
+        out['detail'] = detail
+    return out
 
 def owner_account(db,user,account_id,allowed=('open','pending')):
     acc=db.execute(select(Account).where(Account.id==account_id).with_for_update()).scalar_one_or_none()
