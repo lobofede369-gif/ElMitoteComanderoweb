@@ -438,7 +438,7 @@ try:
         assert "await syncWaiterReadyAlerts" not in start_flow
         assert start_flow.index("const initialRender=render({preserveScroll:false})") < start_flow.index(
             "listenEvents()"
-        ) < start_flow.index("initialRender.then(()=>")
+        ) < start_flow.index("await initialRender")
         assert "function loadingScreenHtml(screen)" in js
         assert "api('/cashier/overview'+query)" in js
         assert "api('/overview')" in js
