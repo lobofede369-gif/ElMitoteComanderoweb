@@ -5,6 +5,7 @@ Do not deploy without PostgreSQL, HTTPS and changing bootstrap credentials.
 """
 import os, json, asyncio, secrets, io, time, logging, hashlib, hmac, unicodedata, re
 from urllib.parse import urlparse
+import urllib.request, urllib.error
 from pywebpush import webpush, WebPushException
 from firebase_admin import credentials, messaging, initialize_app, get_app
 from contextlib import asynccontextmanager
@@ -816,6 +817,475 @@ def auth_either(authorization: Optional[str] = Header(None), db: Session = Depen
 @app.get('/api/isis/ping')
 def isis_ping(user=Depends(auth_isis)):
     return {'ok': True, 'actor': 'Isis', 'role': user.role}
+
+# ---------------------------------------------------------------------------
+# ISIS EMBEBIDA EN EL MITOTE (nueva, desde cero)
+# Vive dentro de esta misma app: mismo servicio, misma base de datos.
+# No usa el token ISIS_API_TOKEN ni el proxy externo: Isis entra con su
+# propio PIN de 6 digitos como todo el personal, con rol owner, y solo se
+# le muestra el panel de voz. Su cerebro solo sabe del restaurante.
+# La clave de FableAI vive SOLO en la variable de entorno FABLEAI_API_KEY
+# del servidor: nunca en el navegador, nunca en localStorage, nunca en logs.
+# Sin clave, Isis sigue funcionando con un interprete local de ordenes
+# en espanol (lecturas y escrituras con confirmacion por voz).
+# ---------------------------------------------------------------------------
+FABLEAI_API_KEY = os.getenv('FABLEAI_API_KEY', '').strip()
+FABLEAI_MODEL = os.getenv('FABLEAI_MODEL', 'claude-sonnet-5-5').strip()
+FABLEAI_URL = os.getenv('FABLEAI_URL', 'https://api.fableaiapi.com/v1/chat/completions').strip()
+_ISIS_CONFIRM = {}  # token -> {'intent': dict, 'expires': float}
+
+_ISIS_SYSTEM = (
+    "Eres Isis, la asistente de voz del restaurante El Mitote. Solo sabes del "
+    "restaurante: mesas, cuentas, comandas, inventario, ventas y caja. "
+    "Nunca hables de otros temas, nunca inventes datos: si no sabes algo, dilo "
+    "y pregunta. Responde SIEMPRE con un JSON valido, sin texto fuera del JSON, "
+    "con esta forma: {\"action\": \"...\", \"params\": {...}, \"question\": \"...\"}. "
+    "Acciones validas: tables, overview, cash, inventory, account_detail, "
+    "open_cash, close_cash, create_table, new_account, add_order, pay_account, "
+    "close_account, restock, inventory_adjust, void_account, cash_movement, "
+    "unknown. Params segun la accion: open_cash {opening}, close_cash "
+    "{counted, note}, create_table {name, area, capacity}, new_account "
+    "{table_name, name}, add_order {table_name, items: [{product, qty}]}, "
+    "pay_account {table_name, amount, method, all}, close_account {table_name}, "
+    "restock {product, qty, reason}, inventory_adjust {product, qty, mode}, "
+    "void_account {table_name, reason}, cash_movement {kind, amount, reason}, "
+    "account_detail {table_name}, inventory {product}. method es cash, card o "
+    "transfer. Si falta un dato indispensable para una escritura, pon "
+    "action unknown y en question pregunta solo por ese dato, en espanol."
+)
+
+def _isis_norm(s):
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode('ascii')
+    return re.sub(r'\s+', ' ', s.lower()).strip()
+
+_NUM_WORDS = {'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5,
+              'seis': 6, 'siete': 7, 'ocho': 8, 'nueve': 9, 'diez': 10,
+              'once': 11, 'doce': 12, 'quince': 15, 'veinte': 20}
+
+def _isis_numbers(text):
+    out = []
+    for m in re.finditer(r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)', text):
+        try:
+            out.append(float(m.group(1).replace(',', '')))
+        except Exception:
+            pass
+    return out
+
+def _isis_money(text):
+    nums = _isis_numbers(text)
+    return nums[0] if nums else None
+
+def _isis_qty(text):
+    m = re.search(r'\b(\d+)\b', text)
+    if m:
+        return int(m.group(1))
+    for w, v in _NUM_WORDS.items():
+        if re.search(r'\b' + w + r'\b', text):
+            return v
+    return 1
+
+def _isis_method(text):
+    if 'tarjeta' in text:
+        return 'card'
+    if 'transfer' in text:
+        return 'transfer'
+    if 'efectivo' in text or 'cash' in text:
+        return 'cash'
+    return None
+
+def _isis_table_name(text):
+    m = re.search(r'mesa\s+([a-z0-9 ]+?)(?:\s+(?:con|por|en|todo|la|el|de)\b|$)', text)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'\bmesa\s+(\d+)\b', text)
+    return m.group(1) if m else None
+
+def _isis_find_table(db, user, text):
+    try:
+        tables = dining_tables(db, user)
+    except Exception:
+        return None
+    want = _isis_norm(_isis_table_name(text) or '')
+    if not want:
+        return None
+    for t in tables:
+        if _isis_norm(t.get('name', '')) == want or _isis_norm(t.get('name', '')).endswith(' ' + want):
+            return t
+    for t in tables:
+        if want in _isis_norm(t.get('name', '')):
+            return t
+    return None
+
+def _isis_find_account(db, user, text):
+    try:
+        accs = accounts(db, user)
+    except Exception:
+        return None
+    m = re.search(r'cuenta\s*#?\s*(\d+)', text)
+    if m:
+        for a in accs:
+            if str(a.get('id')) == m.group(1):
+                return a
+    t = _isis_find_table(db, user, text)
+    if t and t.get('account_id'):
+        for a in accs:
+            if a.get('id') == t.get('account_id'):
+                return a
+    if t:
+        for a in accs:
+            if _isis_norm(a.get('table_name') or '') == _isis_norm(t.get('name', '')):
+                return a
+    return None
+
+def _isis_find_product(db, user, text):
+    try:
+        prods = products(db, user)
+    except Exception:
+        return None
+    norm = _isis_norm(text)
+    best = None
+    for p in prods:
+        name = _isis_norm(p.get('name', ''))
+        if name and name in norm and (best is None or len(name) > len(_isis_norm(best.get('name', '')))):
+            best = p
+    return best
+
+def _isis_parse_local(db, user, raw):
+    """Interprete local, sin IA externa. Devuelve intent o None."""
+    text = _isis_norm(raw)
+    if not text:
+        return None
+    # Lecturas
+    if any(k in text for k in ('mesas libres', 'mesas ocupadas', 'que mesas', 'como van las mesas', 'estado de las mesas')):
+        return {'action': 'tables', 'params': {}}
+    if 'inventario' in text or 'existencias' in text or 'stock' in text or 'cuanto queda de' in text or 'cuanto hay de' in text:
+        p = _isis_find_product(db, user, text)
+        return {'action': 'inventory', 'params': {'product': p.get('name') if p else None}}
+    if any(k in text for k in ('como va la caja', 'cuanto llevamos', 'ventas de hoy', 'resumen', 'como vamos')):
+        return {'action': 'overview', 'params': {}}
+    if 'caja' in text and any(k in text for k in ('cuanto hay', 'cuanto tenemos', 'estado', 'como esta')):
+        return {'action': 'cash', 'params': {}}
+    if 'cuanto debe' in text or 'cuanto es' in text or 'saldo' in text or 'detalle de la cuenta' in text:
+        a = _isis_find_account(db, user, text)
+        if not a:
+            return {'action': 'unknown', 'params': {}, 'question': '¿De qué mesa quieres saber el saldo? Dime el nombre o el número de la mesa.'}
+        return {'action': 'account_detail', 'params': {'account_id': a.get('id')}}
+    # Escrituras (todas con confirmacion)
+    if 'abre el turno' in text or 'abrir turno' in text or 'abre caja' in text:
+        amt = _isis_money(text)
+        if amt is None:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Con cuánto fondo abro el turno? Dime el importe en pesos.'}
+        return {'action': 'open_cash', 'params': {'opening': amt}}
+    if 'cierra el turno' in text or 'corte de caja' in text or 'haz el corte' in text or 'cerrar caja' in text:
+        amt = _isis_money(text)
+        if amt is None:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Cuánto efectivo contaste para el corte? Dime el importe.'}
+        return {'action': 'close_cash', 'params': {'counted': amt, 'note': 'Corte por voz con Isis'}}
+    if 'crea' in text and 'mesa' in text:
+        m_raw = re.search(r'mesa\s+([A-Za-z0-9 ]+?)\s*$', raw.strip(), re.IGNORECASE)
+        name = m_raw.group(1).strip().title() if m_raw else (_isis_table_name(text) or 'Nueva mesa')
+        return {'action': 'create_table', 'params': {'name': name, 'area': 'Salon', 'capacity': 4}}
+    if 'abre la mesa' in text or 'abre mesa' in text or 'nueva cuenta' in text:
+        t = _isis_find_table(db, user, text)
+        if not t:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué mesa quieres abrir? Dime el nombre o el número.'}
+        return {'action': 'new_account', 'params': {'table_id': t.get('id'), 'table_name': t.get('name')}}
+    if 'anula' in text and 'cuenta' in text:
+        a = _isis_find_account(db, user, text)
+        if not a:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué cuenta quieres anular? Dime la mesa.'}
+        return {'action': 'void_account', 'params': {'account_id': a.get('id'), 'reason': 'Anulacion por voz con Isis'}}
+    if 'cierra la cuenta' in text or 'cerrar la cuenta' in text:
+        a = _isis_find_account(db, user, text)
+        if not a:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué cuenta quieres cerrar? Dime la mesa.'}
+        return {'action': 'close_account', 'params': {'account_id': a.get('id')}}
+    if 'cobra' in text or 'paga la mesa' in text or 'pagar la mesa' in text:
+        a = _isis_find_account(db, user, text)
+        if not a:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué mesa quieres cobrar? Dime el nombre o el número.'}
+        method = _isis_method(text)
+        all_flag = 'todo' in text or 'completo' in text or 'total' in text
+        amt = None if all_flag else _isis_money(re.sub(r'mesa\s+\d+', '', text))
+        if not all_flag and amt is None:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Cuánto cobro en esa mesa, o cobro todo el saldo?'}
+        if not method:
+            return {'action': 'unknown', 'params': {}, 'question': '¿En efectivo, con tarjeta o por transferencia?'}
+        return {'action': 'pay_account', 'params': {'account_id': a.get('id'), 'amount': amt, 'method': method, 'all': all_flag}}
+    if 'repon' in text or 'reponer' in text or 'surte' in text:
+        p = _isis_find_product(db, user, text)
+        if not p:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué producto quieres reponer? Dime su nombre.'}
+        return {'action': 'restock', 'params': {'product_id': p.get('id'), 'product': p.get('name'), 'qty': _isis_qty(text), 'reason': 'Reposicion por voz con Isis'}}
+    if 'ajusta' in text and ('inventario' in text or 'existencias' in text):
+        p = _isis_find_product(db, user, text)
+        if not p:
+            return {'action': 'unknown', 'params': {}, 'question': '¿De qué producto ajusto el inventario?'}
+        amt = _isis_money(text)
+        if amt is None:
+            return {'action': 'unknown', 'params': {}, 'question': '¿A cuánto dejo las existencias de ese producto?'}
+        return {'action': 'inventory_adjust', 'params': {'product_id': p.get('id'), 'product': p.get('name'), 'qty': int(amt), 'mode': 'count', 'reason': 'Ajuste por voz con Isis'}}
+    if ('agrega' in text or 'anade' in text or 'pon' in text or 'pide' in text) and 'mesa' in text:
+        a = _isis_find_account(db, user, text)
+        p = _isis_find_product(db, user, text)
+        if not a:
+            return {'action': 'unknown', 'params': {}, 'question': '¿A qué mesa le agrego el pedido?'}
+        if not p:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué producto le agrego a esa mesa?'}
+        return {'action': 'add_order', 'params': {'account_id': a.get('id'), 'items': [{'product_id': p.get('id'), 'product': p.get('name'), 'qty': _isis_qty(re.sub(r'mesa\s+\d+', '', text))}]}}
+    if ('entrada' in text or 'salida' in text) and ('efectivo' in text or 'caja' in text or '$' in text or _isis_money(text) is not None):
+        amt = _isis_money(text)
+        if amt is None:
+            return {'action': 'unknown', 'params': {}, 'question': '¿De cuánto es el movimiento de caja?'}
+        return {'action': 'cash_movement', 'params': {'kind': 'out' if 'salida' in text else 'in', 'amount': amt, 'reason': raw.strip()[:200]}}
+    return None
+
+def _isis_call_fableai(message, context):
+    """Llama a Claude via FableAI y devuelve un intent, o None si no se puede."""
+    if not FABLEAI_API_KEY:
+        return None
+    payload = {'model': FABLEAI_MODEL, 'temperature': 0, 'max_tokens': 600,
+               'messages': [{'role': 'system', 'content': _ISIS_SYSTEM},
+                            {'role': 'user', 'content': 'Contexto del restaurante (mesas, productos y cuentas abiertas, resumido):\n' + context + '\n\nOrden del usuario: ' + message}]}
+    req = urllib.request.Request(FABLEAI_URL, data=json.dumps(payload).encode('utf-8'),
+                                 headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + FABLEAI_API_KEY},
+                                 method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        content = data['choices'][0]['message']['content']
+        start = content.find('{')
+        end = content.rfind('}')
+        if start < 0 or end < 0:
+            return None
+        parsed = json.loads(content[start:end + 1])
+        if not isinstance(parsed, dict) or 'action' not in parsed:
+            return None
+        parsed.setdefault('params', {})
+        return parsed
+    except Exception:
+        return None
+
+def _isis_context(db, user):
+    try:
+        tables = dining_tables(db, user)
+        t_txt = ', '.join(f"{t.get('name')} ({t.get('status')})" for t in tables[:20])
+    except Exception:
+        t_txt = 'no disponible'
+    try:
+        prods = products(db, user)
+        p_txt = ', '.join(f"{p.get('name')} (stock {p.get('stock')})" for p in prods if p.get('inventory_enabled'))[:1500]
+    except Exception:
+        p_txt = 'no disponible'
+    try:
+        accs = accounts(db, user)
+        a_txt = ', '.join(f"#{a.get('id')} {a.get('name')} mesa {a.get('table_name')} debe ${a.get('due')}" for a in accs if a.get('status') in ('open', 'pending'))[:1500]
+    except Exception:
+        a_txt = 'no disponible'
+    return f"Mesas: {t_txt}\nProductos con inventario: {p_txt}\nCuentas abiertas: {a_txt}"
+
+_WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'new_account', 'add_order',
+                  'pay_account', 'close_account', 'restock', 'inventory_adjust', 'void_account', 'cash_movement'}
+
+def _isis_describe(intent):
+    a, p = intent.get('action'), intent.get('params') or {}
+    if a == 'open_cash':
+        return f"Abrir el turno con ${p.get('opening')} de fondo."
+    if a == 'close_cash':
+        return f"Cerrar el turno con ${p.get('counted')} contados."
+    if a == 'create_table':
+        return f"Crear la mesa {p.get('name')}."
+    if a == 'new_account':
+        return f"Abrir una cuenta en la mesa {p.get('table_name')}."
+    if a == 'add_order':
+        items = ', '.join(f"{i.get('qty')} {i.get('product')}" for i in p.get('items') or [])
+        return f"Agregar a la cuenta {p.get('account_id')}: {items}."
+    if a == 'pay_account':
+        amt = 'todo el saldo' if p.get('all') else f"${p.get('amount')}"
+        return f"Cobrar {amt} en la cuenta {p.get('account_id')} con {p.get('method')}."
+    if a == 'close_account':
+        return f"Cerrar la cuenta {p.get('account_id')}."
+    if a == 'restock':
+        return f"Reponer {p.get('qty')} de {p.get('product')}."
+    if a == 'inventory_adjust':
+        return f"Dejar el inventario de {p.get('product')} en {p.get('qty')}."
+    if a == 'void_account':
+        return f"Anular la cuenta {p.get('account_id')}."
+    if a == 'cash_movement':
+        return f"Registrar una {'salida' if p.get('kind') == 'out' else 'entrada'} de ${p.get('amount')} en caja."
+    return f"Ejecutar {a}."
+
+def _isis_confirm_token(intent):
+    token = secrets.token_urlsafe(24)
+    _ISIS_CONFIRM[token] = {'intent': intent, 'expires': time.time() + 120}
+    return token
+
+async def _isis_execute(db, user, intent):
+    """Ejecuta un intent reutilizando las funciones reales de la app."""
+    a, p = intent.get('action'), intent.get('params') or {}
+    if a == 'tables':
+        rows = dining_tables(db, user)
+        free = [t.get('name') for t in rows if t.get('status') == 'available']
+        busy = [t.get('name') for t in rows if t.get('status') == 'occupied']
+        return f"Mesas libres: {', '.join(free) or 'ninguna'}. Mesas ocupadas: {', '.join(busy) or 'ninguna'}."
+    if a == 'overview':
+        o = overview(db, user)
+        c = cash(db, user)
+        if not c.get('open'):
+            return f"Hay {o.get('active_accounts', 0)} cuentas activas y {o.get('products', 0)} productos en el menú. No hay turno de caja abierto."
+        return (f"Hay {o.get('active_accounts', 0)} cuentas activas. Ventas del turno: efectivo ${c.get('cash')}, "
+                f"tarjeta ${c.get('card')}, transferencia ${c.get('transfer')}. Efectivo esperado en caja: ${c.get('expected')}.")
+    if a == 'cash':
+        c = cash(db, user)
+        if not c.get('open'):
+            return "No hay turno de caja abierto."
+        return (f"Caja abierta. Efectivo ${c.get('cash')}, tarjeta ${c.get('card')}, transferencia ${c.get('transfer')}, "
+                f"propinas ${c.get('tips')}, efectivo esperado ${c.get('expected')}.")
+    if a == 'inventory':
+        prods = products(db, user)
+        if p.get('product'):
+            match = next((x for x in prods if _isis_norm(x.get('name', '')) == _isis_norm(p.get('product'))), None)
+            if not match:
+                return f"No encontré el producto {p.get('product')}."
+            return f"{match.get('name')}: quedan {match.get('stock')} {match.get('inventory_unit') or 'unidades'}."
+        low = [x for x in prods if x.get('inventory_enabled') and (x.get('stock') or 0) <= 3]
+        txt = ', '.join(f"{x.get('name')} ({x.get('stock')})" for x in low[:15])
+        return f"Productos con poco inventario: {txt or 'ninguno, todo tiene más de 3'}."
+    if a == 'account_detail':
+        d = account_detail(p.get('account_id'), db, user)
+        label = d.get('table_name') if d.get('table_name') else d.get('name')
+        return (f"Cuenta #{d.get('id')}, mesa {label}: "
+                f"total ${d.get('total')}, pagado ${d.get('paid')}, saldo ${d.get('due')}.")
+    if a == 'open_cash':
+        r = await open_cash(OpenPeriodIn(opening=Decimal(str(p.get('opening')))), db, user)
+        return f"Turno abierto, folio {r.get('id')}, con ${p.get('opening')} de fondo."
+    if a == 'close_cash':
+        r = await close_cash(ClosePeriodIn(counted=Decimal(str(p.get('counted'))), note=str(p.get('note') or '')), db, user)
+        return f"Corte cerrado, folio {r.get('id')} y archivado con su PDF."
+    if a == 'create_table':
+        r = await create_dining_table(DiningTableIn(name=str(p.get('name')), area=str(p.get('area') or 'Salon'), capacity=int(p.get('capacity') or 4)), db, user)
+        return f"Mesa {p.get('name')} creada."
+    if a == 'new_account':
+        r = await new_account(AccountIn(name=None, table_id=int(p.get('table_id')) if p.get('table_id') else None, client_key=secrets.token_urlsafe(16)), db, user)
+        return f"Cuenta abierta en la mesa {p.get('table_name')}, folio {r.get('id')}."
+    if a == 'add_order':
+        items = [OrderLine(product_id=int(i.get('product_id')), qty=int(i.get('qty') or 1)) for i in p.get('items') or []]
+        r = await send_order(int(p.get('account_id')), OrderIn(items=items, client_key=secrets.token_urlsafe(16)), db, user)
+        return f"Comanda enviada, folio {r.get('batch_id')}."
+    if a == 'pay_account':
+        acc = account_detail(int(p.get('account_id')), db, user)
+        # Cobrar exige cuenta en estado pendiente: si sigue abierta, se pide
+        # la cuenta primero, como hace el mesero en la app normal.
+        if acc.get('status') == 'open':
+            await request_bill(int(p.get('account_id')), db, user)
+            acc = account_detail(int(p.get('account_id')), db, user)
+        due = Decimal(str(acc.get('due') or '0'))
+        amt = due if p.get('all') else Decimal(str(p.get('amount')))
+        if amt <= 0 or amt > due:
+            raise HTTPException(409, 'El importe no coincide con el saldo de la cuenta.')
+        lines = [PaymentLine(method=p.get('method'), amount=amt, tip=Decimal('0'))]
+        r = await pay(int(p.get('account_id')), PaymentIn(client_key=secrets.token_urlsafe(16), lines=lines), db, user)
+        return f"Pago registrado. Saldo restante: ${r.get('due')}."
+    if a == 'close_account':
+        await close_account(int(p.get('account_id')), db, user)
+        return f"Cuenta {p.get('account_id')} cerrada y pagada."
+    if a == 'restock':
+        prod = db.get(Product, int(p.get('product_id')))
+        r = await restock(int(p.get('product_id')), RestockIn(delta=int(p.get('qty')), reason=str(p.get('reason') or 'Reposicion por voz'), expected_version=int(prod.version)), db, user)
+        return f"Repuesto. Ahora quedan {r.get('stock')} de {p.get('product')}."
+    if a == 'inventory_adjust':
+        prod = db.get(Product, int(p.get('product_id')))
+        r = await inventory_adjustment(int(p.get('product_id')), InventoryAdjustmentIn(mode=str(p.get('mode') or 'count'), quantity=int(p.get('qty')), reason=str(p.get('reason') or 'Ajuste por voz'), expected_version=int(prod.version)), db, user)
+        return f"Inventario de {p.get('product')} ahora en {r.get('stock')}."
+    if a == 'void_account':
+        await void_account(int(p.get('account_id')), VoidAccountIn(reason=str(p.get('reason') or 'Anulacion por voz')), db, user)
+        return f"Cuenta {p.get('account_id')} anulada."
+    if a == 'cash_movement':
+        r = await movement(MovementIn(kind=str(p.get('kind')), amount=Decimal(str(p.get('amount'))), reason=str(p.get('reason') or 'Movimiento por voz'), client_key=secrets.token_urlsafe(16)), db, user)
+        return f"Movimiento de caja registrado, estado {r.get('status')}."
+    raise HTTPException(400, 'No sé cómo hacer eso en El Mitote.')
+
+class IsisSetupIn(BaseModel):
+    pin: str = Field(min_length=6, max_length=6, pattern=r'^[0-9]{6}$')
+
+@app.post('/api/isis-voice/setup')
+async def isis_voice_setup(data: IsisSetupIn, db: Session = Depends(db_session), user: User = Depends(auth)):
+    """Solo el propietario crea (o cambia el PIN de) el usuario Isis."""
+    allow(user, 'owner')
+    if user.username == 'isis':
+        raise HTTPException(403, 'Isis no puede cambiar su propio PIN')
+    target = db.scalar(select(User).where(User.username == 'isis'))
+    created = False
+    if target is None:
+        target = User(username='isis', display='Isis', role='owner',
+                      password_hash=ph.hash(secrets.token_urlsafe(32)), active=True)
+        db.add(target)
+        db.flush()
+        created = True
+    _set_user_pin(db, target, data.pin)
+    audit(db, user, 'isis.setup', id=target.id, created=created)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, 'Ese PIN ya pertenece a otra persona. Elige uno distinto.')
+    await notify()
+    return {'ok': True, 'created': created, 'username': 'isis', 'display': 'Isis', 'role': 'owner'}
+
+@app.get('/api/isis-voice/status')
+def isis_voice_status(db: Session = Depends(db_session), user: User = Depends(auth)):
+    allow(user, 'owner')
+    exists = db.scalar(select(User).where(User.username == 'isis', User.active.is_(True))) is not None
+    return {'ok': True, 'isis_user_exists': exists, 'fableai_configured': bool(FABLEAI_API_KEY),
+            'voice': 'kokoro-ef-dora', 'mode': 'solo-mitote'}
+
+class IsisChatIn(BaseModel):
+    message: str = Field(min_length=1, max_length=1000)
+    confirm_token: Optional[str] = None
+
+@app.post('/api/isis-voice/chat')
+async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), user: User = Depends(auth)):
+    """Solo Isis (o el propietario, para probar) habla con este cerebro."""
+    if user.username != 'isis' and user.role != 'owner':
+        raise HTTPException(403, 'Este panel de voz es solo para Isis')
+    actor = user.username
+    # Confirmacion de una accion pendiente
+    if data.confirm_token:
+        entry = _ISIS_CONFIRM.pop(data.confirm_token, None)
+        if not entry or entry['expires'] < time.time():
+            return {'ok': True, 'reply': 'Esa confirmación ya venció. Dime de nuevo qué quieres hacer.', 'executed': False}
+        if any(w in _isis_norm(data.message) for w in ('no', 'cancela', 'olvida')):
+            return {'ok': True, 'reply': 'Cancelado, no hice nada.', 'executed': False}
+        try:
+            reply = await _isis_execute(db, user, entry['intent'])
+        except HTTPException as e:
+            return {'ok': True, 'reply': 'No se pudo: ' + str(e.detail), 'executed': False}
+        audit(db, user, 'isis.voice_execute', actor=actor, isis_action=entry['intent'].get('action'))
+        return {'ok': True, 'reply': reply, 'executed': True}
+    # Nueva orden: interprete local primero, IA despues
+    intent = _isis_parse_local(db, user, data.message)
+    if intent is None or intent.get('action') == 'unknown':
+        context = _isis_context(db, user)
+        ai_intent = await asyncio.to_thread(_isis_call_fableai, data.message, context)
+        if ai_intent:
+            intent = ai_intent
+    if intent is None:
+        return {'ok': True, 'reply': 'No te entendí. Pídeme mesas, inventario, ventas, caja o cobrar una cuenta.', 'executed': False}
+    if intent.get('action') == 'unknown':
+        q = intent.get('question') or '¿Me lo repites con más detalle?'
+        return {'ok': True, 'reply': q, 'executed': False}
+    if intent.get('action') not in _WRITE_ACTIONS and intent.get('action') not in {'tables', 'overview', 'cash', 'inventory', 'account_detail'}:
+        return {'ok': True, 'reply': 'Eso no lo hago en El Mitote. Solo mesas, cuentas, inventario, ventas y caja.', 'executed': False}
+    if intent.get('action') in _WRITE_ACTIONS:
+        token = _isis_confirm_token(intent)
+        summary = _isis_describe(intent)
+        audit(db, user, 'isis.voice_propose', actor=actor, isis_action=intent.get('action'))
+        return {'ok': True, 'reply': summary + ' ¿Confirmas?', 'needs_confirmation': True, 'confirm_token': token, 'executed': False}
+    try:
+        reply = await _isis_execute(db, user, intent)
+    except HTTPException as e:
+        return {'ok': True, 'reply': 'No se pudo: ' + str(e.detail), 'executed': False}
+    return {'ok': True, 'reply': reply, 'executed': True}
 
 def owner_account(db,user,account_id,allowed=('open','pending')):
     acc=db.execute(select(Account).where(Account.id==account_id).with_for_update()).scalar_one_or_none()

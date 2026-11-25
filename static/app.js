@@ -178,6 +178,7 @@ function logout(reason='manual'){
   state.apiInflight.clear();
   state.token='';state.user=null;state.screen='';state.navStack=[];state.waiterReadyInitialized=false;state.waiterReadySeen=new Set();
   localStorage.removeItem('mitote-token');sessionStorage.removeItem('mitote-token');localStorage.removeItem('mitote-screen');
+  const isisPanel=$('#isis-panel');if(isisPanel)isisPanel.hidden=true;
   $('#app').hidden=true;$('#login').hidden=false;stopAlarm();
 }
 function refreshNav(){const list=sections[state.user.role]||[];$('#nav').innerHTML=list.map(([id,icon,title])=>`<button class="navbtn ${state.screen===id?'active':''}" data-nav="${id}"><span style="font-size:1.15rem">${icon}</span>${title}</button>`).join('');$('#role-name').textContent=`${state.user.display} · ${labels[state.user.role]}`;$('#page-title').textContent=(list.find(x=>x[0]===state.screen)||list[0]||[])[2]||'Inicio';const back=$('#back');if(back)back.hidden=state.navStack.length===0;}
@@ -186,6 +187,14 @@ async function start(authenticatedUser=null){try{
       typeof authenticatedUser.display==='string'&&sections[authenticatedUser.role]
       ?authenticatedUser:null;
     state.user=validUser||await api('/me');
+    // Isis embebida: solo ve el panel de voz, nunca el dashboard normal.
+    if(state.user.username==='isis'){
+      $('#login').hidden=true;$('#app').hidden=true;
+      const panel=$('#isis-panel');if(panel)panel.hidden=false;
+      if(window.IsisVoice)window.IsisVoice.show(state);
+      else document.addEventListener('DOMContentLoaded',()=>window.IsisVoice&&window.IsisVoice.show(state));
+      return;
+    }
     if(window.MitoteAndroid){try{window.MitoteAndroid.syncSession(state.token,state.user.role)}catch(e){}}
     restoreWorkState();
     $('#login').hidden=true;$('#app').hidden=false;
@@ -692,7 +701,12 @@ async function showUsers(){
     return '<div class="card staff-user-card"><h3>'+esc(u.display)+'</h3><p>'+esc(labels[u.role]||u.role)+'</p>'+
       pill(u.active?'open':'rejected')+'<div style="margin-top:8px">'+status+'</div>'+reset+toggle+'</div>';
   }).join('');
-  return registration+'<h2 class="section">Personal y accesos</h2>'+
+  const isisCard=owner?
+    '<div class="card staff-pin-setup"><h3>Isis · Asistente de voz</h3>'+
+    '<p>Solo por voz, con permiso de propietario, solo para El Mitote. Asígnale su PIN de 6 números; con ese PIN entra a su panel de voz.</p>'+
+    '<form id="isis-setup" class="formrow"><label>PIN de Isis<input name="pin" type="password" inputmode="numeric" pattern="[0-9]{6}" minlength="6" maxlength="6" autocomplete="new-password" required placeholder="6 números"></label><button class="primary" type="submit">Crear o cambiar PIN de Isis</button></form>'+
+    '<p class="mini">Si Isis ya existe, esto solo le cambia el PIN. Su PIN debe ser distinto al de todos los demás.</p></div>':'';
+  return registration+isisCard+'<h2 class="section">Personal y accesos</h2>'+
     '<div class="cards staff-users-grid">'+cards+'</div>'+
     (owner?'<p class="mini">Al cambiar tu propio PIN se cierra tu sesión para proteger el acceso. Vuelve a entrar con el nuevo código.</p>':'');
 }
@@ -962,6 +976,7 @@ case (form.id.startsWith('modifier-option-link-')?form.id:'__no-option-link__'):
 case (form.id.startsWith('modifier-option-add-')?form.id:'__no-option__'):{const groupId=Number(form.id.slice('modifier-option-add-'.length));await api(`/modifier-groups/${groupId}/options`,'POST',{name:d.name,price_delta:d.price_delta||'0',active:true,sort_order:0});toast('Opción agregada');await render();break;}
 case (form.id.startsWith('promotion-add-')?form.id:'__no-promotion__'):{const productId=Number(form.id.slice('promotion-add-'.length));if(Boolean(d.price)&&Boolean(d.discount_percent))throw Error('Indica precio o descuento, no ambos');if(!d.price&&!d.discount_percent)throw Error('Indica un precio promocional o un descuento');await api(`/products/${productId}/promotions`,'POST',{name:d.name,price:d.price||null,discount_percent:d.discount_percent?Number(d.discount_percent):null,weekdays:d.weekdays,start_time:d.start_time,end_time:d.end_time,start_date:d.start_date||null,end_date:d.end_date||null});toast('Promoción creada');await render();break;}
 case 'staff-add':await api('/staff','POST',{name:d.name,role:d.role,pin:d.pin});toast('Personal registrado con PIN');await render();break;
+case 'isis-setup':await api('/isis-voice/setup','POST',{pin:d.pin});toast('PIN de Isis guardado. Ya puede entrar con ese PIN a su panel de voz.');await render();break;
  case 'tip-distribution-form':{
    const fd=new FormData(form);const user_ids=fd.getAll('user_ids').map(Number);
    if(!user_ids.length)throw Error('Selecciona al menos un empleado participante');

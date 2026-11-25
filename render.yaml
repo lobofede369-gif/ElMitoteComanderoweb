@@ -17,6 +17,8 @@ services:
         sync: false
       - key: ADMIN_USERNAME
         value: propietario
+      - key: FABLEAI_API_KEY
+        sync: false
       - key: PYTHON_VERSION
         value: 3.11.11
 databases:
