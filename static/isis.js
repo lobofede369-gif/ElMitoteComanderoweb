@@ -216,15 +216,21 @@
   // del navegador (los archivos del modelo ya están guardados ahí).
   const KOKORO_FLAG = 'isis-kokoro-ready';
 
-  // Saludos de Isis (v5 "persona real"): rotan para no sonar siempre igual.
-  // La hora es la del teléfono, así que "buenas tardes" o "buenas noches"
-  // salen solas. Bloque autocontenido (nada fuera de él se usa aquí).
+  // Saludos de Isis (v5 "persona real", v12 con más variantes): rotan para
+  // no sonar siempre igual. La hora es la del teléfono, así que "buenas
+  // tardes" o "buenas noches" salen solas. Un poco de juego ligero en
+  // algunos; nunca en confirmaciones ni datos. Bloque autocontenido (nada
+  // fuera de él se usa aquí).
   // ISIS_GREETINGS_BEGIN
   const ISIS_GREETINGS = [
     'Hola, Santiago. Buenas {parte}, ¿qué necesitas?',
     'Hola, Santiago, soy Isis. Dime, ¿qué se ofrece?',
     '¿Qué onda, Santiago? Aquí estoy, ¿qué necesitas?',
     'Hola, Santiago. Te escucho, ¿qué hacemos?',
+    'Hola, Santiago. Buenas {parte}, ¿qué se mueve hoy?',
+    'Hola, Santiago, soy Isis. ¿Qué mesa, qué venta, qué pendiente?',
+    '¿Qué tal, Santiago? Aquí ando, ¿qué se ofrece?',
+    'Hola, Santiago. Buenas {parte}, ¿empezamos con las mesas o con la caja?',
   ];
   function isisGreeting(hour) {
     const parte = hour < 12 ? 'días' : hour < 19 ? 'tardes' : 'noches';
@@ -239,6 +245,19 @@
     const orb = $('#isis-orb');
     if (orb) orb.className = 'isis-orb' + (mode ? ' ' + mode : '');
   }
+
+  // Detalle escrito (v12): el análisis largo de una explicación se muestra
+  // en el panel sin hablarse; solo existe cuando el servidor lo manda.
+  // Se limpia con cada respuesta nueva que no trae detalle, para que no
+  // quede colgado el detalle de un turno anterior.
+  // ISIS_DETAIL_BEGIN
+  function setDetail(text) {
+    const el = $('#isis-detail');
+    if (!el) return;
+    if (text) { el.textContent = text; el.hidden = false; }
+    else { el.textContent = ''; el.hidden = true; }
+  }
+  // ISIS_DETAIL_END
 
   // El botón grande es el control de la llamada (Llamar / Colgar) y el
   // botón chico es el silencio. El estado de los botones lo manda inCall.
@@ -1101,6 +1120,7 @@
         : 'No me pude conectar al restaurante, parece que el servidor está dormido o no hay internet. Espérame tantito e inténtalo de nuevo.';
       const rep = $('#isis-reply');
       if (rep) rep.textContent = 'Isis: ' + reply;
+      setDetail('');
       // Si el usuario colgó mientras llegaba la respuesta, ya no se habla.
       await waitForWaitPhrase();
       if (inCall) await speak(reply);
@@ -1117,6 +1137,8 @@
     const reply = data.reply || 'Listo.';
     const rep = $('#isis-reply');
     if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di "sí" para confirmar o "no" para cancelar.)' : '');
+    // v12: el detalle escrito se muestra sin hablarse; sin detalle, se limpia.
+    setDetail(data.detail || '');
     await waitForWaitPhrase();
     if (inCall) await speak(reply);
     busy = false;
@@ -1156,6 +1178,7 @@
       const text = 'Oye, Santiago, te aviso que ' + fresh.join(' ');
       const rep = $('#isis-reply');
       if (rep) rep.textContent = 'Isis: ' + text;
+      setDetail('');
       await speak(text);
     } catch (e) {}
   }
@@ -1362,6 +1385,7 @@
     const greet = isisGreeting(new Date().getHours());
     const rep = $('#isis-reply');
     if (rep) rep.textContent = 'Isis: ' + greet + voiceNote;
+    setDetail('');
     inCall = true;
     muted = false;
     busy = false;
@@ -1446,7 +1470,7 @@
   window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit, startCall, endCall, toggleMute,
     _test: { resolveVoiceEngine, getVoiceEngine: () => voiceEngine, setVoiceEngine,
       resolveOpenAIVoice, getOpenAIVoice, setOpenAIVoice, playVoiceSample, isisTtsText,
-      splitIntoSpeechParts, mergeSpeechParts,
+      splitIntoSpeechParts, mergeSpeechParts, setDetail,
       requestOpenAIPart, makeOpenAIVoicePlayer: makeOpenAIPlayer,
       setOpenaiAvailable: (v) => { openaiTTS = !!v; applyVoiceEngine(); }, speak,
       sendToIsis, setInCall: (v) => { inCall = !!v; } } };
