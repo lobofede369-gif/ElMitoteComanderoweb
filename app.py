@@ -1332,6 +1332,43 @@ def _isis_money_spoken(text):
         return nums[0]
     return _isis_monto_palabras(text)
 
+_DIGIT_WORDS = {'cero': '0', 'uno': '1', 'una': '1', 'un': '1', 'dos': '2', 'tres': '3',
+                'cuatro': '4', 'cinco': '5', 'seis': '6', 'siete': '7', 'ocho': '8',
+                'nueve': '9'}
+_DIGIT_WORD_ALT = r'cero|uno|una|un|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|\d'
+
+def _isis_compact_digits(text):
+    """Junta dígitos dictados de uno en uno (v10.3): '1 0 0 pesos' -> '100 pesos',
+    'uno cero cero' -> '100', 'uno punto dos' -> '1.2'. Pura y testeable.
+    Solo se juntan rachas de 2+ dígitos seguidos, así que 'cinco mil' y
+    'mesa 5' no cambian; tampoco 'dime uno' ni 'un café'."""
+    t = _isis_norm(text)
+
+    def _punto(m):
+        a = _DIGIT_WORDS.get(m.group(1), m.group(1))
+        b = _DIGIT_WORDS.get(m.group(2), m.group(2))
+        return a + '.' + b
+
+    t = re.sub(r'\b(' + _DIGIT_WORD_ALT + r')\s+punto\s+(' + _DIGIT_WORD_ALT + r')\b',
+               _punto, t)
+    t = re.sub(r'\b(\d+)\s+punto\s+(\d+)\b', r'\1.\2', t)
+    toks = t.split(' ')
+    out = []
+    i = 0
+    while i < len(toks):
+        if toks[i] in _DIGIT_WORDS or re.fullmatch(r'\d', toks[i]):
+            j = i
+            digs = []
+            while j < len(toks) and (toks[j] in _DIGIT_WORDS or re.fullmatch(r'\d', toks[j])):
+                digs.append(_DIGIT_WORDS.get(toks[j], toks[j]))
+                j += 1
+            out.append(''.join(digs) if len(digs) >= 2 else toks[i])
+            i = j
+        else:
+            out.append(toks[i])
+            i += 1
+    return ' '.join(out)
+
 def _isis_qty(text):
     m = re.search(r'\b(\d+)\b', text)
     if m:
@@ -3065,19 +3102,143 @@ class IsisTTSIn(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
     voice: Optional[str] = None  # v10.2: probar voces; se valida contra la lista
 
+# Tablas para números a palabras en español (v10.3).
+_UNITS_ES = ['cero', 'uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete',
+             'ocho', 'nueve', 'diez', 'once', 'doce', 'trece', 'catorce', 'quince',
+             'dieciséis', 'diecisiete', 'dieciocho', 'diecinueve']
+_VEINTI_ES = {21: 'veintiuno', 22: 'veintidós', 23: 'veintitrés', 24: 'veinticuatro',
+              25: 'veinticinco', 26: 'veintiséis', 27: 'veintisiete', 28: 'veintiocho',
+              29: 'veintinueve'}
+_TENS_ES = {30: 'treinta', 40: 'cuarenta', 50: 'cincuenta', 60: 'sesenta',
+            70: 'setenta', 80: 'ochenta', 90: 'noventa'}
+_HUNDREDS_ES = {100: 'ciento', 200: 'doscientos', 300: 'trescientos', 400: 'cuatrocientos',
+                500: 'quinientos', 600: 'seiscientos', 700: 'setecientos',
+                800: 'ochocientos', 900: 'novecientos'}
+
+def _isis_num_palabras(n):
+    """Entero a palabras en español (v10.3): 0..999,999,999. Pura y testeable.
+    100 -> 'cien', 250 -> 'doscientos cincuenta', 2026 -> 'dos mil veintiséis',
+    1000000 -> 'un millón'. Devuelve None si no es entero o está fuera de rango."""
+    try:
+        n = int(n)
+    except Exception:
+        return None
+    if n < 0 or n > 999999999:
+        return None
+    if n < 20:
+        return _UNITS_ES[n]
+    if n == 20:
+        return 'veinte'
+    if n < 30:
+        return _VEINTI_ES[n]
+    if n < 100:
+        d, r = divmod(n, 10)
+        w = _TENS_ES[d * 10]
+        return w if r == 0 else w + ' y ' + _UNITS_ES[r]
+    if n < 1000:
+        if n == 100:
+            return 'cien'
+        d, r = divmod(n, 100)
+        w = _HUNDREDS_ES[d * 100]
+        return w if r == 0 else w + ' ' + _isis_num_palabras(r)
+    if n < 1000000:
+        d, r = divmod(n, 1000)
+        w = 'mil' if d == 1 else _isis_num_palabras(d) + ' mil'
+        return w if r == 0 else w + ' ' + _isis_num_palabras(r)
+    d, r = divmod(n, 1000000)
+    w = 'un millón' if d == 1 else _isis_num_palabras(d) + ' millones'
+    return w if r == 0 else w + ' ' + _isis_num_palabras(r)
+
+def _isis_num_palabras_m(n):
+    """Como _isis_num_palabras, pero apocopado antes de un sustantivo
+    masculino ('uno' -> 'un'): 1 -> 'un', 21 -> 'veintiún', 31 -> 'treinta y un'."""
+    w = _isis_num_palabras(n)
+    if w is None:
+        return None
+    if w == 'veintiuno':
+        return 'veintiún'
+    if w.endswith('uno'):
+        w = w[:-3] + 'un'
+    return w
+
 def _isis_tts_text(text):
-    """Copia del texto SOLO para la voz (v10.2): puntuación y caracteres
-    que la voz lee mejor, para que la entonación salga natural. El texto
-    que se muestra en pantalla NO cambia: solo cambia la copia que se
-    manda a OpenAI. Pura y testeable."""
+    """Copia del texto SOLO para la voz (v10.2, números a palabras en v10.3):
+    puntuación, caracteres y NÚMEROS que la voz lee mejor, para que la
+    entonación salga natural y no diga los números dígito por dígito
+    ('1 0 0 pesos' -> 'cien pesos'). El texto que se muestra en pantalla
+    NO cambia: solo cambia la copia que se manda a OpenAI. Pura y testeable.
+    Los códigos (6+ dígitos seguidos que no son dinero) se dejan en dígitos:
+    Isis nunca dice PINs ni claves."""
     t = ' '.join(str(text or '').split())
     t = re.sub(r'\$(\d+)', r'\1 pesos', t)  # "$40" -> "40 pesos"
-    t = re.sub(r'(\d)\s*%', r'\1 por ciento', t)  # "50%" -> "50 por ciento"
     t = t.replace('&', ' y ').replace('+', ' más ').replace('°', ' grados ')
     t = t.replace('#', ' número ').replace('@', ' arroba ')
     t = t.replace('...', '…')
+
+    def _m_money(m):
+        entero = int(m.group(1).replace(',', ''))
+        cents = m.group(2)
+        c = int(cents.ljust(2, '0')) if cents else 0
+        w = _isis_num_palabras_m(entero)
+        if w is None:
+            return m.group(0)
+        if entero >= 1000000:
+            noun = 'de pesos'
+        elif entero == 1 and c == 0:
+            noun = 'peso'
+        else:
+            noun = 'pesos'
+        if c == 0:
+            return w + ' ' + noun
+        cw = _isis_num_palabras_m(c)
+        cnoun = 'centavo' if c == 1 else 'centavos'
+        return w + ' ' + noun + ' con ' + cw + ' ' + cnoun
+
+    def _m_pct(m):
+        num = m.group(1)
+        if '.' in num:
+            ip, fp = num.split('.', 1)
+            iw = _isis_num_palabras(int(ip))
+            fw = ' '.join(_UNITS_ES[int(d)] for d in fp)
+            return iw + ' punto ' + fw + ' por ciento'
+        return _isis_num_palabras(int(num)) + ' por ciento'
+
+    def _m_time(m):
+        h, mm = int(m.group(1)), int(m.group(2))
+        if h > 23 or mm > 59:
+            return m.group(0)
+        hw = _isis_num_palabras(h)
+        if mm == 0:
+            return hw + ' en punto'
+        if mm == 15:
+            return hw + ' y cuarto'
+        if mm == 30:
+            return hw + ' y media'
+        if mm < 30:
+            return hw + ' y ' + _isis_num_palabras(mm)
+        return hw + ' ' + _isis_num_palabras(mm)
+
+    def _m_num(m):
+        raw = m.group(1)
+        digits = raw.replace(',', '')
+        if '.' in digits:
+            ip, fp = digits.split('.', 1)
+            iw = _isis_num_palabras(int(ip)) if ip else None
+            if iw is None:
+                return m.group(0)
+            fw = ' '.join(_UNITS_ES[int(d)] for d in fp)
+            return iw + ' punto ' + fw
+        if len(digits) >= 6:
+            return m.group(0)  # código/ID: se deja en dígitos
+        w = _isis_num_palabras(int(digits))
+        return w if w is not None else m.group(0)
+
+    t = re.sub(r'(\d[\d,]*)(?:\.(\d{1,2}))?\s*pesos?\b', _m_money, t)
+    t = re.sub(r'(\d+(?:\.\d+)?)\s*%', _m_pct, t)
+    t = re.sub(r'\b(\d{1,2}):(\d{2})\b', _m_time, t)
+    t = re.sub(r'(\d[\d,]*(?:\.\d+)?)', _m_num, t)
     # Espacio tras el punto si falta ("Hola.Santiago" -> "Hola. Santiago");
-    # el punto entre dígitos ("1.2", "40.50") no se toca.
+    # el punto entre dígitos ("1.2", "40.50") ya no existe aquí: se volvió palabras.
     t = re.sub(r'([.!?…])(?=[A-Za-zÁÉÍÓÚÜÑáéíóúüñ])', r'\1 ', t)
     t = ' '.join(t.split())
     if t and t[-1] not in '.?!…':
@@ -3157,10 +3318,14 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
     if user.username != 'isis' and user.role != 'owner':
         raise HTTPException(403, 'Este panel de voz es solo para Isis')
     actor = user.username
+    # Números dictados dígito por dígito (v10.3): '1 0 0 pesos' ya llega
+    # como '100 pesos' al parser local, al corte y a Claude; también se
+    # guarda así en el historial, para que el hilo no arrastre los dígitos.
+    message = _isis_compact_digits(data.message)
     # Memoria de conversación (v4): cada intercambio se guarda para que Isis
     # siga el hilo de la llamada; se borra a los 30 min sin uso o al colgar.
     def _record(reply):
-        _isis_history_add(user.id, data.message, reply)
+        _isis_history_add(user.id, message, reply)
     # Confirmacion de una accion pendiente
     if data.confirm_token:
         entry = _ISIS_CONFIRM.pop(data.confirm_token, None)
@@ -3168,7 +3333,7 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
             reply = 'Esa confirmación ya se venció, dime de nuevo qué quieres hacer.'
             _record(reply)
             return {'ok': True, 'reply': reply, 'executed': False}
-        if any(w in _isis_norm(data.message) for w in ('no', 'cancela', 'olvida')):
+        if any(w in _isis_norm(message) for w in ('no', 'cancela', 'olvida')):
             reply = 'Sale, cancelado. No hice nada.'
             _record(reply)
             return {'ok': True, 'reply': reply, 'executed': False}
@@ -3183,7 +3348,7 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         return {'ok': True, 'reply': reply, 'executed': True}
     # Corte guiado (v8): si hay un corte en curso, el mensaje es un paso del flujo.
     if _isis_cash_cut_get(user.id) is not None:
-        res = _isis_cash_cut_step(db, user, data.message)
+        res = _isis_cash_cut_step(db, user, message)
         if res is not None:
             if res.get('needs_confirmation'):
                 audit(db, user, 'isis.voice_propose', actor=actor, isis_action='close_cash')
@@ -3194,13 +3359,13 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
                 out['confirm_token'] = res['confirm_token']
             return out
     # Nueva orden: interprete local primero, IA despues
-    intent = _isis_parse_local(db, user, data.message, history=_isis_history_get(user.id))
+    intent = _isis_parse_local(db, user, message, history=_isis_history_get(user.id))
     if intent is None or intent.get('action') == 'unknown':
         context = _isis_context(db, user)
         hist_txt = _isis_history_text(user.id)
         if hist_txt:
             context += ('\nConversación reciente en esta llamada (para seguir el hilo):\n' + hist_txt)
-        ai_intent = await asyncio.to_thread(_isis_call_fableai, data.message, context)
+        ai_intent = await asyncio.to_thread(_isis_call_fableai, message, context)
         if ai_intent:
             intent = ai_intent
     if intent is None:
