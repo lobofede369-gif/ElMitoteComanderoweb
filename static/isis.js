@@ -115,26 +115,61 @@
     status('Toca el micrófono y habla.', '');
   }
 
+  // El servidor gratis de Render se duerme si nadie lo usa y tarda en
+  // despertar: la primera petición puede fallar aunque internet esté bien.
+  // Por eso, antes de hablar con Isis se despierta el servidor y, si la
+  // petición falla, se reintenta una vez sola.
+  async function wakeServer() {
+    try {
+      const c = new AbortController();
+      const t = setTimeout(() => c.abort(), 8000);
+      await fetch('/api/health', { cache: 'no-store', signal: c.signal });
+      clearTimeout(t);
+    } catch (e) {}
+  }
+
   async function sendToIsis(message) {
     const heard = $('#isis-heard');
     if (heard) heard.textContent = 'Tú: ' + message;
     status('Isis pensando…', 'thinking');
+    await wakeServer();
     let data = {};
+    let r = null;
     try {
-      const r = await fetch('/api/isis-voice/chat', {
+      r = await fetch('/api/isis-voice/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
         body: JSON.stringify({ message, confirm_token: pendingToken || undefined }),
         cache: 'no-store',
       });
-      data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.detail || 'Error del servidor');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
     } catch (e) {
-      const reply = 'No pude conectar con el restaurante. Revisa internet e inténtalo de nuevo.';
+      // Un reintento solo, por si el servidor apenas estaba despertando.
+      status('El servidor se está despertando, reintentando…', 'thinking');
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+      await wakeServer();
+      try {
+        r = await fetch('/api/isis-voice/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+          body: JSON.stringify({ message, confirm_token: pendingToken || undefined }),
+          cache: 'no-store',
+        });
+      } catch (e2) { r = null; }
+    }
+    if (!r || !r.ok) {
+      const reply = (r && (r.status === 401 || r.status === 403))
+        ? 'Tu sesión expiró. Sal y vuelve a entrar con el PIN de Isis.'
+        : 'No pude conectar con el restaurante, parece que el servidor está dormido o sin internet. Espera un momento e inténtalo de nuevo.';
       const rep = $('#isis-reply');
       if (rep) rep.textContent = 'Isis: ' + reply;
       await speak(reply);
       return;
+    }
+    try {
+      data = await r.json();
+    } catch (e) {
+      data = {};
     }
     pendingToken = data.needs_confirmation ? data.confirm_token : null;
     const reply = data.reply || 'Listo.';
