@@ -19,7 +19,9 @@
 #isis-status{color:#cdbfa8;min-height:1.4em;text-align:center;font-size:.9rem}
 #isis-mic{margin-top:22px;background:none;border:1px solid #ffc400;color:#ffc400;border-radius:999px;padding:13px 28px;font-size:.95rem;font-weight:600;letter-spacing:.05em}
 #isis-mic.stop{border-color:#e01e26;color:#e01e26}
-.isis-card{width:100%;max-width:420px;background:none;border:0;padding:0;margin-top:34px;text-align:center}
+.isis-toggle-chat{margin-top:16px;background:none;border:0;color:#cdbfa8;font-size:.8rem;text-decoration:underline;padding:6px 8px}
+.isis-card{width:100%;max-width:420px;background:none;border:0;padding:0;margin-top:24px;text-align:center}
+.isis-card[hidden]{display:none}
 .isis-card h3{display:none}
 #isis-heard{color:#cdbfa8;font-size:.85rem;margin:6px 0;line-height:1.5}
 #isis-reply{color:#fff6e0;font-size:1.05rem;margin:6px 0;line-height:1.6}

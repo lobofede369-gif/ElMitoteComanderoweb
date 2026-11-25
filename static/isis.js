@@ -196,6 +196,13 @@
     if (dl) dl.addEventListener('click', () => loadKokoro());
     const ex = $('#isis-exit');
     if (ex) ex.addEventListener('click', exit);
+    const tg = $('#isis-toggle-chat');
+    if (tg) tg.addEventListener('click', () => {
+      const card = document.querySelector('.isis-card');
+      if (!card) return;
+      card.hidden = !card.hidden;
+      tg.textContent = card.hidden ? 'Ver conversación' : 'Ocultar conversación';
+    });
   });
 
   window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit };
