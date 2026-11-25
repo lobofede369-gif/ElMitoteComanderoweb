@@ -1,5 +1,6 @@
 """Performance regression checks for high-frequency POS read paths."""
 import os
+import re
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -415,7 +416,11 @@ try:
         root = Path(__file__).resolve().parents[1]
         js = (root / "static/app.js").read_text(encoding="utf-8")
         features = (root / "static/features.js").read_text(encoding="utf-8")
-        sw = (root / "static/sw.js").read_text(encoding="utf-8")
+        # P14: static/sw.js ya no existe en disco; /sw.js es una ruta que
+        # genera el SHELL desde index.html en cada petición.
+        sw_resp = client.get("/sw.js")
+        assert sw_resp.status_code == 200, sw_resp.text
+        sw = sw_resp.text
         html = (root / "static/index.html").read_text(encoding="utf-8")
         account_detail = js.split("async function accountDetailHtml", 1)[1].split(
             "async function refreshAccountPanel", 1
@@ -453,10 +458,15 @@ try:
         assert "accountHistoryMarkup(rows)" in js
         assert "prepClockTimer" in features
         assert "document.hidden" in features
-        assert "mitote-comandas-v34" in sw
-        assert "/static/app.js?v=30" in sw and "/static/app.js?v=30" in html
+        # El SHELL generado debe listar exactamente los assets versionados
+        # que pide la página (antes: precache fijo con app.js?v=30, que se
+        # quedaba viejo en cada despliegue) y el caché cambia de nombre
+        # cuando cambia cualquier asset.
+        assert re.search(r"mitote-comandas-[0-9a-f]{12}", sw), sw[:200]
+        versioned = sorted(set(re.findall(r"/static/[^\"'\s]+\?v=\d+", html)))
+        assert versioned, "index.html no referencia assets versionados"
+        assert all(u in sw for u in versioned), [u for u in versioned if u not in sw]
         assert "function setConnectionState(connected)" in js
-        assert "/static/features.js?v=3" in sw and "/static/features.js?v=3" in html
         print("OK: deduplicación GET, historial diferido, cronómetros activos solo en pantalla y caché versionada.")
 
 finally:

@@ -4,7 +4,8 @@ Run: ADMIN_PASSWORD='strong secret' SECRET_KEY='long random string' uvicorn app:
 Do not deploy without PostgreSQL, HTTPS and changing bootstrap credentials.
 """
 import os, json, asyncio, secrets, io, time, logging, hashlib, hmac, unicodedata, re, random
-from urllib.parse import urlparse
+import contextvars
+from urllib.parse import urlparse, parse_qsl
 import urllib.request, urllib.error
 from pywebpush import webpush, WebPushException
 from firebase_admin import credentials, messaging, initialize_app, get_app
@@ -21,6 +22,7 @@ from argon2.exceptions import VerifyMismatchError, VerificationError
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (create_engine, Column, Integer, String, Boolean, ForeignKey,
                         DateTime, Text, LargeBinary, UniqueConstraint, Index, select, func, inspect, or_, text)
@@ -112,6 +114,8 @@ class Setting(Base):
     id=Column(Integer,primary_key=True)
     inventory_on=Column(Boolean,default=False,nullable=False)
     inventory_reviewed=Column(Boolean,default=False,nullable=False)
+    # P15: versión del esquema aplicado por bootstrap() (sin Alembic).
+    schema_version=Column(Integer,default=0,nullable=False)
 
 class Product(Base):
     __tablename__='products'
@@ -483,79 +487,154 @@ class InventoryMovement(Base):
 PERFORMANCE_INDEXES = (
     Index('ix_accounts_owner_created_at', Account.owner_id, Account.created_at),
     Index('ix_accounts_created_at', Account.created_at),
+    # P6: el filtro por periodo NO se aplica (cambia la semántica: una cuenta
+    # reabierta de ayer dejaría de bloquear el cierre de hoy). En su lugar,
+    # este índice evita que las consultas de cuentas bloqueadoras escaneen
+    # toda la historia de cuentas en cada carga de Caja; (status, id) cubre
+    # el conteo y el listado con ORDER BY id LIMIT 50.
+    Index('ix_accounts_status_id', Account.status, Account.id),
     Index('ix_batches_account_id', Batch.account_id),
+    Index('ix_batches_created_at', Batch.created_at),
     Index('ix_order_items_batch_id', OrderItem.batch_id),
     Index('ix_payments_account_id', Payment.account_id),
+    Index('ix_payments_period_id', Payment.period_id),
+    Index('ix_payments_cashier_id', Payment.cashier_id),
+    Index('ix_payment_tips_period_id', PaymentTip.period_id),
+    Index('ix_station_tickets_status_created_at', StationTicket.status, StationTicket.created_at),
+    Index('ix_audit_action_created_at', Audit.action, Audit.created_at),
+    Index('ix_approvals_status', Approval.status),
+    Index('ix_cash_movements_period_id', CashMovement.period_id),
+    Index('ix_allocations_account_id', Allocation.account_id),
+    Index('ix_allocations_order_item_id', Allocation.order_item_id),
+    Index('ix_ready_notification_events_batch_id', ReadyNotificationEvent.batch_id),
+    Index('ix_ready_notification_events_account_id', ReadyNotificationEvent.account_id),
     Index('uq_cash_movements_client_key', CashMovement.client_key, unique=True),
 )
 
 listeners=set()
 login_failures={}
-async def notify():
+async def notify(kind='refresh'):
+    """P16: evento con tipo de cambio. El cliente solo vuelve a cargar la
+    pantalla si el tipo puede cambiar lo que muestra; 'refresh' (o un tipo
+    desconocido) conserva el comportamiento anterior: refresco completo.
+    La cola (maxsize=3, put_nowait) colapsa ráfagas: si ya hay eventos
+    pendientes, los nuevos se descartan y el cliente re-renderiza una vez."""
+    payload=json.dumps({'kind':kind},ensure_ascii=False,separators=(',',':'))
     for q in tuple(listeners):
-        try: q.put_nowait('refresh')
+        try: q.put_nowait(payload)
         except asyncio.QueueFull: pass
 
 def audit(db,user,action,**data):
     db.add(Audit(actor_id=user.id if user else None,action=action,detail=json.dumps(data,ensure_ascii=False)))
 
-def bootstrap():
-    Base.metadata.create_all(engine)
-    # Migración aditiva y compatible con SQLite/PostgreSQL. Los eventos existentes
-    # con acknowledged_at ya representan entregas confirmadas en la UI anterior.
-    with engine.begin() as conn:
-        cash_movement_columns={column['name'] for column in inspect(conn).get_columns('cash_movements')}
-        if 'client_key' not in cash_movement_columns:
-            conn.exec_driver_sql('ALTER TABLE cash_movements ADD COLUMN client_key VARCHAR(100) NULL')
-        product_columns={column['name'] for column in inspect(conn).get_columns('products')}
-        if 'inventory_only' not in product_columns:
-            conn.exec_driver_sql('ALTER TABLE products ADD COLUMN inventory_only BOOLEAN NOT NULL DEFAULT FALSE')
-        if 'inventory_unit' not in product_columns:
-            conn.exec_driver_sql("ALTER TABLE products ADD COLUMN inventory_unit VARCHAR(20) NOT NULL DEFAULT 'unidades'")
-        modifier_columns={column['name'] for column in inspect(conn).get_columns('product_modifier_options')}
-        if 'inventory_product_id' not in modifier_columns:
-            conn.exec_driver_sql("ALTER TABLE product_modifier_options ADD COLUMN inventory_product_id INTEGER NULL REFERENCES products(id)")
-        if 'inventory_quantity' not in modifier_columns:
-            conn.exec_driver_sql("ALTER TABLE product_modifier_options ADD COLUMN inventory_quantity INTEGER NOT NULL DEFAULT 1")
-        columns={column['name'] for column in inspect(conn).get_columns('ready_notification_events')}
-        additions={
-            'provider_accepted_at':'TIMESTAMP WITH TIME ZONE NULL',
-            'attempt_count':'INTEGER NOT NULL DEFAULT 0',
-            'next_attempt_at':'TIMESTAMP WITH TIME ZONE NULL',
-            'last_error':'VARCHAR(240) NULL',
-            'delivered_at':'TIMESTAMP WITH TIME ZONE NULL',
-        }
-        # Esta limpieza solo corresponde a la primera actualización del esquema.
-        # Ejecutarla en cada arranque borraba el estado de entrega de eventos nuevos
-        # y volvía a enviar notificaciones ya aceptadas por FCM/Web Push.
-        legacy_outbox_schema=any(name not in columns for name in additions)
-        for column_name,column_type in additions.items():
-            if column_name not in columns:
-                conn.exec_driver_sql(
-                    f'ALTER TABLE ready_notification_events ADD COLUMN {column_name} {column_type}'
-                )
-        conn.exec_driver_sql(
-            'UPDATE ready_notification_events SET delivered_at=acknowledged_at '
-            'WHERE acknowledged_at IS NOT NULL AND delivered_at IS NULL'
-        )
-        if legacy_outbox_schema:
-            conn.exec_driver_sql(
-                'UPDATE ready_notification_events SET attempt_count=0, next_attempt_at=NULL, '
-                'provider_accepted_at=NULL WHERE acknowledged_at IS NULL AND delivered_at IS NULL'
-            )
+SCHEMA_VERSION = 2  # v2 (P6): ix_accounts_status en PERFORMANCE_INDEXES.
+
+def _ensure_indexes(conn):
+    """Crea los índices que falten sin tocar tablas ni backfills: DDL
+    idempotente, corre en CADA arranque (bootstrap lo llama siempre).
+    create_all no agrega índices a tablas ya creadas y el bloque
+    versionado de P15 solo corre una vez por versión; sin esto, un índice
+    borrado ya no se restauraba (lo cazó test_performance_regressions).
+    bind=conn (no engine): crearlos en otra conexión del pool mientras
+    una transacción tiene el lock de escritura bloquea SQLite."""
     # create_all no agrega índices a tablas ya creadas; checkfirst permite
     # desplegar esta migración de forma idempotente en SQLite y PostgreSQL.
     for performance_index in PERFORMANCE_INDEXES:
-        performance_index.create(bind=engine,checkfirst=True)
+        performance_index.create(bind=conn,checkfirst=True)
+    # Índices de mitote_extensions (sus modelos se importan al final de
+    # app.py, así que no pueden ir en PERFORMANCE_INDEXES): DDL idempotente.
+    for stmt in (
+        'CREATE INDEX IF NOT EXISTS ix_reservations_scheduled_at ON reservations (scheduled_at)',
+        'CREATE INDEX IF NOT EXISTS ix_reservations_status ON reservations (status)',
+        'CREATE INDEX IF NOT EXISTS ix_prep_alerts_created_at ON prep_alerts (created_at)',
+    ):
+        conn.exec_driver_sql(stmt)
     # Índice parcial de expresión constante: evita dos cajas abiertas incluso bajo
     # concurrencia. El DDL es común a SQLite y PostgreSQL.
-    with engine.begin() as conn:
+    conn.exec_driver_sql(
+        'CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_periods_single_open '
+        'ON cash_periods ((1)) WHERE closed_at IS NULL'
+    )
+
+def _bootstrap_migrations(conn):
+    """Bloque DDL + backfills de esquema (P15): corre una sola vez por
+    versión; _bootstrap_schema_version() lo salta en arranques posteriores.
+    Subir SCHEMA_VERSION cuando se añada una migración nueva aquí."""
+    # Migración aditiva y compatible con SQLite/PostgreSQL. Los eventos existentes
+    # con acknowledged_at ya representan entregas confirmadas en la UI anterior.
+    cash_movement_columns={column['name'] for column in inspect(conn).get_columns('cash_movements')}
+    if 'client_key' not in cash_movement_columns:
+        conn.exec_driver_sql('ALTER TABLE cash_movements ADD COLUMN client_key VARCHAR(100) NULL')
+    product_columns={column['name'] for column in inspect(conn).get_columns('products')}
+    if 'inventory_only' not in product_columns:
+        conn.exec_driver_sql('ALTER TABLE products ADD COLUMN inventory_only BOOLEAN NOT NULL DEFAULT FALSE')
+    if 'inventory_unit' not in product_columns:
+        conn.exec_driver_sql("ALTER TABLE products ADD COLUMN inventory_unit VARCHAR(20) NOT NULL DEFAULT 'unidades'")
+    modifier_columns={column['name'] for column in inspect(conn).get_columns('product_modifier_options')}
+    if 'inventory_product_id' not in modifier_columns:
+        conn.exec_driver_sql("ALTER TABLE product_modifier_options ADD COLUMN inventory_product_id INTEGER NULL REFERENCES products(id)")
+    if 'inventory_quantity' not in modifier_columns:
+        conn.exec_driver_sql("ALTER TABLE product_modifier_options ADD COLUMN inventory_quantity INTEGER NOT NULL DEFAULT 1")
+    columns={column['name'] for column in inspect(conn).get_columns('ready_notification_events')}
+    additions={
+        'provider_accepted_at':'TIMESTAMP WITH TIME ZONE NULL',
+        'attempt_count':'INTEGER NOT NULL DEFAULT 0',
+        'next_attempt_at':'TIMESTAMP WITH TIME ZONE NULL',
+        'last_error':'VARCHAR(240) NULL',
+        'delivered_at':'TIMESTAMP WITH TIME ZONE NULL',
+    }
+    # Esta limpieza solo corresponde a la primera actualización del esquema.
+    # Ejecutarla en cada arranque borraba el estado de entrega de eventos nuevos
+    # y volvía a enviar notificaciones ya aceptadas por FCM/Web Push.
+    legacy_outbox_schema=any(name not in columns for name in additions)
+    for column_name,column_type in additions.items():
+        if column_name not in columns:
+            conn.exec_driver_sql(
+                f'ALTER TABLE ready_notification_events ADD COLUMN {column_name} {column_type}'
+            )
+    conn.exec_driver_sql(
+        'UPDATE ready_notification_events SET delivered_at=acknowledged_at '
+        'WHERE acknowledged_at IS NOT NULL AND delivered_at IS NULL'
+    )
+    if legacy_outbox_schema:
         conn.exec_driver_sql(
-            'CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_periods_single_open '
-            'ON cash_periods ((1)) WHERE closed_at IS NULL'
+            'UPDATE ready_notification_events SET attempt_count=0, next_attempt_at=NULL, '
+            'provider_accepted_at=NULL WHERE acknowledged_at IS NULL AND delivered_at IS NULL'
         )
+    # Índices (siempre, no solo en migraciones): _ensure_indexes() corre
+    # en cada arranque desde bootstrap().
+    _ensure_indexes(conn)
+
+def _bootstrap_schema_version():
+    """Asegura settings.schema_version, corre las migraciones si la versión
+    guardada es menor que SCHEMA_VERSION y la deja aplicada. Devuelve True
+    si las migraciones corrieron en este arranque."""
+    with engine.begin() as conn:
+        cols={c['name'] for c in inspect(conn).get_columns('settings')}
+        if 'schema_version' not in cols:
+            conn.exec_driver_sql('ALTER TABLE settings ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 0')
+        version=conn.exec_driver_sql('SELECT schema_version FROM settings WHERE id = 1').scalar()
+        if version is None or version < SCHEMA_VERSION:
+            _bootstrap_migrations(conn)
+            conn.exec_driver_sql(f'UPDATE settings SET schema_version = {SCHEMA_VERSION} WHERE id = 1')
+            return True
+        return False
+
+def bootstrap():
+    Base.metadata.create_all(engine)
+    # P15: migraciones de esquema con versión (sin Alembic): el bloque DDL
+    # + backfills corre una sola vez; en arranques posteriores se salta si
+    # settings.schema_version ya está aplicado.
+    applied_migrations = _bootstrap_schema_version()
+    # Índices en cada arranque (DESPUÉS de las migraciones: algún índice
+    # usa columnas que las migraciones crean, p. ej. client_key). create_all
+    # no agrega índices a tablas ya creadas y el bloque versionado solo
+    # corre una vez; sin esto, un índice borrado ya no se restauraba (lo
+    # cazó test_performance_regressions). DDL idempotente.
+    with engine.begin() as conn:
+        _ensure_indexes(conn)
     with SessionLocal() as db:
-        if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False))
+        if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False,schema_version=SCHEMA_VERSION))
         if not db.scalar(select(User).where(User.role=='owner')):
             db.add(User(username=ADMIN_USERNAME,display='Propietario',role='owner',password_hash=ph.hash(ADMIN_PASSWORD)))
             db.flush()
@@ -574,31 +653,34 @@ def bootstrap():
                 _set_user_pin(db,owner,new_pin)
                 db.add(OwnerRecoveryEvent(fingerprint=fingerprint))
                 audit(db,None,'owner.recovery',owner_id=owner.id)
-        # Conservar los pedidos que ya estaban listos durante el turno abierto
-        # cuando se introduce por primera vez el registro persistente.
-        period = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
-        if period:
-            ready_rows = db.execute(
-                select(StationTicket,Batch,Account).join(Batch,Batch.id==StationTicket.batch_id)
-                .join(Account,Account.id==Batch.account_id)
-                .where(Batch.created_at>=period.opened_at,StationTicket.status=='ready',
-                       Account.status.in_(('open','pending')))
-            ).all()
-            batch_ids = {b.id for _,b,_ in ready_rows}
-            all_tickets = db.scalars(select(StationTicket).where(StationTicket.batch_id.in_(batch_ids))).all() if batch_ids else []
-            by_batch = {}
-            for ticket in all_tickets:
-                by_batch.setdefault(ticket.batch_id,[]).append(ticket)
-            for ticket,batch,account in ready_rows:
-                if db.scalar(select(ReadyNotificationEvent.id).where(ReadyNotificationEvent.ticket_id==ticket.id)):
-                    continue
-                siblings = by_batch[batch.id]
-                complete = all(x.status=='ready' for x in siblings) and ticket.id==max(
-                    siblings,key=lambda x:(x.ready_at or x.created_at or now(),x.id)).id
-                db.add(ReadyNotificationEvent(event_key=f'ready-{ticket.id}',
-                    ticket_id=ticket.id,batch_id=batch.id,account_id=account.id,
-                    waiter_id=account.owner_id,station=ticket.station,complete=complete,
-                    created_at=ticket.ready_at or now(),attempted_at=None,attempt_count=0))
+        # Solo en el arranque que aplica las migraciones: es un backfill
+        # de primera introducción, no algo que deba re-escanearse en cada arranque.
+        if applied_migrations:
+            # Conservar los pedidos que ya estaban listos durante el turno abierto
+            # cuando se introduce por primera vez el registro persistente.
+            period = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+            if period:
+                ready_rows = db.execute(
+                    select(StationTicket,Batch,Account).join(Batch,Batch.id==StationTicket.batch_id)
+                    .join(Account,Account.id==Batch.account_id)
+                    .where(Batch.created_at>=period.opened_at,StationTicket.status=='ready',
+                           Account.status.in_(('open','pending')))
+                ).all()
+                batch_ids = {b.id for _,b,_ in ready_rows}
+                all_tickets = db.scalars(select(StationTicket).where(StationTicket.batch_id.in_(batch_ids))).all() if batch_ids else []
+                by_batch = {}
+                for ticket in all_tickets:
+                    by_batch.setdefault(ticket.batch_id,[]).append(ticket)
+                for ticket,batch,account in ready_rows:
+                    if db.scalar(select(ReadyNotificationEvent.id).where(ReadyNotificationEvent.ticket_id==ticket.id)):
+                        continue
+                    siblings = by_batch[batch.id]
+                    complete = all(x.status=='ready' for x in siblings) and ticket.id==max(
+                        siblings,key=lambda x:(x.ready_at or x.created_at or now(),x.id)).id
+                    db.add(ReadyNotificationEvent(event_key=f'ready-{ticket.id}',
+                        ticket_id=ticket.id,batch_id=batch.id,account_id=account.id,
+                        waiter_id=account.owner_id,station=ticket.station,complete=complete,
+                        created_at=ticket.ready_at or now(),attempted_at=None,attempt_count=0))
         # El Kardex comienza con un saldo inicial verificable para cada producto
         # cuyo control individual está activado. No se inventan ventas históricas.
         tracked_products=db.scalars(select(Product).where(Product.inventory_enabled.is_(True))).all()
@@ -738,8 +820,98 @@ async def lifespan(app):
             task.cancel()
         await asyncio.gather(prep_worker,ready_worker,return_exceptions=True)
 
+class _VersionedStaticFiles(StaticFiles):
+    """Cache-Control: immutable solo para assets con ?v= (P14): el ?v=
+    cambia con cada versión, así que el navegador puede cachearlos un año
+    sin revalidar. Sin ?v= (p. ej. style.css) no se cachea agresivo para
+    no servir CSS viejo tras un despliegue."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        query = scope.get('query_string', b'').decode('latin-1')
+        if any(k == 'v' for k, _ in parse_qsl(query)):
+            response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+        return response
+
+
+# Plantilla del service worker: la lógica es la misma que tenía
+# static/sw.js (install/activate/fetch/push/notificationclick); el CACHE
+# y el SHELL los genera _sw_shell_and_cache() desde index.html (F-02).
+_SW_TEMPLATE = """const CACHE='__CACHE__';const SHELL=__SHELL__;self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)));self.skipWaiting()});self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim()});self.addEventListener('fetch',e=>{const u=new URL(e.request.url);if(e.request.method!=='GET'||u.pathname.startsWith('/api/'))return;e.respondWith(fetch(e.request).then(r=>{if(r.ok&&u.origin===location.origin){const copy=r.clone();caches.open(CACHE).then(c=>c.put(e.request,copy))}return r}).catch(()=>caches.match(e.request)))});
+self.addEventListener('push',event=>{
+  let data={};try{data=event.data?event.data.json():{}}catch{}
+  const title=String(data.title||'El Mitote Comandas').slice(0,100);
+  const body=String(data.body||'Nueva actualización').slice(0,250);
+  const url=typeof data.url==='string'&&data.url.startsWith('/')&&!data.url.startsWith('//')?data.url:'/';
+  event.waitUntil(self.registration.showNotification(title,{
+    body,icon:'/static/assets/icon-192.png',badge:'/static/assets/icon-192.png',
+    tag:String(data.tag||'mitote-notificacion'),renotify:false,requireInteraction:true,
+    data:{url}
+  }));
+});
+self.addEventListener('notificationclick',event=>{
+  event.notification.close();
+  const target=new URL(event.notification.data?.url||'/',self.location.origin).href;
+  event.waitUntil((async()=>{
+    const clientsList=await self.clients.matchAll({type:'window',includeUncontrolled:true});
+    for(const client of clientsList){
+      if(new URL(client.url).origin===self.location.origin){
+        if('navigate' in client)await client.navigate(target);
+        return client.focus();
+      }
+    }
+    return self.clients.openWindow(target);
+  })());
+});
+"""
+
+def _sw_shell_and_cache():
+    """SHELL del service worker generado desde index.html (F-02): la lista
+    es exactamente lo que pide la página, con sus ?v= actuales, y el nombre
+    del caché cambia cuando cambia cualquier asset (mtime+tamaño). Solo
+    entran archivos que existen en disco: un 404 en c.addAll rompería
+    toda la instalación del SW."""
+    html = open('static/index.html', encoding='utf-8').read()
+    urls = []
+    for m in re.finditer(r'''(?:href|src)=["'](/[^"']+)["']''', html):
+        u = m.group(1)
+        if u not in urls:
+            urls.append(u)
+    for extra in ('/static/assets/logo-splash.png', '/static/assets/dashboard-ambiente.jpg',
+                  '/static/assets/icon-192.png', '/static/assets/icon-512.png'):
+        if extra not in urls:
+            urls.append(extra)
+    shell = ['/']
+    parts = []
+    for u in urls:
+        rel = u.split('?', 1)[0].lstrip('/')
+        path = rel if os.path.isfile(rel) else os.path.join('static', rel)
+        if not os.path.isfile(path):
+            continue
+        shell.append(u)
+        st = os.stat(path)
+        parts.append(f'{u}:{st.st_mtime_ns}:{st.st_size}')
+    digest = hashlib.sha256('|'.join(parts).encode()).hexdigest()[:12]
+    return shell, 'mitote-comandas-' + digest
+
+
 app=FastAPI(title='El Mitote Comandas',version='1.0.0',lifespan=lifespan,docs_url=None,redoc_url=None)
-app.mount('/static',StaticFiles(directory='static'),name='static')
+# P14: comprime JS/CSS/HTML/JSON (el middleware excluye text/event-stream,
+# así que el SSE no se toca); solo respuestas de 1 KB o más.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+@app.get('/sw.js')
+def service_worker():
+    """Service worker generado desde index.html (F-02): el SHELL siempre
+    lista exactamente los assets que pide la página y el caché cambia de
+    nombre cuando cambia cualquier asset — nunca más un precache viejo
+    (antes: app.js?v=35 precacheado, la página pedía v=36)."""
+    shell, cache = _sw_shell_and_cache()
+    body = _SW_TEMPLATE.replace('__CACHE__', cache).replace('__SHELL__', json.dumps(shell))
+    return Response(content=body, media_type='application/javascript',
+                    headers={'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/'})
+
+app.mount('/static',_VersionedStaticFiles(directory='static'),name='static')
 
 http_log=logging.getLogger('mitote.http')
 
@@ -768,9 +940,7 @@ async def observe_request_performance(request:Request,call_next):
     return response
 
 @app.get('/')
-def root(): return FileResponse('static/index.html')
-@app.get('/sw.js')
-def sw(): return FileResponse('static/sw.js',media_type='application/javascript')
+def root(): return FileResponse('static/index.html', headers={'Cache-Control': 'no-cache'})
 @app.get('/manifest.webmanifest')
 def manifest(): return FileResponse('static/manifest.webmanifest',media_type='application/manifest+json')
 @app.get('/api/health')
@@ -857,21 +1027,25 @@ OPENAI_TTS_VOICES = frozenset(['coral', 'nova', 'shimmer', 'alloy', 'ash',
 OPENAI_TTS_VOICE = os.getenv('OPENAI_TTS_VOICE', 'coral').strip().lower()
 if OPENAI_TTS_VOICE not in OPENAI_TTS_VOICES:
     OPENAI_TTS_VOICE = 'coral'
-# Velocidad de la voz de paga (v10.2): 0.95 para sonar igual de pausada
-# que Dora; 0.25–4.0 según OpenAI, fuera de rango se ajusta.
+# Velocidad de la voz de paga (v10.2, despierta en v10.5): 1.1 porque a
+# 0.95 la voz sonaba lenta y adormilada en el teléfono; 0.25–4.0 según
+# OpenAI, fuera de rango se ajusta. Si existe el env OPENAI_TTS_SPEED,
+# ese manda.
 def _env_tts_speed():
     try:
-        v = float(os.getenv('OPENAI_TTS_SPEED', '0.95') or '0.95')
+        v = float(os.getenv('OPENAI_TTS_SPEED', '1.1') or '1.1')
     except ValueError:
-        return 0.95
+        return 1.1
     return min(4.0, max(0.25, v))
 OPENAI_TTS_SPEED = _env_tts_speed()
-# Instrucciones de estilo (v10.2): solo gpt-4o-mini-tts las acepta; así
+# Instrucciones de estilo (v10.2, despierta en v10.5): solo gpt-4o-mini-tts las acepta; así
 # Isis suena cálida y natural, como gerente mexicana hablando por
-# teléfono con su jefe, sin sonar robot ni exagerada.
+# teléfono con su jefe, pero despierta y con energía: ritmo ágil y
+# pausas cortas, sin arrastrar las palabras ni sonar robot o exagerada.
 _ISIS_TTS_INSTRUCTIONS_DEFAULT = ('Habla con voz cálida y natural, como la gerente de un restaurante '
-    'mexicano hablando por teléfono con su jefe: cercana, segura y clara, con ritmo tranquilo y '
-    'pausas naturales. Nunca suenes robot ni exagerada.')
+    'mexicano hablando por teléfono con su jefe: cercana, segura y clara, despierta y con energía, '
+    'con ritmo ágil y pausas cortas, sin arrastrar las palabras. Nunca suenes robot, ni lenta, '
+    'ni exagerada.')
 OPENAI_TTS_INSTRUCTIONS = (os.getenv('OPENAI_TTS_INSTRUCTIONS', '') or _ISIS_TTS_INSTRUCTIONS_DEFAULT).strip() or _ISIS_TTS_INSTRUCTIONS_DEFAULT
 OPENAI_TTS_URL = 'https://api.openai.com/v1/audio/speech'
 _ISIS_CONFIRM = {}  # token -> {'intent': dict, 'expires': float}
@@ -942,7 +1116,7 @@ def _isis_cash_state(db):
     Devuelve el periodo abierto, el desglose del esperado y los bloqueos
     con las mismas condiciones que cash()/close_cash: cuentas abiertas o
     por cobrar, movimientos pendientes y reparto de propinas."""
-    p = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    p = _open_period_cached(db)
     if not p:
         return {'open': False}
     totals = {m: 0 for m in ('cash', 'card', 'transfer')}
@@ -1547,9 +1721,47 @@ def _isis_qty_for_product(text, product):
             return v
     return 1
 
+# Memo por llamada de Isis (P2): las listas y agregados caros se cargan una
+# sola vez por request de voz y se reutilizan entre el parser, el contexto
+# y la ejecución. Vive en una ContextVar: cada llamada (tarea asyncio en
+# chat, hilo del threadpool en status) tiene su propio memo, así que nunca
+# hay datos viejos entre llamadas; fuera de una llamada de Isis el memo es
+# None y todo carga fresco como siempre.
+_ISIS_MEMO = contextvars.ContextVar('_isis_memo', default=None)
+
+def _isis_cached(key, loader):
+    """memo[key] si ya se cargó en esta llamada; si no, carga con loader(),
+    lo guarda y lo devuelve. Sin memo activo, carga directo."""
+    memo = _ISIS_MEMO.get()
+    if memo is None:
+        return loader()
+    if key not in memo:
+        memo[key] = loader()
+    return memo[key]
+
+def _isis_analytics_cached(db, user, start, end, scope):
+    """owner_analytics con memo por llamada (misma fecha/alcance = 1 query)."""
+    return _isis_cached(('analytics', str(start), str(end), scope),
+                        lambda: mitote_extensions.owner_analytics(
+                            start=start, end=end, scope=scope, db=db, user=user))
+
+def _isis_pending_approvals(db):
+    """Autorizaciones pendientes, con memo por llamada."""
+    return _isis_cached('approvals_pending',
+                        lambda: db.scalars(select(Approval).where(Approval.status == 'pending')).all())
+
+def _open_period_cached(db):
+    """Turno abierto con memo por llamada de Isis (P13): el mismo turno
+    se consultaba hasta 9 veces en un solo chat (cuentas, comandas, caja,
+    resumen y analytics lo leen cada uno por su lado). Fuera de Isis el
+    memo es None y la consulta es fresca como siempre; los cierres y
+    cobros siguen usando active_period() con bloqueo, sin memo."""
+    return _isis_cached('open_period', lambda: db.scalar(
+        select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc())))
+
 def _isis_find_table(db, user, text):
     try:
-        tables = dining_tables(db, user)
+        tables = _isis_cached('tables', lambda: dining_tables(db, user))
     except Exception:
         return None
     want = _isis_norm(_isis_table_name(text) or '')
@@ -1565,7 +1777,7 @@ def _isis_find_table(db, user, text):
 
 def _isis_find_account(db, user, text):
     try:
-        accs = accounts(db, user)
+        accs = _isis_cached('accounts', lambda: accounts(db, user))
     except Exception:
         return None
     m = re.search(r'cuenta\s*#?\s*(\d+)', text)
@@ -1604,8 +1816,8 @@ def _isis_find_account_by_client(db, user, text):
     'la cuenta de Juanita', 'cobra a Juanita'. Devuelve (cuenta|None,
     [coincidencias] si hay más de una). Nunca adivina entre dos."""
     try:
-        accs = [x for x in accounts(db, user) if x.get('status') in ('open', 'pending')]
-        table_names = {_isis_norm(t.get('name', '')) for t in dining_tables(db, user)}
+        accs = [x for x in _isis_cached('accounts', lambda: accounts(db, user)) if x.get('status') in ('open', 'pending')]
+        table_names = {_isis_norm(t.get('name', '')) for t in _isis_cached('tables', lambda: dining_tables(db, user))}
     except Exception:
         return None, []
     norm = _isis_norm(text)
@@ -1657,7 +1869,7 @@ def _isis_describe_account(p):
 
 def _isis_find_product(db, user, text):
     try:
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
     except Exception:
         return None
     norm = _isis_norm(text)
@@ -1700,7 +1912,7 @@ def _isis_find_products_by_token(db, user, text):
     Las palabras de número (dos, tres...) no puntúan: son cantidades.
     Devuelve los empatados con la mejor puntuación."""
     try:
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
     except Exception:
         return []
     norm = _isis_strip_mesa(_isis_norm(text))
@@ -1765,7 +1977,7 @@ def _isis_find_closed_account(db, user, text):
     if m:
         a = db.get(Account, int(m.group(1)))
         if a and a.status == 'paid':
-            t = next((x for x in dining_tables(db, user)
+            t = next((x for x in _isis_cached('tables', lambda: dining_tables(db, user))
                       if _isis_norm(x.get('name', '')) == _isis_norm(a.name)), None)
             return account_dict(db, a), t
         return None, None
@@ -1774,7 +1986,7 @@ def _isis_find_closed_account(db, user, text):
         # Por nombre de cliente: "reabre la cuenta de Juanita".
         for a in db.scalars(select(Account).where(Account.status == 'paid').order_by(Account.id.desc())).all():
             if _isis_norm(a.name) and _isis_norm(a.name) in _isis_norm(text):
-                tt = next((x for x in dining_tables(db, user)
+                tt = next((x for x in _isis_cached('tables', lambda: dining_tables(db, user))
                            if _isis_norm(x.get('name', '')) == _isis_norm(a.name)), None)
                 return account_dict(db, a), tt
         return None, None
@@ -2091,8 +2303,8 @@ def _isis_parse_client_question(text):
 def _isis_day_summary(db, user):
     """Resumen del día para que Isis responda con contexto (v2)."""
     try:
-        o = overview(db, user)
-        c = cash(db, user)
+        o = _isis_cached('overview', lambda: overview(db, user))
+        c = _isis_cached('cash', lambda: cash(db, user))
         if not c.get('open'):
             return (f"Hoy: {_isis_n(o.get('active_accounts', 0), 'cuenta activa', 'cuentas activas')}, "
                     f"{_isis_n(o.get('products', 0), 'producto', 'productos')} en el menú. No hay turno de caja abierto.")
@@ -2105,7 +2317,7 @@ def _isis_day_summary(db, user):
 
 def _isis_find_user(db, user, text, role=None):
     try:
-        rows = users(db, user)
+        rows = _isis_cached('users', lambda: users(db, user))
     except Exception:
         return None
     norm = _isis_norm(text)
@@ -2119,7 +2331,7 @@ def _isis_find_user(db, user, text, role=None):
 
 def _isis_find_ticket(db, user, text, station=None):
     try:
-        rows = tickets(db, user)
+        rows = _isis_cached('tickets', lambda: tickets(db, user))
     except Exception:
         return None
     m = re.search(r'(?:comanda|ticket)\s*#?\s*(\d+)', text)
@@ -2136,7 +2348,7 @@ def _isis_find_ticket(db, user, text, station=None):
 
 def _isis_find_reservation(db, user, text):
     try:
-        rows = mitote_extensions.reservations(db, user)
+        rows = _isis_cached('reservations', lambda: mitote_extensions.reservations(db, user))
     except Exception:
         return None
     norm = _isis_norm(text)
@@ -2247,7 +2459,7 @@ def _isis_resolve_followup(db, user, text, history):
     if not fam:
         return None
     try:
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
     except Exception:
         return None
     best = None
@@ -2898,7 +3110,7 @@ def _isis_sales_context(db, user):
     parts = []
     try:
         today = datetime.now(timezone.utc).date()
-        d = mitote_extensions.owner_analytics(start=today, end=today, scope='current', db=db, user=user)
+        d = _isis_analytics_cached(db, user, today, today, 'current')
         top = d.get('products') or []
         top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in top[:3]) or 'nada todavía'
         parts.append(f"Ventas de hoy: {d.get('sales')} pesos en {_isis_n(d.get('paid_accounts'), 'cuenta pagada', 'cuentas pagadas')}, "
@@ -2906,7 +3118,7 @@ def _isis_sales_context(db, user):
     except Exception:
         parts.append('Ventas de hoy: no disponible.')
     try:
-        c = cash(db, user)
+        c = _isis_cached('cash', lambda: cash(db, user))
         if c.get('open'):
             parts.append(f"Caja abierta, efectivo esperado {c.get('expected')} pesos (efectivo {c.get('cash')} pesos, "
                          f"tarjeta {c.get('card')} pesos, transferencia {c.get('transfer')} pesos).")
@@ -2915,7 +3127,7 @@ def _isis_sales_context(db, user):
     except Exception:
         parts.append('Caja: no disponible.')
     try:
-        accs = accounts(db, user)
+        accs = _isis_cached('accounts', lambda: accounts(db, user))
         pend = [x for x in accs if x.get('status') in ('open', 'pending')]
         total = sum(float(x.get('due') or 0) for x in pend)
         parts.append(f"Cuentas pendientes de cobro: {len(pend)}, total por cobrar {total:.2f} pesos.")
@@ -2948,7 +3160,7 @@ def _isis_sold_today(db, user):
     try:
         local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
         today = datetime.now(local_tz).date()
-        d = mitote_extensions.owner_analytics(start=today, end=today, scope='history', db=db, user=user)
+        d = _isis_analytics_cached(db, user, today, today, 'history')
         return d.get('products') or []
     except Exception:
         return []
@@ -2963,7 +3175,7 @@ def _isis_week_trend(db, user):
     local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
     today = datetime.now(local_tz).date()
     start = today - timedelta(days=6)
-    d = mitote_extensions.owner_analytics(start=start, end=today, scope='history', db=db, user=user)
+    d = _isis_analytics_cached(db, user, start, today, 'history')
     totals = []
     for row in (d.get('sales_by_day') or []):
         try:
@@ -2976,8 +3188,7 @@ def _isis_week_trend(db, user):
     total_week = sum(v for _, v in totals)
     best_day, best_val = max(totals, key=lambda x: x[1])
     per_day = ', '.join(f"{_DIAS_SEMANA[day.weekday()]} {v:.0f}" for day, v in totals)
-    d_prev = mitote_extensions.owner_analytics(start=start - timedelta(days=7), end=today - timedelta(days=7),
-                                               scope='history', db=db, user=user)
+    d_prev = _isis_analytics_cached(db, user, start - timedelta(days=7), today - timedelta(days=7), 'history')
     prev_total = sum(float(r.get('amount') or 0) for r in (d_prev.get('sales_by_day') or []))
     if prev_total > 0:
         diff = total_week - prev_total
@@ -3005,7 +3216,7 @@ def _isis_morning_brief(db, user):
     try:
         local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
         yday = datetime.now(local_tz).date() - timedelta(days=1)
-        d = mitote_extensions.owner_analytics(start=yday, end=yday, scope='history', db=db, user=user)
+        d = _isis_analytics_cached(db, user, yday, yday, 'history')
         sales = float(d.get('sales') or 0)
         paid = int(d.get('paid_accounts') or 0)
         top = [x.get('name') for x in (d.get('products') or [])[:3] if x.get('name')]
@@ -3019,7 +3230,7 @@ def _isis_morning_brief(db, user):
     except Exception:
         parts.append('No pude ver cómo cerró ayer.')
     try:
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
         out = [p.get('name') for p in prods
                if p.get('inventory_enabled') and p.get('id') in sold_ids
                and p.get('stock') is not None and float(p.get('stock') or 0) <= 0]
@@ -3044,15 +3255,15 @@ def _isis_decision_context(db, user):
     Cada sección con su propio try/except: un fallo no rompe el contexto."""
     parts = []
     try:
-        trend = _isis_week_trend(db, user)
+        trend = _isis_cached('week_trend', lambda: _isis_week_trend(db, user))
         parts.append(trend if trend else 'Tendencia de la semana: no disponible.')
     except Exception:
         parts.append('Tendencia de la semana: no disponible.')
     try:
         local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
         today = datetime.now(local_tz).date()
-        d_today = mitote_extensions.owner_analytics(start=today, end=today, scope='history', db=db, user=user)
-        d_yday = mitote_extensions.owner_analytics(start=today - timedelta(days=1), end=today - timedelta(days=1), scope='history', db=db, user=user)
+        d_today = _isis_analytics_cached(db, user, today, today, 'history')
+        d_yday = _isis_analytics_cached(db, user, today - timedelta(days=1), today - timedelta(days=1), 'history')
         s_t = float(d_today.get('sales') or 0)
         s_y = float(d_yday.get('sales') or 0)
         diff = s_t - s_y
@@ -3065,8 +3276,10 @@ def _isis_decision_context(db, user):
         parts.append(f"Ventas: hoy {s_t:.2f} pesos en {_isis_n(d_today.get('paid_accounts'), 'cuenta pagada', 'cuentas pagadas')}, ayer {s_y:.2f} pesos. Hoy va {comp}.")
     except Exception:
         parts.append('Ventas hoy vs ayer: no disponible.')
+    sold_today = []
     try:
-        sold = _isis_sold_today(db, user)
+        sold_today = _isis_sold_today(db, user)
+        sold = sold_today
         if sold:
             top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in sold[:3])
             bottom = sold[-3:] if len(sold) > 3 else []
@@ -3077,9 +3290,9 @@ def _isis_decision_context(db, user):
     except Exception:
         parts.append('Más/menos vendidos: no disponible.')
     try:
-        sold = _isis_sold_today(db, user)
+        sold = sold_today
         sold_ids = {x.get('product_id') for x in sold}
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
         low = [p for p in prods if p.get('inventory_enabled') and p.get('id') in sold_ids
                and p.get('stock') is not None and float(p.get('stock') or 0) <= _ISIS_LOW_STOCK]
         if low:
@@ -3089,7 +3302,7 @@ def _isis_decision_context(db, user):
     except Exception:
         parts.append('Productos por acabarse: no disponible.')
     try:
-        accs = accounts(db, user)
+        accs = _isis_cached('accounts', lambda: accounts(db, user))
         now = datetime.now(timezone.utc)
         old = []
         for a in accs:
@@ -3105,14 +3318,14 @@ def _isis_decision_context(db, user):
     except Exception:
         parts.append('Cuentas viejas: no disponible.')
     try:
-        tables = dining_tables(db, user)
+        tables = _isis_cached('tables', lambda: dining_tables(db, user))
         free = sum(1 for t in tables if t.get('status') == 'available' and t.get('active'))
         occ = sum(1 for t in tables if t.get('status') == 'occupied' and t.get('active'))
         parts.append(f"Mesas: {free} libres, {occ} ocupadas.")
     except Exception:
         parts.append('Mesas libres/ocupadas: no disponible.')
     try:
-        pend = db.scalars(select(Approval).where(Approval.status == 'pending')).all()
+        pend = _isis_pending_approvals(db)
         if pend:
             parts.append('Autorizaciones pendientes: ' + ', '.join(f"#{a.id} {a.kind} (cuenta {a.account_id})" for a in pend[:5]) + '.')
         else:
@@ -3120,7 +3333,7 @@ def _isis_decision_context(db, user):
     except Exception:
         parts.append('Autorizaciones pendientes: no disponible.')
     try:
-        rows = mitote_extensions.reservations(db, user)
+        rows = _isis_cached('reservations', lambda: mitote_extensions.reservations(db, user))
         local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
         today_local = datetime.now(local_tz).date()
         pend_res = [r for r in rows if r.get('status') in ('pending', 'confirmed')
@@ -3142,7 +3355,7 @@ def _isis_day_close(db, user):
     local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
     today = datetime.now(local_tz).date()
     try:
-        d = mitote_extensions.owner_analytics(start=today, end=today, scope='history', db=db, user=user)
+        d = _isis_analytics_cached(db, user, today, today, 'history')
     except Exception:
         d = {}
     sales = float(d.get('sales') or 0)
@@ -3167,13 +3380,13 @@ def _isis_day_close(db, user):
     except Exception:
         best = None
     try:
-        accs = accounts(db, user)
+        accs = _isis_cached('accounts', lambda: accounts(db, user))
         pend = [x for x in accs if x.get('status') in ('open', 'pending')]
         due = sum(float(x.get('due') or 0) for x in pend)
     except Exception:
         pend, due = [], 0
     try:
-        c = cash(db, user)
+        c = _isis_cached('cash', lambda: cash(db, user))
         cash_txt = (f"En caja deberían haber {_isis_pesos(c.get('expected'))}."
                     if c.get('open') else "La caja está cerrada.")
     except Exception:
@@ -3204,7 +3417,7 @@ def _isis_shopping_list(db, user):
     vendió hoy de cada uno. Solo datos: producto, cuánto queda y cuánto se
     vendió hoy. Nunca inventa cantidades sugeridas."""
     try:
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
         low = [x for x in prods if x.get('inventory_enabled') and (x.get('stock') or 0) <= 3]
     except Exception:
         return 'No pude revisar el inventario.'
@@ -3270,7 +3483,7 @@ def _isis_shift_handover(db, user):
     día hasta ahora. Solo datos reales."""
     parts = []
     try:
-        accs = accounts(db, user)
+        accs = _isis_cached('accounts', lambda: accounts(db, user))
         pend = [x for x in accs if x.get('status') in ('open', 'pending')]
         if pend:
             items = []
@@ -3288,7 +3501,7 @@ def _isis_shift_handover(db, user):
         parts.append('Cuentas abiertas: no disponible.')
     try:
         pend_ap = [r for r in requests(db, user) if r.get('status') == 'pending']
-        rows = mitote_extensions.reservations(db, user)
+        rows = _isis_cached('reservations', lambda: mitote_extensions.reservations(db, user))
         local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
         today_local = datetime.now(local_tz).date()
         pend_res = [r for r in rows if r.get('status') in ('pending', 'confirmed')
@@ -3303,7 +3516,7 @@ def _isis_shift_handover(db, user):
     except Exception:
         parts.append('Pendientes: no disponible.')
     try:
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
         low = [x for x in prods if x.get('inventory_enabled') and (x.get('stock') or 0) <= 3]
         if low:
             parts.append('Stock bajo: ' + _isis_short_list(
@@ -3313,7 +3526,7 @@ def _isis_shift_handover(db, user):
     except Exception:
         parts.append('Stock: no disponible.')
     try:
-        c = cash(db, user)
+        c = _isis_cached('cash', lambda: cash(db, user))
         if c.get('open'):
             parts.append(f"Caja abierta, en caja deberían haber {_isis_pesos(c.get('expected'))}.")
         else:
@@ -3323,7 +3536,7 @@ def _isis_shift_handover(db, user):
     try:
         local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
         today = datetime.now(local_tz).date()
-        d = mitote_extensions.owner_analytics(start=today, end=today, scope='history', db=db, user=user)
+        d = _isis_analytics_cached(db, user, today, today, 'history')
         sales = float(d.get('sales') or 0)
         paid = int(d.get('paid_accounts') or 0)
         if sales > 0 or paid > 0:
@@ -3339,13 +3552,13 @@ def _isis_alerts(db, user):
     """Hasta 3 alertas cortas de lo que necesita atención AHORA (v4). Solo lectura."""
     alerts = []
     try:
-        c = cash(db, user)
+        c = _isis_cached('cash', lambda: cash(db, user))
         if not c.get('open'):
             alerts.append('La caja todavía no está abierta.')
     except Exception:
         pass
     try:
-        accs = accounts(db, user)
+        accs = _isis_cached('accounts', lambda: accounts(db, user))
         now = datetime.now(timezone.utc)
         for a in accs:
             if a.get('status') not in ('open', 'pending'):
@@ -3362,7 +3575,7 @@ def _isis_alerts(db, user):
         # v11: reservaciones próximas (en los próximos 60 minutos). Van
         # antes que el stock bajo: hay que preparar la mesa. Como mucho 2,
         # para que un solo tipo no se coma las 3 alertas.
-        rows = mitote_extensions.reservations(db, user)
+        rows = _isis_cached('reservations', lambda: mitote_extensions.reservations(db, user))
         local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
         now_local = datetime.now(local_tz)
         upcoming = []
@@ -3389,14 +3602,14 @@ def _isis_alerts(db, user):
     try:
         sold = _isis_sold_today(db, user)
         sold_ids = {x.get('product_id') for x in sold}
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
         for p in prods:
             if p.get('inventory_enabled') and p.get('id') in sold_ids and p.get('stock') is not None and float(p.get('stock') or 0) <= _ISIS_LOW_STOCK:
                 alerts.append(f"{p.get('name')} se está vendiendo y solo quedan {p.get('stock')}.")
     except Exception:
         pass
     try:
-        pend = db.scalars(select(Approval).where(Approval.status == 'pending')).all()
+        pend = _isis_pending_approvals(db)
         if pend:
             alerts.append(f"Hay {len(pend)} {'autorización' if len(pend) == 1 else 'autorizaciones'} pendientes.")
     except Exception:
@@ -3406,23 +3619,23 @@ def _isis_alerts(db, user):
 
 def _isis_context(db, user):
     try:
-        tables = dining_tables(db, user)
+        tables = _isis_cached('tables', lambda: dining_tables(db, user))
         t_txt = ', '.join(f"{t.get('name')} ({t.get('status')})" for t in tables[:20])
     except Exception:
         t_txt = 'no disponible'
     try:
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
         p_txt = ', '.join(f"{p.get('name')} (stock {p.get('stock')})" for p in prods if p.get('inventory_enabled'))[:1500]
     except Exception:
         p_txt = 'no disponible'
     try:
-        accs = accounts(db, user)
+        accs = _isis_cached('accounts', lambda: accounts(db, user))
         a_txt = ', '.join(f"#{a.get('id')} {a.get('name')} mesa {a.get('table_name')} debe {a.get('due')} pesos" for a in accs if a.get('status') in ('open', 'pending'))[:1500]
     except Exception:
         a_txt = 'no disponible'
     # Memoria que le dictaron + resumen del día, para que responda con contexto (v2).
     try:
-        mems = _isis_memory_all(db)
+        mems = _isis_cached('memory', lambda: _isis_memory_all(db))
         m_txt = '; '.join(f"{k}: {v}" for k, v in mems) if mems else 'ninguna'
     except Exception:
         m_txt = 'no disponible'
@@ -3597,29 +3810,29 @@ async def _isis_execute(db, user, intent):
     """Ejecuta un intent reutilizando las funciones reales de la app."""
     a, p = intent.get('action'), intent.get('params') or {}
     if a == 'tables':
-        rows = dining_tables(db, user)
+        rows = _isis_cached('tables', lambda: dining_tables(db, user))
         free = [t.get('name') for t in rows if t.get('status') == 'available']
         busy = [t.get('name') for t in rows if t.get('status') == 'occupied']
         free_txt = _isis_short_list(free, len(free)) if free else 'ninguna.'
         busy_txt = _isis_short_list(busy, len(busy)) if busy else 'ninguna.'
         return f"Mira, libres: {free_txt} Ocupadas: {busy_txt}"
     if a == 'overview':
-        o = overview(db, user)
-        c = cash(db, user)
+        o = _isis_cached('overview', lambda: overview(db, user))
+        c = _isis_cached('cash', lambda: cash(db, user))
         if not c.get('open'):
             return f"Hay {_isis_n(o.get('active_accounts', 0), 'cuenta activa', 'cuentas activas')} y {_isis_n(o.get('products', 0), 'producto', 'productos')} en el menú. La caja todavía no está abierta."
         return (f"Hay {_isis_n(o.get('active_accounts', 0), 'cuenta activa', 'cuentas activas')}. Del turno: {_isis_pesos(c.get('cash'))} en efectivo, "
                 f"{_isis_pesos(c.get('card'))} con tarjeta y {_isis_pesos(c.get('transfer'))} por transferencia. "
                 f"En caja deberían haber {_isis_pesos(c.get('expected'))}.")
     if a == 'cash':
-        c = cash(db, user)
+        c = _isis_cached('cash', lambda: cash(db, user))
         if not c.get('open'):
             return "La caja todavía no está abierta."
         return (f"La caja está abierta. Llevamos {_isis_pesos(c.get('cash'))} en efectivo, {_isis_pesos(c.get('card'))} con tarjeta, "
                 f"{_isis_pesos(c.get('transfer'))} por transferencia y {_isis_pesos(c.get('tips'))} de propinas. "
                 f"En caja deberían haber {_isis_pesos(c.get('expected'))}.")
     if a == 'inventory':
-        prods = products(db, user)
+        prods = _isis_cached('products', lambda: products(db, user))
         if p.get('product'):
             match = next((x for x in prods if _isis_norm(x.get('name', '')) == _isis_norm(p.get('product'))), None)
             if not match:
@@ -3792,7 +4005,7 @@ async def _isis_execute(db, user, intent):
         return _isis_say(f"Listo, borré: {txt}", warm=True)
     # --- v2: 1. Cuentas ---
     if a == 'accounts_list':
-        rows = [x for x in accounts(db, user) if x.get('status') in ('open', 'pending')]
+        rows = [x for x in _isis_cached('accounts', lambda: accounts(db, user)) if x.get('status') in ('open', 'pending')]
         if not rows:
             return "No hay cuentas abiertas ahorita. Todo tranquilo."
         txt = _isis_short_list([f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe {_isis_pesos(x.get('due'))}" for x in rows], len(rows))
@@ -3831,14 +4044,14 @@ async def _isis_execute(db, user, intent):
         return _isis_say(f"Listo, a {p.get('employee')} ya le pagué sus {_isis_pesos(p.get('amount'))} de propina {metodo}.{extra}", warm=True)
     # --- v2: 2. Mesas ---
     if a == 'update_table':
-        cur = next((t for t in dining_tables(db, user) if t.get('id') == int(p.get('table_id'))), None)
+        cur = next((t for t in _isis_cached('tables', lambda: dining_tables(db, user)) if t.get('id') == int(p.get('table_id'))), None)
         if not cur:
             raise HTTPException(404, 'Mesa no encontrada')
         await update_dining_table(int(p.get('table_id')), DiningTableIn(name=cur.get('name'), area=cur.get('area') or 'Salón', capacity=int(p.get('capacity')), active=True, sort_order=int(cur.get('sort_order') or 0)), db, user)
         return _isis_say(f"La {_isis_mesa_txt(p.get('table_name'))} ahora es para {p.get('capacity')} personas.", warm=True)
     # --- v2: 3. Estaciones ---
     if a == 'tickets_list':
-        rows = tickets(db, user)
+        rows = _isis_cached('tickets', lambda: tickets(db, user))
         if p.get('station'):
             rows = [t for t in rows if t.get('station') == p.get('station')]
         if not rows:
@@ -3871,13 +4084,13 @@ async def _isis_execute(db, user, intent):
         return _isis_say(f"Los últimos cortes: {txt}.", warm=True)
     # --- v2: 6. Menú ---
     if a == 'menu_list':
-        rows = [x for x in products(db, user) if not x.get('inventory_only') and x.get('active')]
+        rows = [x for x in _isis_cached('products', lambda: products(db, user)) if not x.get('inventory_only') and x.get('active')]
         if not rows:
             return "El menú está vacío. ¿Agrego el primer producto?"
         txt = _isis_short_list([f"{x.get('name')}, {_isis_pesos(x.get('current_price') or x.get('price'))}" for x in rows], len(rows))
         return _isis_say(f"Mira, en el menú hay {_isis_n(len(rows), 'producto', 'productos')}: {txt}", warm=True)
     if a == 'product_price':
-        rows = products(db, user)
+        rows = _isis_cached('products', lambda: products(db, user))
         prod = next((x for x in rows if str(x.get('id')) == str(p.get('product_id'))), None)
         if not prod and p.get('product'):
             prod = _isis_find_product(db, user, str(p.get('product')))
@@ -3978,7 +4191,7 @@ async def _isis_execute(db, user, intent):
         return _isis_say(f"Últimos movimientos: {txt}", warm=True)
     # --- v2: 12. Reservaciones ---
     if a == 'reservations_list':
-        rows = [r for r in mitote_extensions.reservations(db, user) if r.get('status') in ('pending', 'confirmed')]
+        rows = [r for r in _isis_cached('reservations', lambda: mitote_extensions.reservations(db, user)) if r.get('status') in ('pending', 'confirmed')]
         if not rows:
             return "No hay reservaciones pendientes ni confirmadas."
         txt = _isis_short_list([f"{r.get('name')} ({_isis_n(r.get('party_size'), 'persona', 'personas')}, {r.get('status')})" for r in rows], len(rows))
@@ -4039,7 +4252,7 @@ async def _isis_execute(db, user, intent):
         else:
             start = end = today
             label, scope = 'Hoy', 'current'
-        d = mitote_extensions.owner_analytics(start=start, end=end, scope=scope, db=db, user=user)
+        d = _isis_analytics_cached(db, user, start, end, scope)
         top = d.get('products') or []
         top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in top[:3])
         prep = d.get('prep_avg_minutes')
@@ -4060,23 +4273,27 @@ async def isis_voice_setup(data: IsisSetupIn, db: Session = Depends(db_session),
     created = False
     if target is None:
         target = User(username='isis', display='Isis', role='owner',
-                      password_hash=ph.hash(secrets.token_urlsafe(32)), active=True)
+                      password_hash=await asyncio.to_thread(ph.hash, secrets.token_urlsafe(32)), active=True)
         db.add(target)
         db.flush()
         created = True
-    _set_user_pin(db, target, data.pin)
+    await _set_user_pin_async(db, target, data.pin)
     audit(db, user, 'isis.setup', id=target.id, created=created)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'Ese PIN ya pertenece a otra persona. Elige uno distinto.')
-    await notify()
+    await notify('users')
     return {'ok': True, 'created': created, 'username': 'isis', 'display': 'Isis', 'role': 'owner'}
 
 @app.get('/api/isis-voice/status')
 def isis_voice_status(db: Session = Depends(db_session), user: User = Depends(auth)):
     allow(user, 'owner')
+    # P2: memo por llamada — alertas y resumen comparten las listas y
+    # agregados en vez de cargarlos dos veces. La ContextVar vive solo en
+    # esta request, así que nunca sirve datos viejos.
+    _ISIS_MEMO.set({})
     exists = db.scalar(select(User).where(User.username == 'isis', User.active.is_(True))) is not None
     # Alertas proactivas (v4): lo que necesita atención AHORA; nunca rompen el status.
     try:
@@ -4321,6 +4538,11 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
     """Solo Isis (o el propietario, para probar) habla con este cerebro."""
     if user.username != 'isis' and user.role != 'owner':
         raise HTTPException(403, 'Este panel de voz es solo para Isis')
+    # P2: memo por llamada — parser, contexto y ejecución comparten las
+    # listas y agregados en vez de cargarlos una vez por pregunta. La
+    # ContextVar vive solo en la tarea asyncio de esta request, así que
+    # nunca sirve datos viejos entre llamadas.
+    _ISIS_MEMO.set({})
     actor = user.username
     # Números dictados dígito por dígito (v10.3): '1 0 0 pesos' ya llega
     # como '100 pesos' al parser local, al corte y a Claude; también se
@@ -4679,7 +4901,7 @@ def _pin_lookup(pin: str) -> str:
 def _pin_format(pin: str) -> bool:
     return isinstance(pin, str) and bool(re.fullmatch(r'[0-9]{6}', pin))
 
-def _set_user_pin(db: Session, target: User, pin: str):
+def _set_user_pin(db: Session, target: User, pin: str, pin_hash=None):
     if not _pin_format(pin):
         raise HTTPException(400, 'El PIN debe tener exactamente 6 números')
     digest = _pin_lookup(pin)
@@ -4688,11 +4910,19 @@ def _set_user_pin(db: Session, target: User, pin: str):
         raise HTTPException(409, 'Este PIN ya pertenece a otra persona. Elige uno distinto.')
     row = db.get(UserPin, target.id)
     if row is None:
-        db.add(UserPin(user_id=target.id, lookup=digest, pin_hash=ph.hash(pin)))
+        db.add(UserPin(user_id=target.id, lookup=digest, pin_hash=pin_hash if pin_hash is not None else ph.hash(pin)))
     else:
         row.lookup = digest
-        row.pin_hash = ph.hash(pin)
+        row.pin_hash = pin_hash if pin_hash is not None else ph.hash(pin)
     target.session_version = (target.session_version or 1) + 1
+
+async def _set_user_pin_async(db: Session, target: User, pin: str):
+    """Igual que _set_user_pin, pero el hash Argon2 (~200 ms) corre en un
+    hilo para no bloquear el loop del servidor (P9)."""
+    if not _pin_format(pin):
+        raise HTTPException(400, 'El PIN debe tener exactamente 6 números')
+    pin_hash = await asyncio.to_thread(ph.hash, pin)
+    _set_user_pin(db, target, pin, pin_hash=pin_hash)
 
 class PinLoginIn(BaseModel):
     pin: str = Field(min_length=6, max_length=6, pattern=r'^[0-9]{6}$')
@@ -5029,17 +5259,17 @@ async def create_staff(data: StaffCreateIn, db: Session = Depends(db_session), u
         username = f'{base}-{num}'
         num += 1
     target = User(username=username,display=name,role=data.role,
-                  password_hash=ph.hash(secrets.token_urlsafe(32)),active=True)
+                  password_hash=await asyncio.to_thread(ph.hash, secrets.token_urlsafe(32)),active=True)
     db.add(target)
     db.flush()
-    _set_user_pin(db, target, data.pin)
+    await _set_user_pin_async(db, target, data.pin)
     audit(db, user, 'staff.create', id=target.id, role=target.role, name=name)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'El PIN o el identificador del empleado ya está en uso')
-    await notify()
+    await notify('users')
     return {'id':target.id,'display':target.display,'role':target.role}
 
 class StaffPinIn(BaseModel):
@@ -5052,14 +5282,14 @@ async def assign_staff_pin(user_id: int, data: StaffPinIn,
     target = db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'Personal no encontrado')
-    _set_user_pin(db, target, data.pin)
+    await _set_user_pin_async(db, target, data.pin)
     audit(db,user,'staff.pin_set',id=target.id)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'El PIN ya pertenece a otra persona')
-    await notify()
+    await notify('users')
     return {'ok':True,'owner_pin_changed':target.id == user.id}
 
 class UserIn(BaseModel): username:str=Field(min_length=3,max_length=80);display:str=Field(min_length=2,max_length=100);role:Literal['admin','cashier','waiter','kitchen','bar'];secret:str=Field(min_length=6,max_length=6)
@@ -5081,15 +5311,15 @@ async def add_user(data:UserIn,db:Session=Depends(db_session),user:User=Depends(
     display=data.display.strip()
     if not username or not display:raise HTTPException(400,'Nombre y usuario son obligatorios')
     if db.scalar(select(User).where(User.username==username)):raise HTTPException(409,'Usuario ya registrado')
-    u=User(username=username,display=display,role=data.role,password_hash=ph.hash(secrets.token_urlsafe(32)))
+    u=User(username=username,display=display,role=data.role,password_hash=await asyncio.to_thread(ph.hash, secrets.token_urlsafe(32)))
     db.add(u);db.flush()
-    _set_user_pin(db,u,data.secret)
+    await _set_user_pin_async(db,u,data.secret)
     audit(db,user,'user.create',username=u.username,role=u.role)
     try:db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'Usuario o PIN ya registrado')
-    await notify()
+    await notify('users')
     return {'id':u.id}
 
 class UserUpdateIn(BaseModel): active:Optional[bool]=None;secret:Optional[str]=None
@@ -5102,8 +5332,8 @@ async def update_user(user_id:int,data:UserUpdateIn,db:Session=Depends(db_sessio
     if data.active is not None:target.active=data.active
     if data.secret is not None:
         # La API anterior ya no debe habilitar credenciales sin PIN.
-        _set_user_pin(db,target,data.secret)
-        target.password_hash=ph.hash(secrets.token_urlsafe(32))
+        await _set_user_pin_async(db,target,data.secret)
+        target.password_hash=await asyncio.to_thread(ph.hash, secrets.token_urlsafe(32))
     else:
         target.session_version=(target.session_version or 1)+1
     audit(db,user,'user.update',id=target.id,active=target.active,reset=bool(data.secret))
@@ -5111,7 +5341,7 @@ async def update_user(user_id:int,data:UserUpdateIn,db:Session=Depends(db_sessio
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'El PIN ya pertenece a otra persona')
-    await notify()
+    await notify('users')
     return {'ok':True}
 
 @app.get('/api/settings')
@@ -5125,7 +5355,7 @@ async def set_settings(data:SettingsIn,db:Session=Depends(db_session),user:User=
     s=db.execute(select(Setting).where(Setting.id==1).with_for_update()).scalar_one()
     if data.inventory_on and not s.inventory_on and not data.confirmed_recount:raise HTTPException(409,'Confirma el recuento de existencias antes de activar inventario')
     old=s.inventory_on;s.inventory_on=data.inventory_on;s.inventory_reviewed=data.confirmed_recount if data.inventory_on else False
-    audit(db,user,'inventory.global',old=old,new=s.inventory_on);db.commit();await notify();return {'ok':True}
+    audit(db,user,'inventory.global',old=old,new=s.inventory_on);db.commit();await notify('settings');return {'ok':True}
 
 @app.get('/api/products')
 def products(db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -5159,7 +5389,7 @@ async def remove_category(data:RemoveCategoryIn,db:Session=Depends(db_session),u
         p.version=(p.version or 1)+1
     audit(db,user,'category.remove',source=source,destination=destination,
           active_products=visible_count,all_products=len(rows))
-    db.commit();await notify()
+    db.commit();await notify('products')
     return {'ok':True,'moved':visible_count,'new_category':destination}
 
 class ProductArchiveIn(BaseModel):
@@ -5226,14 +5456,14 @@ async def add_product_variant(product_id:int,data:ProductVariantIn,db:Session=De
     p=db.get(Product,product_id)
     if not p:raise HTTPException(404,'Producto inexistente')
     v=ProductVariant(product_id=p.id,name=data.name.strip(),price_cents=cents(data.price),active=data.active,sort_order=data.sort_order)
-    db.add(v);db.flush();audit(db,user,'product.variant.create',product_id=p.id,variant_id=v.id,name=v.name,price=amount(v.price_cents));db.commit();await notify()
+    db.add(v);db.flush();audit(db,user,'product.variant.create',product_id=p.id,variant_id=v.id,name=v.name,price=amount(v.price_cents));db.commit();await notify('products')
     return {'id':v.id,'ok':True}
 
 @app.patch('/api/product-variants/{variant_id}')
 async def toggle_product_variant(variant_id:int,data:ActiveToggleIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin');v=db.get(ProductVariant,variant_id)
     if not v:raise HTTPException(404,'Presentación inexistente')
-    v.active=data.active;audit(db,user,'product.variant.toggle',variant_id=v.id,active=v.active);db.commit();await notify();return {'ok':True}
+    v.active=data.active;audit(db,user,'product.variant.toggle',variant_id=v.id,active=v.active);db.commit();await notify('products');return {'ok':True}
 
 @app.post('/api/products/{product_id}/modifier-groups')
 async def add_modifier_group(product_id:int,data:ModifierGroupIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -5241,7 +5471,7 @@ async def add_modifier_group(product_id:int,data:ModifierGroupIn,db:Session=Depe
     if not db.get(Product,product_id):raise HTTPException(404,'Producto inexistente')
     if data.min_select>data.max_select:raise HTTPException(400,'La selección mínima no puede superar la máxima')
     g=ProductModifierGroup(product_id=product_id,name=data.name.strip(),min_select=data.min_select,max_select=data.max_select,active=data.active,sort_order=data.sort_order)
-    db.add(g);db.flush();audit(db,user,'product.modifier_group.create',product_id=product_id,group_id=g.id,name=g.name);db.commit();await notify();return {'id':g.id,'ok':True}
+    db.add(g);db.flush();audit(db,user,'product.modifier_group.create',product_id=product_id,group_id=g.id,name=g.name);db.commit();await notify('products');return {'id':g.id,'ok':True}
 
 @app.post('/api/modifier-groups/{group_id}/options')
 async def add_modifier_option(group_id:int,data:ModifierOptionIn,db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -5258,7 +5488,7 @@ async def add_modifier_option(group_id:int,data:ModifierOptionIn,db:Session=Depe
     db.add(o);db.flush()
     audit(db,user,'product.modifier_option.create',group_id=g.id,option_id=o.id,name=o.name,
           price_delta=amount(o.price_delta_cents),inventory_product_id=o.inventory_product_id)
-    db.commit();await notify();return {'id':o.id,'ok':True}
+    db.commit();await notify('products');return {'id':o.id,'ok':True}
 
 @app.patch('/api/modifier-options/{option_id}/inventory')
 async def link_modifier_inventory(option_id:int,data:ModifierOptionInventoryIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -5274,13 +5504,13 @@ async def link_modifier_inventory(option_id:int,data:ModifierOptionInventoryIn,d
     option.inventory_quantity=data.inventory_quantity
     audit(db,user,'product.modifier_option.inventory_link',option_id=option.id,
           inventory_product_id=option.inventory_product_id,inventory_quantity=option.inventory_quantity)
-    db.commit();await notify();return {'ok':True}
+    db.commit();await notify('products');return {'ok':True}
 
 @app.patch('/api/modifier-options/{option_id}')
 async def toggle_modifier_option(option_id:int,data:ActiveToggleIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin');o=db.get(ProductModifierOption,option_id)
     if not o:raise HTTPException(404,'Modificador inexistente')
-    o.active=data.active;audit(db,user,'product.modifier_option.toggle',option_id=o.id,active=o.active);db.commit();await notify();return {'ok':True}
+    o.active=data.active;audit(db,user,'product.modifier_option.toggle',option_id=o.id,active=o.active);db.commit();await notify('products');return {'ok':True}
 
 @app.post('/api/products/{product_id}/promotions')
 async def add_product_promotion(product_id:int,data:PromotionIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -5298,13 +5528,13 @@ async def add_product_promotion(product_id:int,data:PromotionIn,db:Session=Depen
     promo=ProductPromotion(product_id=product_id,name=data.name.strip(),price_cents=cents(data.price) if data.price is not None else None,
         discount_percent=data.discount_percent,weekdays=','.join(str(x) for x in sorted(days)),start_time=data.start_time,end_time=data.end_time,
         start_date=data.start_date or None,end_date=data.end_date or None,active=True)
-    db.add(promo);db.flush();audit(db,user,'product.promotion.create',product_id=product_id,promotion_id=promo.id,name=promo.name);db.commit();await notify();return {'id':promo.id,'ok':True}
+    db.add(promo);db.flush();audit(db,user,'product.promotion.create',product_id=product_id,promotion_id=promo.id,name=promo.name);db.commit();await notify('products');return {'id':promo.id,'ok':True}
 
 @app.patch('/api/promotions/{promotion_id}')
 async def toggle_product_promotion(promotion_id:int,data:ActiveToggleIn,db:Session=Depends(db_session),user:User=Depends(auth)):
     allow(user,'owner','admin');promo=db.get(ProductPromotion,promotion_id)
     if not promo:raise HTTPException(404,'Promoción inexistente')
-    promo.active=data.active;audit(db,user,'product.promotion.toggle',promotion_id=promo.id,active=promo.active);db.commit();await notify();return {'ok':True}
+    promo.active=data.active;audit(db,user,'product.promotion.toggle',promotion_id=promo.id,active=promo.active);db.commit();await notify('products');return {'ok':True}
 
 @app.post('/api/products')
 async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -5315,7 +5545,7 @@ async def add_product(data:ProductIn,db:Session=Depends(db_session),user:User=De
         db.add(InventoryMovement(product_id=p.id,actor_id=user.id,kind='opening',
             quantity_change=p.stock,before_stock=0,after_stock=p.stock,
             reason='Saldo inicial al crear producto',source_key=f'inventory-opening:{p.id}',created_at=now()))
-    audit(db,user,'product.create',name=p.name);db.commit();await notify();return {'id':p.id}
+    audit(db,user,'product.create',name=p.name);db.commit();await notify('products');return {'id':p.id}
 @app.get('/api/products/archived')
 def archived_products(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
@@ -5336,7 +5566,7 @@ async def archive_product(product_id:int,data:ProductArchiveIn,db:Session=Depend
                            original_active=bool(p.active),original_blocked=bool(p.blocked)))
     p.active=False;p.blocked=True;p.version+=1
     audit(db,user,'product.archive',product_id=p.id,name=p.name,reason=data.reason.strip())
-    db.commit();await notify()
+    db.commit();await notify('products')
     return {'ok':True,'archived':True}
 
 class ProductRestoreIn(BaseModel):
@@ -5352,7 +5582,7 @@ async def restore_product(product_id:int,data:ProductRestoreIn,db:Session=Depend
     p.active=bool(a.original_active);p.blocked=bool(a.original_blocked);p.version+=1
     db.delete(a)
     audit(db,user,'product.restore',product_id=p.id,name=p.name)
-    db.commit();await notify()
+    db.commit();await notify('products')
     return {'ok':True,'restored':True}
 
 @app.put('/api/products/{product_id}')
@@ -5379,7 +5609,7 @@ async def edit_product(product_id:int,data:ProductIn,db:Session=Depends(db_sessi
             reason=data.stock_reason.strip(),source_key=f'inventory-adjust-product:{secrets.token_urlsafe(18)}',created_at=now()))
         audit(db,user,'inventory.adjustment',product_id=p.id,before=old_stock,delta=data.stock-old_stock,
               after=data.stock,reason=data.stock_reason.strip(),source='product.edit')
-    audit(db,user,'product.update',id=p.id,before=before,after=product_dict(p,db.get(Setting,1),db));db.commit();await notify();return {'ok':True}
+    audit(db,user,'product.update',id=p.id,before=before,after=product_dict(p,db.get(Setting,1),db));db.commit();await notify('products');return {'ok':True}
 class RestockIn(BaseModel): delta:int=Field(gt=0,le=100000);reason:str=Field(min_length=3,max_length=400);expected_version:int
 @app.post('/api/products/{product_id}/restock')
 async def restock(product_id:int,data:RestockIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -5392,7 +5622,7 @@ async def restock(product_id:int,data:RestockIn,db:Session=Depends(db_session),u
         quantity_change=data.delta,before_stock=before,after_stock=p.stock,reason=data.reason.strip(),
         source_key=f'inventory-restock:{secrets.token_urlsafe(18)}',created_at=now()))
     audit(db,user,'inventory.restock',product_id=p.id,before=before,delta=data.delta,after=p.stock,reason=data.reason)
-    db.commit();await notify();return {'stock':p.stock}
+    db.commit();await notify('products');return {'stock':p.stock}
 
 class InventoryAdjustmentIn(BaseModel):
     mode:Literal['out','count']
@@ -5420,7 +5650,7 @@ async def inventory_adjustment(product_id:int,data:InventoryAdjustmentIn,db:Sess
         source_key=f'inventory-manual:{secrets.token_urlsafe(18)}',created_at=now()))
     audit(db,user,'inventory.manual_movement',product_id=p.id,kind=kind,
           before=before,delta=delta,after=after,reason=data.reason.strip())
-    db.commit();await notify();return {'stock':p.stock,'delta':delta}
+    db.commit();await notify('products');return {'stock':p.stock,'delta':delta}
 
 @app.post('/api/inventory/items')
 async def create_inventory_item(data:InventoryItemIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -5437,7 +5667,7 @@ async def create_inventory_item(data:InventoryItemIn,db:Session=Depends(db_sessi
         quantity_change=item.stock,before_stock=0,after_stock=item.stock,
         reason='Saldo inicial al registrar insumo',source_key=f'inventory-opening:{item.id}',created_at=now()))
     audit(db,user,'inventory.item.create',product_id=item.id,name=item.name,stock=item.stock,unit=item.inventory_unit)
-    db.commit();await notify()
+    db.commit();await notify('inventory')
     return {'id':item.id,'ok':True}
 
 @app.get('/api/inventory/movements')
@@ -5565,7 +5795,7 @@ async def create_dining_table(data:DiningTableIn,db:Session=Depends(db_session),
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'Ya existe una mesa con ese nombre')
-    await notify()
+    await notify('tables')
     return {'id':t.id,'ok':True}
 
 @app.put('/api/tables/{table_id}')
@@ -5587,13 +5817,13 @@ async def update_dining_table(table_id:int,data:DiningTableIn,db:Session=Depends
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'Ya existe otra mesa con ese nombre')
-    await notify()
+    await notify('tables')
     return {'ok':True}
 
 @app.get('/api/accounts')
 def accounts(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier','waiter')
-    p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    p=_open_period_cached(db)
     if not p:return []  # Los cierres anteriores se consultan solo desde el historial de caja.
     q=select(Account).where(Account.created_at>=p.opened_at).order_by(Account.id.desc())
     if user.role=='waiter':q=q.where(Account.owner_id==user.id)
@@ -5605,8 +5835,7 @@ def accounts(db:Session=Depends(db_session),user:User=Depends(auth_either)):
 def overview(db:Session=Depends(db_session),user:User=Depends(auth)):
     """Resumen compacto del panel: métricas agregadas sin descargar listas completas."""
     allow(user,'owner','admin')
-    period=db.scalar(select(CashPeriod).where(
-        CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    period=_open_period_cached(db)
     status_counts={}
     new_tickets=0
     if period:
@@ -5699,7 +5928,7 @@ async def new_account(data:AccountIn,db:Session=Depends(db_session),user:User=De
         if previous:
             return duplicate_response(previous)
         raise HTTPException(409,'La mesa acaba de ser ocupada por otro mesero. Actualiza las mesas.')
-    await notify()
+    await notify('accounts')
     return {'id':a.id,'table_id':table.id if table else None,'duplicate':False}
 
 class VoidAccountIn(BaseModel):
@@ -5716,7 +5945,7 @@ async def void_account(account_id:int,data:VoidAccountIn,db:Session=Depends(db_s
     a.status='cancelled';a.closed_at=now()
     release_table_for_account(db,a,user,'Cuenta anulada')
     audit(db,user,'account.void',id=a.id,reason=data.reason)
-    db.commit();await notify()
+    db.commit();await notify('accounts')
     return {'ok':True,'id':a.id,'status':'cancelled'}
 
 @app.get('/api/accounts/{account_id}')
@@ -5830,7 +6059,7 @@ async def reassign(account_id:int,data:ReassignIn,db:Session=Depends(db_session)
             pending_ids.append(notice.id)
     audit(db,user,'account.reassign',id=a.id,old=old,new=dest.id,
           reason=data.reason,notifications_reassigned=len(pending_ids))
-    db.commit();await notify()
+    db.commit();await notify('accounts')
     for event_id in pending_ids:
         await dispatch_ready_notification(event_id)
     return {'ok':True,'notifications_reassigned':len(pending_ids)}
@@ -5916,7 +6145,7 @@ async def rename_account(account_id: int, data: AccountRenameIn,
     audit(db, user, 'account.rename', account_id=account.id,
           before=before, after=name, reason=data.reason)
     db.commit()
-    await notify()
+    await notify('accounts')
     return {'ok': True, 'name': account.name}
 
 @app.post('/api/accounts/{account_id}/transfer-table')
@@ -5953,7 +6182,7 @@ async def transfer_account_table(account_id: int, data: AccountTableTransferIn,
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'La mesa cambió de disponibilidad. Actualiza e inténtalo de nuevo.')
-    await notify()
+    await notify('accounts')
     return {'ok': True, 'table_id': destination.id if destination else None}
 
 @app.post('/api/accounts/{account_id}/merge')
@@ -6030,7 +6259,7 @@ async def merge_accounts(account_id: int, data: AccountMergeIn,
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'No se pudo unir: revisa la ocupación de las mesas e inténtalo otra vez')
-    await notify()
+    await notify('accounts')
     total, paid = acc_totals(db, target)
     return {'ok': True, 'source_account_id': source.id, 'target_account_id': target.id,
             'target_total': amount(total), 'target_paid': amount(paid),
@@ -6155,7 +6384,7 @@ async def split_account(account_id: int, data: AccountSplitIn,
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'No se pudo dividir la cuenta. Actualiza e inténtalo de nuevo.')
-    await notify()
+    await notify('accounts')
     return {'ok': True, 'source_account_id': source.id, 'target_account_id': target.id,
             'new_account': data.target_account_id is None, 'split_item_id': split_item.id}
 
@@ -6201,7 +6430,7 @@ async def reopen_closed_account(account_id: int, data: AccountReopenClosedIn,
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'No se pudo reabrir la cuenta; verifica la disponibilidad de la mesa')
-    await notify()
+    await notify('accounts')
     return {'ok': True, 'id': account.id, 'status': account.status}
 
 # ---------------------------------------------------------------------------
@@ -6270,32 +6499,44 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
                 unit=stock_item.inventory_unit or 'unidades'
                 raise HTTPException(409,f'Sin existencias suficientes de {stock_item.name}: quedan {stock_item.stock} {unit}')
     prepared=[];stations=set()
+    # P4: cargas por lote (antes: 1 query por línea para variante, grupos,
+    # opciones, promociones y minutos de preparación). Mismo resultado.
+    order_pids=sorted({line.product_id for line in data.items})
+    variant_ids=sorted({line.variant_id for line in data.items if line.variant_id is not None})
+    variant_by_id={v.id:v for v in db.scalars(select(ProductVariant).where(ProductVariant.id.in_(variant_ids))).all()} if variant_ids else {}
+    groups_by_product={}
+    for g in db.scalars(select(ProductModifierGroup).where(ProductModifierGroup.product_id.in_(order_pids),ProductModifierGroup.active.is_(True))).all():
+        groups_by_product.setdefault(g.product_id,[]).append(g)
+    promos_by_product={}
+    for pr in db.scalars(select(ProductPromotion).where(ProductPromotion.product_id.in_(order_pids),ProductPromotion.active.is_(True)).order_by(ProductPromotion.id.desc())).all():
+        promos_by_product.setdefault(pr.product_id,[]).append(pr)
+    prep_by_product={pp.product_id:pp.minutes for pp in db.scalars(select(mitote_extensions.ProductPrep).where(mitote_extensions.ProductPrep.product_id.in_(order_pids))).all()}
     for line in data.items:
         p=products[line.product_id];stations.add(p.station)
         variant=None
         if line.variant_id is not None:
-            variant=db.get(ProductVariant,line.variant_id)
+            variant=variant_by_id.get(line.variant_id)
             if not variant or variant.product_id!=p.id or not variant.active:raise HTTPException(400,f'Presentación inválida para {p.name}')
         base_cents=variant.price_cents if variant else p.price_cents
-        groups=db.scalars(select(ProductModifierGroup).where(ProductModifierGroup.product_id==p.id,ProductModifierGroup.active.is_(True))).all()
+        groups=groups_by_product.get(p.id,[])
         option_ids=line.modifier_option_ids
         if len(option_ids)!=len(set(option_ids)):raise HTTPException(400,'No repitas modificadores')
         options=[]
         if option_ids:
-            options=db.scalars(select(ProductModifierOption).where(ProductModifierOption.id.in_(option_ids),ProductModifierOption.active.is_(True))).all()
+            # Mismo orden que la query original (sin ORDER BY: orden de id).
+            options=sorted([selected_option_by_id[oid] for oid in option_ids if selected_option_by_id[oid].active],key=lambda o:o.id)
             if len(options)!=len(option_ids):raise HTTPException(400,f'Hay modificadores inexistentes o inactivos en {p.name}')
         group_by_id={g.id:g for g in groups}
         counts={g.id:0 for g in groups}
         for option in options:
-            group=db.get(ProductModifierGroup,option.group_id)
+            group=group_by_id.get(option.group_id)
             if not group or group.product_id!=p.id or not group.active:raise HTTPException(400,f'Modificador no válido para {p.name}')
             counts[group.id]=counts.get(group.id,0)+1
         for group in groups:
             count=counts.get(group.id,0)
             if count<group.min_select or count>group.max_select:
                 raise HTTPException(400,f'{p.name}: selecciona entre {group.min_select} y {group.max_select} opciones en "{group.name}"')
-        promo=db.scalars(select(ProductPromotion).where(ProductPromotion.product_id==p.id,ProductPromotion.active.is_(True)).order_by(ProductPromotion.id.desc())).all()
-        promo=next((x for x in promo if promotion_is_active(x)),None)
+        promo=next((x for x in promos_by_product.get(p.id,[]) if promotion_is_active(x)),None)
         promo_base=apply_promotion(base_cents,promo)
         modifier_cents=sum(o.price_delta_cents for o in options)
         final_price=promo_base+modifier_cents
@@ -6333,7 +6574,7 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         db.add(item);db.flush()
         created_order_items.append((item,p,line.qty,row['selected_options']))
         db.add(OrderItemMeta(order_item_id=item.id,variant_name=variant.name if variant else '',
-            modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=mitote_extensions.product_prep_minutes(db,p.id,line.prep_minutes),
+            modifiers_json=json.dumps(row['options'],ensure_ascii=False),prep_minutes=prep_by_product.get(p.id) if p.id in prep_by_product else max(1,min(240,int(line.prep_minutes or 15))),
             release_after_minutes=line.release_after_minutes,promotion_name=row['promo_name'],
             base_price_cents=row['base_cents'],modifier_price_cents=row['modifier_cents']))
     # Una salida por línea de comanda: conserva producto, folio, mesa, usuario y hora.
@@ -6372,7 +6613,7 @@ async def send_order(account_id:int,data:OrderIn,db:Session=Depends(db_session),
         if existing:
             raise HTTPException(409,'Identificador de envío ya utilizado')
         raise
-    await notify()
+    await notify('accounts')
     async def dispatch_station(station):
         station_title='Cocina' if station=='kitchen' else 'Barra'
         payload={'title':'El Mitote · '+station_title,
@@ -6463,7 +6704,7 @@ async def repeat_order_item(account_id:int,item_id:int,data:RepeatOrderIn,db:Ses
                 source_key=f'inventory-sale:{batch.id}:{new_item.id}:repeat:{stock_item.id}',created_at=now()))
     db.add(StationTicket(batch_id=batch.id,station=item.station))
     audit(db,user,'order.repeat',account_id=account.id,source_item_id=item.id,new_item_id=new_item.id,qty=data.qty,batch_id=batch.id)
-    db.commit();await notify()
+    db.commit();await notify('accounts')
     await push_to({'title':'El Mitote · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · {account.name}','url':'/?push=station','tag':f'mitote-order-{batch.id}-{item.station}'},role=item.station)
     await fcm_to({'title':'El Mitote · '+('Cocina' if item.station=='kitchen' else 'Barra'),'body':f'Producto repetido · Comanda #{batch.id}','url':'/?push=station'},role=item.station)
     return {'batch_id':batch.id,'duplicate':False}
@@ -6473,7 +6714,7 @@ async def request_bill(account_id:int,db:Session=Depends(db_session),user:User=D
     allow(user,'owner','admin','waiter');a=owner_account(db,user,account_id,('open',))
     total,paid=acc_totals(db,a)
     if total<=0:raise HTTPException(409,'La cuenta no tiene productos')
-    a.status='pending';audit(db,user,'account.request_bill',id=a.id);db.commit();await notify();return {'ok':True}
+    a.status='pending';audit(db,user,'account.request_bill',id=a.id);db.commit();await notify('accounts');return {'ok':True}
 class ApprovalIn(BaseModel):kind:Literal['reopen','cancel'];reason:str=Field(min_length=3,max_length=400);item_id:Optional[int]=None;qty:Optional[int]=None
 @app.post('/api/accounts/{account_id}/requests')
 async def request_approval(account_id:int,data:ApprovalIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -6484,7 +6725,7 @@ async def request_approval(account_id:int,data:ApprovalIn,db:Session=Depends(db_
         item=db.get(OrderItem,data.item_id) if data.item_id else None
         if not item or db.get(Batch,item.batch_id).account_id!=a.id or not data.qty or data.qty<1 or data.qty>item.qty-item.cancelled_qty:raise HTTPException(400,'Producto o cantidad inválidos')
     r=Approval(account_id=a.id,requester_id=user.id,kind=data.kind,item_id=data.item_id,qty=data.qty,reason=data.reason)
-    db.add(r);audit(db,user,'approval.request',kind=data.kind,account_id=a.id);db.commit();await notify();return {'id':r.id}
+    db.add(r);audit(db,user,'approval.request',kind=data.kind,account_id=a.id);db.commit();await notify('accounts');return {'id':r.id}
 @app.get('/api/requests')
 def requests(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin')
@@ -6531,31 +6772,43 @@ async def decide(request_id:int,data:DecisionIn,db:Session=Depends(db_session),u
                         account_name=a.name,table_name=assigned_table.name if assigned_table else '',
                         source_key=f'inventory-return:{r.id}:{sale.id}',created_at=now()))
     r.status='approved' if data.approve else 'rejected';r.decided_by=user.id
-    audit(db,user,'approval.decide',id=r.id,approved=data.approve,return_stock=data.return_stock);db.commit();await notify();return {'ok':True}
+    audit(db,user,'approval.decide',id=r.id,approved=data.approve,return_stock=data.return_stock);db.commit();await notify('approvals');return {'ok':True}
 
 @app.get('/api/tickets')
 def tickets(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','kitchen','bar')
-    p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    p=_open_period_cached(db)
     if not p:return []
     q=select(StationTicket).join(Batch,Batch.id==StationTicket.batch_id).where(
         Batch.created_at>=p.opened_at).order_by(StationTicket.id.desc()).limit(150)
     if user.role in ('kitchen','bar'):q=q.where(StationTicket.station==user.role)
+    # P1: batch loads (antes: 1 query por ticket + 1 por ítem + 1 por
+    # usuario — 513 stmts con 120 tickets). Mismo resultado, ~7 queries.
+    tickets=db.scalars(q).all()
+    if not tickets:return []
+    batch_ids=[t.batch_id for t in tickets]
+    batch_by={b.id:b for b in db.scalars(select(Batch).where(Batch.id.in_(batch_ids))).all()}
+    account_by={a.id:a for a in db.scalars(select(Account).where(Account.id.in_([b.account_id for b in batch_by.values()]))).all()}
+    items_by={}
+    for it in db.scalars(select(OrderItem).where(OrderItem.batch_id.in_(batch_ids)).order_by(OrderItem.id)).all():
+        items_by.setdefault((it.batch_id,it.station),[]).append(it)
+    item_ids=[it.id for lst in items_by.values() for it in lst]
+    meta_by={mt.order_item_id:mt for mt in db.scalars(select(OrderItemMeta).where(OrderItemMeta.order_item_id.in_(item_ids))).all()} if item_ids else {}
+    waiter_by={u.id:u for u in db.scalars(select(User).where(User.id.in_([b.sent_by for b in batch_by.values()]))).all()}
     out=[]
-    for t in db.scalars(q):
-        b=db.get(Batch,t.batch_id);a=db.get(Account,b.account_id)
-        lines=db.scalars(select(OrderItem).where(OrderItem.batch_id==b.id,OrderItem.station==t.station)).all()
+    for t in tickets:
+        b=batch_by[t.batch_id];a=account_by[b.account_id]
         ticket_items=[]
-        for x in lines:
+        for x in items_by.get((b.id,t.station),[]):
             if x.qty<=x.cancelled_qty:continue
-            meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==x.id))
+            meta=meta_by.get(x.id)
             try:modifiers=json.loads(meta.modifiers_json or '[]') if meta else []
             except Exception:modifiers=[]
             ticket_items.append({'name':x.name,'qty':x.qty-x.cancelled_qty,'note':x.note,
                 'variant_name':meta.variant_name if meta else '', 'modifiers':modifiers,
                 'prep_minutes':meta.prep_minutes if meta else 15,'release_after_minutes':meta.release_after_minutes if meta else 0,
                 'promotion_name':meta.promotion_name if meta else ''})
-        out.append({'id':t.id,'batch_id':b.id,'account':a.name,'account_id':a.id,'waiter':db.get(User,b.sent_by).display,'station':t.station,'status':t.status,'created_at':t.created_at.isoformat() if t.created_at else '', 'items':ticket_items})
+        out.append({'id':t.id,'batch_id':b.id,'account':a.name,'account_id':a.id,'waiter':waiter_by[b.sent_by].display,'station':t.station,'status':t.status,'created_at':t.created_at.isoformat() if t.created_at else '', 'items':ticket_items})
     return out
 @app.get('/api/waiter/ready-alerts')
 def waiter_ready_alerts(db:Session=Depends(db_session),user:User=Depends(auth)):
@@ -6597,7 +6850,7 @@ async def acknowledge_ready_alert(event_id:int,db:Session=Depends(db_session),us
     row.acknowledged_at=now()
     row.next_attempt_at=None
     audit(db,user,'ready.received',event_id=row.id,ticket_id=row.ticket_id,account_id=row.account_id)
-    db.commit();await notify()
+    db.commit();await notify('ready')
     return {'ok':True,'duplicate':False,'received':True}
 
 
@@ -6616,7 +6869,7 @@ async def deliver_ready_alert(event_id:int,db:Session=Depends(db_session),user:U
         raise HTTPException(409,'Primero confirma que recibiste el pedido.')
     row.delivered_at=now()
     audit(db,user,'ready.delivered',event_id=row.id,ticket_id=row.ticket_id,account_id=row.account_id)
-    db.commit();await notify()
+    db.commit();await notify('ready')
     return {'ok':True,'duplicate':False,'delivered':True}
 
 
@@ -6649,7 +6902,7 @@ async def ticket_status(ticket_id:int,data:StatusIn,db:Session=Depends(db_sessio
             waiter_id=owner_id,station=station,complete=complete,
             created_at=t.ready_at)
         db.add(event);db.flush();event_id=event.id
-    db.commit();await notify()
+    db.commit();await notify('tickets')
     if event_id is not None:
         await dispatch_ready_notification(event_id)
     return {'ok':True}
@@ -6692,13 +6945,20 @@ def tip_distribution_dict(db, distribution):
     shares=db.scalars(select(TipDistributionShare).where(
         TipDistributionShare.distribution_id==distribution.id
     ).order_by(TipDistributionShare.user_id)).all()
+    # P8: cobros y registradores en bloque (antes: 1 query por reparto y
+    # db.get duplicado por cobro).
+    share_ids=[s.id for s in shares]
+    payouts_by_share={}
+    for x in db.scalars(select(TipPayout).where(
+            TipPayout.share_id.in_(share_ids)).order_by(TipPayout.id)).all() if share_ids else []:
+        payouts_by_share.setdefault(x.share_id,[]).append(x)
+    recorder_ids={x.recorded_by for lst in payouts_by_share.values() for x in lst if x.recorded_by is not None}
+    recorder_by={u.id:u.display for u in db.scalars(select(User).where(User.id.in_(recorder_ids))).all()} if recorder_ids else {}
     result=[]
     total_paid=0
     pending_total=0
     for share in shares:
-        payouts=db.scalars(select(TipPayout).where(
-            TipPayout.share_id==share.id
-        ).order_by(TipPayout.id)).all()
+        payouts=payouts_by_share.get(share.id,[])
         paid=sum(x.cents for x in payouts)
         pending=max(0,share.share_cents-paid)
         total_paid+=paid
@@ -6710,7 +6970,7 @@ def tip_distribution_dict(db, distribution):
             'status':'paid' if pending==0 else ('partial' if paid else 'pending'),
             'payouts':[{'id':x.id,'method':x.method,'amount':amount(x.cents),
                         'note':x.note or '', 'date':x.created_at.isoformat() if x.created_at else '',
-                        'recorded_by':db.get(User,x.recorded_by).display if db.get(User,x.recorded_by) else '?',
+                        'recorded_by':recorder_by.get(x.recorded_by,'?'),
                         'cash_period_id':x.cash_period_id} for x in payouts]
         })
     creator=db.get(User,distribution.created_by)
@@ -6775,7 +7035,7 @@ async def apply_account_discount(account_id:int,data:AccountDiscountIn,db:Sessio
     db.add(row)
     audit(db,user,'discount.apply',account_id=account.id,item_id=row.item_id,scope=row.scope,
           mode=row.mode,value=row.value_text,base_cents=base,discount_cents=discount,reason=row.reason)
-    db.commit();await notify()
+    db.commit();await notify('accounts')
     total,paid=acc_totals(db,account)
     return {'ok':True,'id':row.id,'discount':amount(discount),'total':amount(total),'due':amount(total-paid)}
 
@@ -6792,7 +7052,7 @@ async def void_account_discount(account_id:int,discount_id:int,data:VoidAccountI
         raise HTTPException(404,'Descuento aplicado no encontrado')
     row.status='voided';row.voided_by=user.id;row.void_reason=data.reason
     audit(db,user,'discount.void',account_id=account.id,discount_id=row.id,reason=data.reason)
-    db.commit();await notify()
+    db.commit();await notify('accounts')
     total,paid=acc_totals(db,account)
     return {'ok':True,'total':amount(total),'due':amount(total-paid)}
 
@@ -6863,7 +7123,7 @@ async def pay(account_id:int,data:PaymentIn,db:Session=Depends(db_session),user:
             tip_total+=tip_value
     for alloc in data.allocations:db.add(Allocation(account_id=a.id,order_item_id=alloc.item_id,qty=alloc.qty,group_key=data.client_key))
     audit(db,user,'payment.record',account_id=a.id,total=payment_total,tips=tip_total,
-          methods=[l.method for l in data.lines]);db.commit();await notify()
+          methods=[l.method for l in data.lines]);db.commit();await notify('accounts')
     return {'ok':True,'due':amount(total-paid-payment_total),'tips':amount(tip_total),'duplicate':False}
 
 @app.post('/api/accounts/{account_id}/close')
@@ -6874,12 +7134,12 @@ async def close_account(account_id:int,db:Session=Depends(db_session),user:User=
     a.status='paid';a.closed_at=now()
     release_table_for_account(db,a,user,'Cuenta pagada y cerrada')
     mitote_extensions.close_reservation_for_account(db,a.id,user)
-    audit(db,user,'account.close',id=a.id);db.commit();await notify();return {'ok':True}
+    audit(db,user,'account.close',id=a.id);db.commit();await notify('accounts');return {'ok':True}
 
 @app.get('/api/cash')
 def cash(db:Session=Depends(db_session),user:User=Depends(auth_either)):
     allow(user,'owner','admin','cashier')
-    p=db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    p=_open_period_cached(db)
     if not p:return {'open':False}
     totals={method:0 for method in ('cash','card','transfer')}
     for method,value in db.execute(
@@ -6961,7 +7221,7 @@ async def movement(data:MovementIn,db:Session=Depends(db_session),user:User=Depe
         if previous:
             return previous
         raise HTTPException(409,'No se pudo registrar el movimiento. Actualiza e inténtalo de nuevo.')
-    await notify()
+    await notify('cash')
     return {'id':m.id,'status':m.status,'duplicate':False}
 class MoveDecision(BaseModel):approve:bool
 @app.post('/api/cash/movements/{movement_id}/decide')
@@ -6971,7 +7231,7 @@ async def move_decide(movement_id:int,data:MoveDecision,db:Session=Depends(db_se
     p=active_period(db)
     if p.id!=m.period_id:raise HTTPException(409,'Periodo ya cerrado')
     m.status='approved' if data.approve else 'rejected';m.approved_by=user.id
-    audit(db,user,'cash.movement.decide',id=m.id,approve=data.approve);db.commit();await notify();return {'ok':True}
+    audit(db,user,'cash.movement.decide',id=m.id,approve=data.approve);db.commit();await notify('cash');return {'ok':True}
 class ClosePeriodIn(BaseModel):counted:Decimal=Field(ge=0);note:str=Field(default='',max_length=400)
 @app.post('/api/cash/close')
 async def close_cash(data:ClosePeriodIn,db:Session=Depends(db_session),user:User=Depends(auth_either)):
@@ -6995,12 +7255,14 @@ async def close_cash(data:ClosePeriodIn,db:Session=Depends(db_session),user:User
     snapshot['archived']=True
     snapshot['tips_total']=snapshot.get('tips_total') or amount(sum(period_tip_totals(db,p.id).values()))
     snapshot['product_breakdown']=cash_cut_receipt.cut_product_breakdown(db,p)
-    pdf_blob=cash_cut_receipt.build_cut_ticket_pdf(snapshot)
+    # P10: el PDF (reportlab, CPU) corre en un hilo para no bloquear el
+    # loop; el snapshot ya es un dict plano, así que no toca la sesión.
+    pdf_blob=await asyncio.to_thread(cash_cut_receipt.build_cut_ticket_pdf, snapshot)
     db.add(CashCutArchive(period_id=p.id,
                           detail_json=json.dumps(snapshot,ensure_ascii=False),
                           pdf_blob=pdf_blob))
     audit(db,user,'cash.close',period=p.id,counted=p.counted_cents,note=data.note,archived=True)
-    db.commit();await notify()
+    db.commit();await notify('cash')
     return {'id':p.id,'closed':True,'archived':True}
 class OpenPeriodIn(BaseModel):opening:Decimal=Field(ge=0)
 @app.post('/api/cash/open')
@@ -7015,7 +7277,7 @@ async def open_cash(data:OpenPeriodIn,db:Session=Depends(db_session),user:User=D
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'Ya existe un periodo de caja abierto. Actualiza la pantalla.')
-    await notify()
+    await notify('cash')
     return {'id':p.id}
 
 class TipDistributionIn(BaseModel):
@@ -7087,7 +7349,7 @@ async def create_tip_distribution(data:TipDistributionIn,db:Session=Depends(db_s
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'El reparto de este turno ya fue creado. Actualiza la pantalla.')
-    await notify()
+    await notify('tips')
     distribution=db.get(TipDistribution,distribution.id)
     return {'ok':True,'distribution':tip_distribution_dict(db,distribution)}
 
@@ -7132,7 +7394,7 @@ async def record_tip_payout(distribution_id:int,share_id:int,data:TipPayoutIn,
     except IntegrityError:
         db.rollback()
         raise HTTPException(409,'No se pudo registrar la entrega; actualiza e inténtalo de nuevo')
-    await notify()
+    await notify('tips')
     return {'ok':True,'payout_id':payout.id,'paid':amount(paid+payout_cents),
             'pending':amount(share.share_cents-paid-payout_cents)}
 
@@ -7143,14 +7405,25 @@ def audit_log(db:Session=Depends(db_session),user:User=Depends(auth_either)):
 
 
 def build_account_pdf(db,account,prebill=False):
-    total,paid=acc_totals(db,account)
+    # P8: el bruto se calculaba dos veces (dentro de acc_totals y aquí);
+    # se calcula una sola vez con los mismos helpers.
     gross=account_gross_total(db,account)
+    discounts_total=account_discount_total(db,account.id)
+    total=max(0,gross-discounts_total)
+    paid=db.scalar(select(func.coalesce(func.sum(Payment.cents),0)).where(Payment.account_id==account.id)) or 0
     discounts=db.scalars(select(AccountDiscount).where(
         AccountDiscount.account_id==account.id,AccountDiscount.status=='applied').order_by(AccountDiscount.id)).all()
     items=db.scalars(select(OrderItem).join(Batch,Batch.id==OrderItem.batch_id).where(Batch.account_id==account.id)).all()
     payments=db.scalars(select(Payment).where(Payment.account_id==account.id).order_by(Payment.id)).all()
     tips=db.scalars(select(PaymentTip).where(PaymentTip.account_id==account.id).order_by(PaymentTip.id)).all()
     tip_by_payment={x.payment_id:x.cents for x in tips}
+    # P8: metas y productos de descuentos en bloque (antes: 1 query por
+    # ítem y db.get duplicado por descuento con producto).
+    meta_by={mt.order_item_id:mt for mt in db.scalars(select(OrderItemMeta).where(
+        OrderItemMeta.order_item_id.in_([x.id for x in items]))).all()} if items else {}
+    disc_item_ids={d.item_id for d in discounts if d.item_id}
+    disc_item_by={x.id:x.name for x in db.scalars(select(OrderItem).where(
+        OrderItem.id.in_(disc_item_ids))).all()} if disc_item_ids else {}
     buf=io.BytesIO()
     doc=SimpleDocTemplate(buf,pagesize=(226,720),rightMargin=14,leftMargin=14,topMargin=15,bottomMargin=15)
     ss=getSampleStyleSheet()
@@ -7175,7 +7448,7 @@ def build_account_pdf(db,account,prebill=False):
     for item in items:
         qty=item.qty-item.cancelled_qty
         if qty<=0:continue
-        meta=db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id==item.id))
+        meta=meta_by.get(item.id)
         label=xml_escape(item.name)
         if meta and meta.variant_name:label+=' · '+xml_escape(meta.variant_name)
         if meta and meta.modifiers_json:
@@ -7193,7 +7466,7 @@ def build_account_pdf(db,account,prebill=False):
     if discounts:
         story.append(Paragraph('<b>Descuentos aplicados</b>',normal))
         for d in discounts:
-            scope='Cuenta completa' if d.scope=='account' else 'Producto '+xml_escape(db.get(OrderItem,d.item_id).name if d.item_id and db.get(OrderItem,d.item_id) else '')
+            scope='Cuenta completa' if d.scope=='account' else 'Producto '+xml_escape(disc_item_by.get(d.item_id,'') if d.item_id else '')
             story.append(Paragraph(f'{scope}: {xml_escape(d.reason)} · -${amount(d.discount_cents)}',normal))
     story.append(Paragraph(f'Subtotal: ${amount(gross)}<br/>Descuentos: -${amount(sum(d.discount_cents for d in discounts))}<br/><b>Total: ${amount(total)}</b><br/>Pagado: ${amount(paid)}<br/><b>Saldo: ${amount(total-paid)}</b>',bold))
     if not prebill:
@@ -7253,10 +7526,12 @@ def period_summary(db,p):
     tip_distribution=db.scalar(select(TipDistribution).where(TipDistribution.period_id==p.id))
     accounts=db.scalars(select(Account).where(Account.created_at>=p.opened_at,Account.created_at<=p.closed_at).order_by(Account.id)).all()
     closer=db.get(User,p.closed_by) if p.closed_by else None
+    # P5: los nombres de cajero en bloque (antes: db.get por cobro).
     cashier_totals={}
+    cashier_ids={payment.cashier_id for payment in payments if payment.cashier_id is not None}
+    cashier_by={u.id:u.display for u in db.scalars(select(User).where(User.id.in_(cashier_ids))).all()} if cashier_ids else {}
     for payment in payments:
-        cashier=db.get(User,payment.cashier_id)
-        label=cashier.display if cashier else 'Desconocido'
+        label=cashier_by.get(payment.cashier_id,'Desconocido')
         cashier_totals[label]=cashier_totals.get(label,0)+payment.cents
     return {'id':p.id,'opened_at':p.opened_at.isoformat(),'closed_at':p.closed_at.isoformat(),
             'closed_by':closer.display if closer else '?','opening':amount(p.opening_cents),
@@ -7289,18 +7564,26 @@ def cash_period_detail(period_id:int,db:Session=Depends(db_session),user:User=De
     payments=db.scalars(select(Payment).where(Payment.period_id==p.id).order_by(Payment.id)).all()
     moves=db.scalars(select(CashMovement).where(CashMovement.period_id==p.id).order_by(CashMovement.id)).all()
     accounts=db.scalars(select(Account).where(Account.created_at>=p.opened_at,Account.created_at<=p.closed_at).order_by(Account.id)).all()
-    summary['accounts']=[account_dict(db,a) for a in accounts]
-    summary['payments']=[{'id':x.id,'account_id':x.account_id,'account':db.get(Account,x.account_id).name if db.get(Account,x.account_id) else '?',
-                          'cashier':db.get(User,x.cashier_id).display if db.get(User,x.cashier_id) else '?',
+    summary['accounts']=account_dict_many(db,accounts)
+    # P5: cuentas, cajeros y propinas por pago en bloque (antes: hasta 5
+    # queries por cobro y 4 por propina, con db.get repetidos).
+    tip_rows=db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id).order_by(PaymentTip.id)).all()
+    acc_ids={x.account_id for x in payments} | {x.account_id for x in tip_rows}
+    cashier_ids={x.cashier_id for x in payments} | {x.cashier_id for x in tip_rows}
+    account_by={a.id:a.name for a in db.scalars(select(Account).where(Account.id.in_(acc_ids))).all()} if acc_ids else {}
+    user_by={u.id:u.display for u in db.scalars(select(User).where(User.id.in_(cashier_ids))).all()} if cashier_ids else {}
+    tip_by_payment={t.payment_id:t.cents for t in db.scalars(select(PaymentTip).where(PaymentTip.payment_id.in_([x.id for x in payments]))).all()} if payments else {}
+    summary['payments']=[{'id':x.id,'account_id':x.account_id,'account':account_by.get(x.account_id,'?'),
+                          'cashier':user_by.get(x.cashier_id,'?'),
                           'method':x.method,'amount':amount(x.cents),
-                          'tip':amount(db.scalar(select(PaymentTip.cents).where(PaymentTip.payment_id==x.id)) or 0),
+                          'tip':amount(tip_by_payment.get(x.id,0)),
                           'date':x.created_at.isoformat()} for x in payments]
     summary['tips_total']=summary['tips']
     summary['tips']=[{'id':x.id,'payment_id':x.payment_id,'account_id':x.account_id,
-                      'account':db.get(Account,x.account_id).name if db.get(Account,x.account_id) else '?',
-                      'cashier':db.get(User,x.cashier_id).display if db.get(User,x.cashier_id) else '?',
+                      'account':account_by.get(x.account_id,'?'),
+                      'cashier':user_by.get(x.cashier_id,'?'),
                       'method':x.method,'amount':amount(x.cents),'date':x.created_at.isoformat()}
-                     for x in db.scalars(select(PaymentTip).where(PaymentTip.period_id==p.id).order_by(PaymentTip.id))]
+                     for x in tip_rows]
     summary['movements']=[{'id':x.id,'kind':x.kind,'amount':amount(x.cents),'reason':x.reason,'status':x.status,
                            'date':x.created_at.isoformat()} for x in moves]
     return summary

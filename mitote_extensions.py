@@ -20,7 +20,7 @@ from app import (
     app, Base, Batch, Account, DiningTable, TableOccupancy, Product, ArchivedProduct, CashPeriod, OrderItem,
     OrderItemMeta, StationTicket, Payment, PaymentTip, Audit, User,
     SessionLocal, db_session, auth, auth_either, allow, audit, active_period, TipDistribution, now, notify,
-    push_to, fcm_to, ticket_status, StatusIn, amount
+    push_to, fcm_to, ticket_status, StatusIn, amount, _open_period_cached
 )
 
 LOG = logging.getLogger("mitote.extensions")
@@ -148,7 +148,7 @@ async def put_prep_config(data: PrepPolicyIn, db: Session = Depends(db_session),
     p.warning_percent = data.warning_percent
     audit(db, user, "prep.policy", batch_minutes=p.batch_minutes, warning_percent=p.warning_percent)
     db.commit()
-    await notify()
+    await notify('prepconfig')
     return {"ok": True}
 
 
@@ -165,7 +165,7 @@ async def put_product_prep(product_id: int, data: ProductPrepIn, db: Session = D
     p.minutes = data.minutes
     audit(db, user, "prep.product", product_id=product_id, minutes=p.minutes)
     db.commit()
-    await notify()
+    await notify('prepconfig')
     return {"ok": True}
 
 
@@ -309,7 +309,7 @@ async def mark_item_ready(item_id: int, db: Session = Depends(db_session), user:
         # Reutiliza el flujo ya existente (auditoría, notificaciones al mesero y FCM).
         return await ticket_status(ticket.id, StatusIn(status="ready"), db, user)
     db.commit()
-    await notify()
+    await notify('tickets')
     return {"ok": True, "duplicate": False}
 
 
@@ -368,7 +368,7 @@ async def ingest_reservation(data: ReservationIn, authorization: Optional[str] =
             raise
         duplicate = True
     if not duplicate:
-        await notify()
+        await notify('reservations')
     return {"id": row.id, "duplicate": duplicate}
 
 
@@ -377,7 +377,7 @@ async def add_reservation(data: ReservationIn, db: Session = Depends(db_session)
     allow(user, "owner", "admin")
     row, duplicate = create_reservation(db, data, "manual", user)
     db.commit()
-    await notify()
+    await notify('reservations')
     return {"id": row.id, "duplicate": duplicate}
 
 
@@ -408,7 +408,7 @@ async def change_reservation_status(reservation_id: int, data: ReservationStatus
     row.status = data.status
     audit(db, user, "reservation.status", reservation_id=row.id, status=row.status)
     db.commit()
-    await notify()
+    await notify('reservations')
     return {"ok": True}
 
 
@@ -457,7 +457,9 @@ async def reservation_arrival(reservation_id: int, data: ReservationArrivalIn,
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "La mesa acaba de ocuparse; actualiza la pantalla")
-    await notify()
+    # La llegada crea cuenta y ocupa mesa: avisa de los dos dominios.
+    await notify('reservations')
+    await notify('accounts')
     return {"ok": True, "account_id": acc.id, "duplicate": False}
 
 
@@ -479,8 +481,9 @@ def owner_analytics(start: date, end: date, scope: Literal["current","history"] 
     allow(user, "owner")
     if end < start or (end - start).days > 93:
         raise HTTPException(400, "El periodo debe ser de 1 a 94 días")
-    active = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(
-        CashPeriod.id.desc())) if scope == "current" else None
+    # P13: el turno abierto se comparte por llamada de Isis (memo); fuera
+    # de Isis la consulta es fresca como siempre.
+    active = _open_period_cached(db) if scope == "current" else None
     if scope == "current":
         # El corte vigente define el rango. Fechas históricas se consultan aparte.
         end = datetime.now(LOCAL_TZ).date()
@@ -490,56 +493,79 @@ def owner_analytics(start: date, end: date, scope: Literal["current","history"] 
     else:
         begin = datetime.combine(start, day_time.min, LOCAL_TZ).astimezone(timezone.utc)
         finish = datetime.combine(end + timedelta(days=1), day_time.min, LOCAL_TZ).astimezone(timezone.utc)
-    pay_query = select(Payment).where(Payment.created_at >= begin, Payment.created_at < finish)
-    if active: pay_query = pay_query.where(Payment.period_id == active.id)
-    payments = db.scalars(pay_query).all() if scope == "history" or active else []
-    sales_cents = sum(p.cents for p in payments)
-    accounts_paid = len({p.account_id for p in payments})
-    methods = {method: sum(p.cents for p in payments if p.method == method)
+    # P7: agregados en SQL + tuplas en vez de objetos ORM completos, y la
+    # rotación de mesas con una sola query IN (antes: db.get por fila).
+    # Mismo resultado que antes; solo cambia el coste.
+    has_data = scope == "history" or active is not None
+    pay_rows, item_rows, ticket_rows, audit_details, batch_ids = [], [], [], [], []
+    if has_data:
+        pay_q = select(Payment.cents, Payment.method, Payment.created_at, Payment.account_id).where(
+            Payment.created_at >= begin, Payment.created_at < finish)
+        if active:
+            pay_q = pay_q.where(Payment.period_id == active.id)
+        pay_rows = db.execute(pay_q).all()
+        batch_q = select(Batch.id).where(Batch.created_at >= begin, Batch.created_at < finish)
+        if active:
+            batch_q = batch_q.where(Batch.created_at >= active.opened_at)
+        batch_ids = [r[0] for r in db.execute(batch_q).all()]
+        item_q = select(OrderItem.product_id, OrderItem.name, OrderItem.qty,
+                        OrderItem.cancelled_qty, OrderItem.price_cents).join(
+            Batch, Batch.id == OrderItem.batch_id).where(
+            Batch.created_at >= begin, Batch.created_at < finish)
+        if active:
+            item_q = item_q.where(Batch.created_at >= active.opened_at)
+        item_rows = db.execute(item_q).all()
+        ticket_q = select(StationTicket.created_at, StationTicket.ready_at).where(
+            StationTicket.ready_at >= begin, StationTicket.ready_at < finish,
+            StationTicket.status == "ready")
+        if active:
+            ticket_q = ticket_q.where(StationTicket.batch_id.in_(batch_ids))
+        ticket_rows = db.execute(ticket_q).all()
+        audit_q = select(Audit.detail).where(
+            Audit.action == "table.assign", Audit.created_at >= begin, Audit.created_at < finish)
+        if active:
+            audit_q = audit_q.where(Audit.created_at >= active.opened_at)
+        audit_details = [r[0] for r in db.execute(audit_q).all()]
+    sales_cents = sum(r[0] for r in pay_rows)
+    accounts_paid = len({r[3] for r in pay_rows})
+    methods = {method: sum(r[0] for r in pay_rows if r[1] == method)
                for method in ("cash", "card", "transfer")}
     by_day = {str(start + timedelta(days=d)): 0 for d in range((end - start).days + 1)}
     by_hour = {f"{h:02d}:00": 0 for h in range(24)}
-    for p in payments:
-        local = aware(p.created_at).astimezone(LOCAL_TZ)
-        by_day[local.date().isoformat()] += p.cents
-        by_hour[f"{local.hour:02d}:00"] += p.cents
-    batches_query = select(Batch).where(Batch.created_at >= begin, Batch.created_at < finish)
-    if active: batches_query = batches_query.where(Batch.created_at >= active.opened_at)
-    batches = db.scalars(batches_query).all() if scope == "history" or active else []
-    batch_ids = [b.id for b in batches]
+    for cents, _method, created_at, _account_id in pay_rows:
+        local = aware(created_at).astimezone(LOCAL_TZ)
+        by_day[local.date().isoformat()] += cents
+        by_hour[f"{local.hour:02d}:00"] += cents
     products = {}
-    if batch_ids:
-        for item in db.scalars(select(OrderItem).where(OrderItem.batch_id.in_(batch_ids))):
-            qty = max(0, item.qty - item.cancelled_qty)
-            if qty:
-                row = products.setdefault(item.product_id, {"product_id": item.product_id, "name": item.name,
-                    "quantity": 0, "estimated_gross_cents": 0})
-                row["quantity"] += qty
-                row["estimated_gross_cents"] += qty * item.price_cents
+    for product_id, name, qty, cancelled_qty, price_cents in item_rows:
+        q = max(0, qty - cancelled_qty)
+        if q:
+            row = products.setdefault(product_id, {"product_id": product_id, "name": name,
+                "quantity": 0, "estimated_gross_cents": 0})
+            row["quantity"] += q
+            row["estimated_gross_cents"] += q * price_cents
     product_rank = sorted(products.values(), key=lambda x: (-x["quantity"], x["name"]))[:15]
     for product in product_rank:
         product["estimated_gross"] = amount(product.pop("estimated_gross_cents"))
-    ticket_query = select(StationTicket).where(
-        StationTicket.ready_at >= begin, StationTicket.ready_at < finish,
-        StationTicket.status == "ready")
-    if active: ticket_query = ticket_query.where(StationTicket.batch_id.in_(batch_ids))
-    tickets = db.scalars(ticket_query).all() if scope == "history" or active else []
-    prep_samples = [elapsed_seconds(t.created_at, t.ready_at) for t in tickets]
+    prep_samples = [elapsed_seconds(c, r) for c, r in ticket_rows]
     prep_average = round(sum(prep_samples) / len(prep_samples) / 60, 1) if prep_samples else None
-    audit_query = select(Audit).where(
-        Audit.action == "table.assign", Audit.created_at >= begin, Audit.created_at < finish)
-    if active: audit_query = audit_query.where(Audit.created_at >= active.opened_at)
-    assignments = db.scalars(audit_query).all() if scope == "history" or active else []
     rotation = {}
-    for entry in assignments:
+    for detail in audit_details:
         try:
-            detail = json.loads(entry.detail or "{}")
-            tid = int(detail["table_id"])
+            tid = int(json.loads(detail or "{}")["table_id"])
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):
             continue
-        table = db.get(DiningTable, tid)
-        label = table.name if table else str(tid)
-        rotation[label] = rotation.get(label, 0) + 1
+        rotation[tid] = rotation.get(tid, 0) + 1
+    if rotation:
+        table_names = {t.id: t.name for t in db.scalars(
+            select(DiningTable).where(DiningTable.id.in_(list(rotation)))).all()}
+        named = {}
+        for tid, count in rotation.items():
+            label = table_names.get(tid, str(tid))
+            named[label] = named.get(label, 0) + count
+        rotation = named
+    else:
+        rotation = {}
     return {
         "period": {"start": start.isoformat(), "end": end.isoformat()},
         "scope": scope, "active_period_id": active.id if active else None,
@@ -567,37 +593,76 @@ async def prep_alert_worker():
                 min_date = stamp - timedelta(hours=6)
                 tickets = db.scalars(select(StationTicket).where(StationTicket.status != "ready",
                                       StationTicket.created_at >= min_date).limit(250)).all()
+                # P11: cargas por lote (antes: db.get/scalar por comanda,
+                # por ítem y por meta — cientos de queries por pasada).
+                batch_ids = [t.batch_id for t in tickets]
+                batch_by = {b.id: b for b in db.scalars(
+                    select(Batch).where(Batch.id.in_(batch_ids))).all()} if batch_ids else {}
+                acc_by = {a.id: a for a in db.scalars(
+                    select(Account).where(Account.id.in_(
+                        {b.account_id for b in batch_by.values()}))).all()} if batch_by else {}
+                prep_by = {bp.batch_id: bp.minutes for bp in db.scalars(
+                    select(BatchPrep).where(BatchPrep.batch_id.in_(batch_ids))).all()} if batch_ids else {}
+                config = policy(db)
+                items_by = {}
+                for it in db.scalars(select(OrderItem).where(
+                        OrderItem.batch_id.in_(batch_ids)).order_by(OrderItem.id)).all() if batch_ids else []:
+                    items_by.setdefault((it.batch_id, it.station), []).append(it)
+                item_ids = [it.id for lst in items_by.values() for it in lst]
+                meta_by = {mt.order_item_id: mt for mt in db.scalars(
+                    select(OrderItemMeta).where(OrderItemMeta.order_item_id.in_(item_ids))).all()} if item_ids else {}
+                ready_by = {row.order_item_id: row.ready_at for row in db.scalars(
+                    select(ItemPrep).where(ItemPrep.order_item_id.in_(item_ids))).all()} if item_ids else {}
+                # Claves candidatas (comandas e ítems que ya exceden su
+                # límite) y cuáles ya tienen aviso, en una sola query.
+                cand_keys = set()
                 for ticket in tickets:
-                    batch = db.get(Batch, ticket.batch_id)
-                    acc = db.get(Account, batch.account_id)
+                    batch = batch_by.get(ticket.batch_id)
+                    if not batch:
+                        continue
+                    limit = prep_by[batch.id] if batch.id in prep_by else (config.batch_minutes if config else 25)
+                    if elapsed_seconds(batch.created_at, stamp) > limit * 60:
+                        cand_keys.add(f"batch:{batch.id}:{ticket.station}")
+                    for item in items_by.get((batch.id, ticket.station), []):
+                        if item.qty <= item.cancelled_qty or ready_by.get(item.id):
+                            continue
+                        meta = meta_by.get(item.id)
+                        product_limit = meta.prep_minutes if meta else 15
+                        if elapsed_seconds(batch.created_at, stamp) > max(1, product_limit) * 60:
+                            cand_keys.add(f"item:{item.id}")
+                existing_keys = set(db.scalars(select(PrepAlert.alert_key).where(
+                    PrepAlert.alert_key.in_(cand_keys))).all()) if cand_keys else set()
+                for ticket in tickets:
+                    batch = batch_by.get(ticket.batch_id)
+                    acc = acc_by.get(batch.account_id) if batch else None
                     if not acc or acc.status not in ("open", "pending"):
                         continue
                     seconds = elapsed_seconds(batch.created_at, stamp)
-                    limit = batch_limit(db, batch.id)
+                    limit = prep_by[batch.id] if batch.id in prep_by else (config.batch_minutes if config else 25)
                     if seconds > limit * 60:
                         key = f"batch:{batch.id}:{ticket.station}"
-                        if not db.scalar(select(PrepAlert.id).where(PrepAlert.alert_key == key)):
+                        if key not in existing_keys:
                             db.add(PrepAlert(alert_key=key))
                             try:
                                 db.commit()
+                                existing_keys.add(key)
                                 outgoing.append((ticket.station, f"Comanda #{batch.id} · {acc.name} excedió {limit} min", key))
                             except IntegrityError:
                                 db.rollback()
-                    items = db.scalars(select(OrderItem).where(OrderItem.batch_id == batch.id,
-                                        OrderItem.station == ticket.station)).all()
-                    for item in items:
-                        if item.qty <= item.cancelled_qty or get_item_completion(db, item.id, ticket):
+                    for item in items_by.get((batch.id, ticket.station), []):
+                        if item.qty <= item.cancelled_qty or ready_by.get(item.id):
                             continue
-                        meta = db.scalar(select(OrderItemMeta).where(OrderItemMeta.order_item_id == item.id))
+                        meta = meta_by.get(item.id)
                         product_limit = meta.prep_minutes if meta else 15
                         if seconds <= max(1, product_limit) * 60:
                             continue
                         key = f"item:{item.id}"
-                        if db.scalar(select(PrepAlert.id).where(PrepAlert.alert_key == key)):
+                        if key in existing_keys:
                             continue
                         db.add(PrepAlert(alert_key=key))
                         try:
                             db.commit()
+                            existing_keys.add(key)
                             outgoing.append((ticket.station, f"{item.name} · comanda #{batch.id} retrasada", key))
                         except IntegrityError:
                             db.rollback()
