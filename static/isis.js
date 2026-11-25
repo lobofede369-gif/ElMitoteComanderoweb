@@ -12,6 +12,9 @@
    Isis habla, ella se calla y lo escucha (interrupción); si la respuesta
    tarda, Isis dice una frase corta de espera; y cada ~75 segundos, entre
    turnos, avisa sola si apareció algo nuevo que necesita atención.
+   Añadido (v10.5): la frase de espera sale a los 3 s (antes a 1.5 s salía
+   casi siempre) y se deja terminar antes de la respuesta real, para no
+   cortarla a media palabra ("Dame…").
    Resumen al entrar (v8): después del saludo y las alertas, Isis dice sola
    cómo cerró el día anterior (ventas de ayer, lo más vendido, lo que se
    acabó), una sola vez por entrada al panel.
@@ -68,11 +71,14 @@
   const saidAlerts = new Set(); // alertas ya dichas (entrada + media llamada)
   let lastMidCheck = 0; // último chequeo de avisos a media llamada
   const WAIT_PHRASES = ['Dame un segundo, estoy revisando.', 'A ver, déjame checar eso.'];
-  // Fluidez (v9): Dora habla un poco más pausada y por frases, para que no
-  // suene a robot ni se trabe generando respuestas largas.
-  const KOKORO_SPEED = 0.95; // kokoro-js: generate(text, { voice, speed })
-  const PART_PAUSE_MS = 200; // respiro entre frases
-  const WAIT_DELAY_MS = 1500; // la frase de espera sale antes de los 2 s
+  // Fluidez (v9, ritmo despierto en v10.5): por frases, para que no suene
+  // a robot ni se trabe generando respuestas largas. La velocidad subió
+  // (Dora 1.05, pausa 100 ms) porque a 0.95 con pausas de 200 ms la voz
+  // sonaba lenta y adormilada en el teléfono.
+  const KOKORO_SPEED = 1.05; // kokoro-js: generate(text, { voice, speed })
+  const PART_PAUSE_MS = 100; // respiro entre frases
+  const WAIT_DELAY_MS = 3000; // la frase de espera solo sale si la respuesta sí tarda (a 1.5 s salía casi siempre y se cortaba a media palabra)
+  const WAIT_FINISH_MS = 2500; // tope para dejar terminar la frase de espera antes de la respuesta real
   const CHAT_TIMEOUT_MS = 15000; // la petición de chat no cuelga la llamada
   const OPENAI_TTS_TIMEOUT_MS = 8000; // por frase: si tarda, Dora cubre
   let openaiTTS = false; // v10: el servidor tiene llave de OpenAI (lo dice /status)
@@ -324,6 +330,10 @@
   // hablar en cuanto esté lista la primera, sin esperar a generar todo.
   // No se parte el punto entre dígitos ("Corona 1.2", "40.50 pesos") ni los
   // montos: solo se parte en punto, ?, !, ; o … seguidos de espacio o fin.
+  // Voz despierta (v10.5): después las frases cortas se fusionan
+  // (mergeSpeechParts) hasta ~160 caracteres, para que cada parte rinda
+  // 2-4 s de audio y la generación (~1.5 s por frase) ya no supere a la
+  // reproducción, que era lo que dejaba silencios de 1.5 s entre frases.
   function splitIntoSpeechParts(text) {
     const clean = (text || '').replace(/\s+/g, ' ').trim();
     if (!clean) return [];
@@ -351,7 +361,27 @@
       }
       if (cur.trim()) out.push(cur.trim());
     }
-    return out.filter(Boolean);
+    // Voz despierta (v10.5): las frases muy cortas se fusionan hasta ~160
+    // caracteres (tope ~200) para que cada parte rinda 2-4 s de audio.
+    // Antes cada frase era una petición de voz aparte (~1.5 s hasta el
+    // primer trozo) y con partes de 0.3-1 s la llamada quedaba llena de
+    // silencios. Una parte sola más larga que 200 se queda como está.
+    return mergeSpeechParts(out.filter(Boolean));
+  }
+
+  // Fusiona partes cortas consecutivas: no fusiona si la acumulada ya
+  // llegó a ~160 caracteres, ni si el resultado pasaría de ~200.
+  function mergeSpeechParts(parts) {
+    const merged = [];
+    for (const p of parts) {
+      const last = merged[merged.length - 1];
+      if (last && last.length < 160 && last.length + 1 + p.length <= 200) {
+        merged[merged.length - 1] = last + ' ' + p;
+      } else {
+        merged.push(p);
+      }
+    }
+    return merged;
   }
 
   // Números a palabras en la voz (v10.4): espejo en JS del normalizador
@@ -649,8 +679,9 @@
 
   async function generateKokoroPart(text, gen) {
     try {
-      // speed 0.95 (kokoro-js: generate(text, { voice, speed }), default 1):
-      // Dora habla un poco más pausada, menos a robot. No hay control de
+      // speed KOKORO_SPEED (kokoro-js: generate(text, { voice, speed }),
+      // default 1): a 1.05 Dora suena despierta; a 0.95 sonaba adormilada.
+      // No hay control de
       // tono ni de emoción en kokoro-js: la naturalidad sale de la velocidad
       // y de las pausas entre frases, no de parámetros que no existen.
       // Solo la copia para la voz pasa por el normalizador (v10.4):
@@ -902,36 +933,52 @@
   }
 
   // Voz con OpenAI (v10, streaming en v10.2): por frases, igual que Dora
-  // (v9): la siguiente ya se pide mientras suena la actual. Si OpenAI
-  // falla en una frase, esa frase suena con Dora (o la voz del teléfono);
-  // si falla dos veces seguidas en la misma respuesta, el resto va
-  // directo con Dora para no pagar el tiempo de espera frase por frase.
+  // (v9): las siguientes ya se piden mientras suena la actual. Voz
+  // despierta (v10.5): se piden DOS frases por adelantado, no una: con
+  // partes cortas la reproducción se acababa antes de que llegara la
+  // siguiente y quedaban huecos de ~1.5 s. Si OpenAI falla en una frase,
+  // esa frase suena con Dora (o la voz del teléfono); si falla dos veces
+  // seguidas en la misma respuesta, el resto va directo con Dora para no
+  // pagar el tiempo de espera frase por frase.
   async function speakOpenAI(text, voiceOverride) {
     const gen = speakGen;
     const parts = splitIntoSpeechParts(text);
-    let nextPlayerPromise = null;
+    let nextPlayers = []; // v10.5: cola de hasta 2 frases ya pedidas
     let openaiFails = 0;
     let useOpenAI = true;
+    // Cancela todas las frases pedidas que aún no sonaron (al interrumpir,
+    // colgar, cambiar de generación o dejar de usar OpenAI).
+    const cancelQueued = () => {
+      for (const p of nextPlayers) p.then((pl) => { if (pl) pl.cancel(); }).catch(() => {});
+      nextPlayers = [];
+    };
+    // Pide por adelantado las frases desde `from` hasta tener 2 en cola.
+    const prefetch = (from) => {
+      while (useOpenAI && nextPlayers.length < 2 && from < parts.length) {
+        nextPlayers.push(requestOpenAIPart(parts[from], gen, voiceOverride));
+        from++;
+      }
+    };
     for (let i = 0; i < parts.length; i++) {
       if (gen !== speakGen || !speaking) {
-        if (nextPlayerPromise) nextPlayerPromise.then((p) => { if (p) p.cancel(); }).catch(() => {});
+        cancelQueued();
         return;
       }
       let heard = false;
       if (useOpenAI) {
         let player = null;
-        if (nextPlayerPromise) {
-          player = await nextPlayerPromise;
-          nextPlayerPromise = null;
+        if (nextPlayers.length) {
+          player = await nextPlayers.shift();
         } else {
           player = await requestOpenAIPart(parts[i], gen, voiceOverride);
         }
         if (gen !== speakGen || !speaking) {
           if (player) player.cancel();
+          cancelQueued();
           return;
         }
         if (player) {
-          if (useOpenAI && i + 1 < parts.length) nextPlayerPromise = requestOpenAIPart(parts[i + 1], gen, voiceOverride);
+          prefetch(i + 1);
           heard = await player.play();
         }
       }
@@ -943,12 +990,9 @@
           openaiFails += 1;
           if (openaiFails >= 2) {
             useOpenAI = false;
-            // La siguiente frase ya se estaba pidiendo con OpenAI: si
-            // llega, se cancela en vez de quedar colgada en memoria.
-            if (nextPlayerPromise) {
-              nextPlayerPromise.then((p) => { if (p) p.cancel(); }).catch(() => {});
-              nextPlayerPromise = null;
-            }
+            // Las frases que ya se estaban pidiendo con OpenAI se
+            // cancelan en vez de quedar colgadas en memoria.
+            cancelQueued();
           }
         }
         if (kokoroTTS) {
@@ -959,7 +1003,10 @@
           await speakPhone(parts[i], true);
         }
       }
-      if (gen !== speakGen || !speaking) return;
+      if (gen !== speakGen || !speaking) {
+        cancelQueued();
+        return;
+      }
       // Pausa corta entre frases, para que respire.
       if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, PART_PAUSE_MS));
     }
@@ -1007,15 +1054,30 @@
     // Duda natural (v7) con voz instantánea (v9): si la respuesta tarda,
     // Isis dice una sola frase corta de espera CON LA VOZ DEL TELÉFONO, que
     // arranca al instante; antes también se generaba con Dora y ella misma
-    // tardaba. Cuando llega la respuesta real, la frase se corta sola
-    // porque speak() para la voz en curso.
+    // tardaba. Cuando llega la respuesta real, la frase de espera se deja
+    // terminar (waitForWaitPhrase, con tope): cortarla a media palabra
+    // ("Dame…") sonaba como si la voz gratis interrumpiera a la de paga.
     let waitSaid = false;
+    // La promesa del speak() de la frase de espera, para esperarla cuando
+    // llegue la respuesta (ver waitForWaitPhrase).
+    let waitSpeakPromise = null;
     const waitTimer = setTimeout(async () => {
       if (!inCall || waitSaid) return;
       waitSaid = true;
       const phrase = WAIT_PHRASES[Math.floor(Math.random() * WAIT_PHRASES.length)];
-      try { await speak(phrase, { forcePhone: true }); } catch (e) {}
+      waitSpeakPromise = speak(phrase, { forcePhone: true });
+      try { await waitSpeakPromise; } catch (e) {}
     }, WAIT_DELAY_MS);
+    // Espera a que la frase de espera termine (con tope): si ya terminó o
+    // nunca salió, no espera nada. Colgar o interrumpir la corta igual que
+    // antes, porque stopSpeaking() resuelve su promesa al cancelar la voz.
+    const waitForWaitPhrase = async () => {
+      if (!waitSpeakPromise) return;
+      await Promise.race([
+        waitSpeakPromise.catch(() => {}),
+        new Promise((r) => setTimeout(r, WAIT_FINISH_MS)),
+      ]);
+    };
     await wakeServer(2000);
     let data = {};
     let r = null;
@@ -1040,6 +1102,7 @@
       const rep = $('#isis-reply');
       if (rep) rep.textContent = 'Isis: ' + reply;
       // Si el usuario colgó mientras llegaba la respuesta, ya no se habla.
+      await waitForWaitPhrase();
       if (inCall) await speak(reply);
       busy = false;
       maybeListen();
@@ -1054,6 +1117,7 @@
     const reply = data.reply || 'Listo.';
     const rep = $('#isis-reply');
     if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di "sí" para confirmar o "no" para cancelar.)' : '');
+    await waitForWaitPhrase();
     if (inCall) await speak(reply);
     busy = false;
     await maybeMidCallAlert();
@@ -1376,10 +1440,14 @@
 
   // _test es solo para las pruebas locales (sin navegador): expone la
   // decisión del motor y el habla para verificar que en modo gratis no se
-  // llama nunca al endpoint de OpenAI.
+  // llama nunca al endpoint de OpenAI; sendToIsis con setInCall sirve
+  // para verificar la frase de espera en VM (que no se corte a media
+  // palabra y que colgar la corte de inmediato).
   window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit, startCall, endCall, toggleMute,
     _test: { resolveVoiceEngine, getVoiceEngine: () => voiceEngine, setVoiceEngine,
       resolveOpenAIVoice, getOpenAIVoice, setOpenAIVoice, playVoiceSample, isisTtsText,
+      splitIntoSpeechParts, mergeSpeechParts,
       requestOpenAIPart, makeOpenAIVoicePlayer: makeOpenAIPlayer,
-      setOpenaiAvailable: (v) => { openaiTTS = !!v; applyVoiceEngine(); }, speak } };
+      setOpenaiAvailable: (v) => { openaiTTS = !!v; applyVoiceEngine(); }, speak,
+      sendToIsis, setInCall: (v) => { inCall = !!v; } } };
 })();

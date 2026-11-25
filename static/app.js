@@ -1128,12 +1128,38 @@ async function syncWaiterReadyAlerts(initial=false){
     if(state.waiterReadyPending){state.waiterReadyPending=false;syncWaiterReadyAlerts().catch(()=>{});}
   }
 }
+// P16: qué tipos de cambio puede mostrar cada pantalla (según lo que su
+// show* carga del servidor). 'audit' es null = cualquier tipo, porque cada
+// escritura queda en auditoría. Una pantalla no listada refresca siempre.
+const SCREEN_KINDS={overview:['accounts','tickets','cash','tables'],accounts:['accounts','approvals','cash'],all:['accounts','approvals','cash'],tables:['tables','accounts'],new:['tables'],orders:['accounts','products','tables'],station:['tickets','accounts','prepconfig'],history:['tickets','accounts','prepconfig'],tickets:['tickets','accounts','prepconfig'],notifications:['ready','tickets'],cashier:['accounts','cash'],cash:['cash','accounts'],tips:['accounts','cash','tips'],products:['products','inventory','settings'],inventory:['inventory','products','settings'],users:['users'],approvals:['approvals','accounts'],audit:null,reservations:['reservations'],prepconfig:['prepconfig'],analytics:['accounts','tickets','cash']};
+function liveEventKind(raw){if(raw==='refresh')return 'refresh';try{const o=JSON.parse(raw);return typeof o.kind==='string'?o.kind:'refresh'}catch{return 'refresh'}}
+const LIVE_KINDS=new Set(['accounts','tickets','products','inventory','cash','tables','users','approvals','reservations','settings','prepconfig','ready','tips']);
+function liveRenderNow(){
+  const editing=document.activeElement?.matches('input,textarea,select');
+  if(state.user?.role==='waiter'&&state.screen==='orders'){state.pendingRefresh=true;$('#refresh')?.classList.add('has-update')}
+  else if(!editing)render({preserveScroll:true}).catch(()=>{});
+}
+function handleLiveEvent(raw){
+  let kind=liveEventKind(raw);
+  // Vocabulario de tipos que el servidor emite hoy. Un tipo que el cliente
+  // no conozca (p. ej. de un despliegue más nuevo) se trata como 'refresh':
+  // refresco completo, nunca se pierde una actualización por un tipo nuevo.
+  if(kind!=='refresh'&&!LIVE_KINDS.has(kind))kind='refresh';
+  // Los avisos de "listo" solo los crean cambios de comandas o de avisos.
+  if(state.user?.role==='waiter'&&(kind==='tickets'||kind==='ready'||kind==='refresh'))syncWaiterReadyAlerts().catch(()=>{});
+  const kinds=SCREEN_KINDS[state.screen];
+  if(kind!=='refresh'&&kinds&&!kinds.includes(kind))return; // esta pantalla no muestra ese cambio
+  if(Date.now()-state.lastRefresh>1400){state.lastRefresh=Date.now();liveRenderNow()}
+  // Debounce: si llegó dentro de la ventana, renderizar una sola vez al
+  // cerrarse (antes se perdía el refresco hasta el siguiente evento).
+  else if(!state.liveTimer){const wait=1400-(Date.now()-state.lastRefresh);state.liveTimer=setTimeout(()=>{state.liveTimer=null;state.lastRefresh=Date.now();liveRenderNow()},wait)}
+}
 async function listenEvents(){while(state.user&&state.token){try{
   await refreshSessionIfNeeded();const token=state.token;
   const res=await fetch('/api/events',{headers:{Authorization:'Bearer '+token},cache:'no-store'});
   if(res.status===401){logout('expired');break}if(!res.ok)throw Error('Sin eventos');
   const reader=res.body.getReader();const decoder=new TextDecoder();let pending='';
-  while(state.token===token&&state.user){const {done,value}=await reader.read();if(done)break;pending+=decoder.decode(value,{stream:true});const parts=pending.split('\n\n');pending=parts.pop();if(parts.some(x=>x.includes('data: refresh'))){if(state.user?.role==='waiter')syncWaiterReadyAlerts().catch(()=>{});if(Date.now()-state.lastRefresh>1400){state.lastRefresh=Date.now();const editing=document.activeElement?.matches('input,textarea,select');if(state.user?.role==='waiter'&&state.screen==='orders'){state.pendingRefresh=true;$('#refresh')?.classList.add('has-update')}else if(!editing)await render({preserveScroll:true})}}}
+  while(state.token===token&&state.user){const {done,value}=await reader.read();if(done)break;pending+=decoder.decode(value,{stream:true});const parts=pending.split('\n\n');pending=parts.pop();for(const part of parts){const m=part.match(/^data: (.*)$/);if(m)handleLiveEvent(m[1].trim())}}
  }catch{}if(!state.user)break;await new Promise(r=>setTimeout(r,3500))}}
 // La pantalla principal solo muestra un teclado numérico. Los perfiles se obtienen del servidor.
 const recoveryMode=new URLSearchParams(location.search).get('recuperar')==='1';
