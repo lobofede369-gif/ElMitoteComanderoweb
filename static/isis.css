@@ -34,4 +34,19 @@
 .isis-hint{color:#cdbfa8;font-size:.8rem;text-align:center;max-width:420px;margin-top:26px;letter-spacing:.12em}
 .isis-voice-row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:18px}
 .isis-voice-row button{background:none;border:0;color:#cdbfa8;padding:6px 8px;font-size:.8rem;text-decoration:underline}
+.isis-engine-row{display:flex;gap:8px;align-items:center;justify-content:center;margin-top:14px}
+.isis-engine-row span{color:#8a7d68;font-size:.75rem}
+.isis-engine-row button{background:none;border:1px solid #5c5345;color:#cdbfa8;border-radius:999px;padding:6px 12px;font-size:.78rem}
+.isis-engine-row button.active{border-color:#ffc400;color:#ffc400;font-weight:600}
+.isis-engine-row button:disabled{opacity:.4}
+.isis-engine-note{color:#8a7d68;font-size:.75rem;text-align:center;margin-top:6px}
+.isis-engine-note[hidden]{display:none}
+/* Probar voces (v10.2): mismo estilo que el interruptor, discreto. */
+.isis-try-row{margin-top:10px;text-align:center}
+.isis-try-row[hidden]{display:none}
+.isis-try-row>button{background:none;border:1px solid #5c5345;color:#cdbfa8;border-radius:999px;padding:6px 12px;font-size:.78rem}
+.isis-try-pick{display:flex;gap:8px;justify-content:center;margin-top:8px}
+.isis-try-pick[hidden]{display:none}
+.isis-try-pick button{background:none;border:1px solid #5c5345;color:#cdbfa8;border-radius:999px;padding:6px 12px;font-size:.78rem}
+.isis-try-pick button.active{border-color:#ffc400;color:#ffc400;font-weight:600}
 #isis-voice-state{color:#8a7d68;font-size:.75rem;text-align:center;margin-top:6px}

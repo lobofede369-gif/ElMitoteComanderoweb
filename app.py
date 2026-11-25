@@ -841,6 +841,39 @@ def isis_ping(user=Depends(auth_isis)):
 FABLEAI_API_KEY = os.getenv('FABLEAI_API_KEY', '').strip()
 FABLEAI_MODEL = os.getenv('FABLEAI_MODEL', 'claude-sonnet-5-5').strip()
 FABLEAI_URL = os.getenv('FABLEAI_URL', 'https://api.fableaiapi.com/v1/chat/completions').strip()
+# Voz de Isis con OpenAI TTS (v10): la llave vive SOLO en la variable de
+# entorno OPENAI_API_KEY del servidor, igual que la de FableAI: nunca en el
+# navegador, nunca en localStorage, nunca en logs. Sin clave, el endpoint
+# de voz responde 503 y el frente usa Dora (Kokoro) o la voz del teléfono.
+# gpt-4o-mini-tts es la voz recomendada (la más natural de las baratas);
+# se apaga el 6 de enero de 2027 (reemplazo: gpt-realtime-2.1-mini).
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '').strip()
+OPENAI_TTS_MODEL = os.getenv('OPENAI_TTS_MODEL', 'gpt-4o-mini-tts').strip()
+# Voces que OpenAI TTS acepta: la app solo ofrece coral/nova/shimmer
+# para probar, pero el endpoint acepta cualquiera de la lista (la de
+# servidor, OPENAI_TTS_VOICE, también se valida contra ella).
+OPENAI_TTS_VOICES = frozenset(['coral', 'nova', 'shimmer', 'alloy', 'ash',
+                               'ballad', 'echo', 'fable', 'onyx', 'sage', 'verse'])
+OPENAI_TTS_VOICE = os.getenv('OPENAI_TTS_VOICE', 'coral').strip().lower()
+if OPENAI_TTS_VOICE not in OPENAI_TTS_VOICES:
+    OPENAI_TTS_VOICE = 'coral'
+# Velocidad de la voz de paga (v10.2): 0.95 para sonar igual de pausada
+# que Dora; 0.25–4.0 según OpenAI, fuera de rango se ajusta.
+def _env_tts_speed():
+    try:
+        v = float(os.getenv('OPENAI_TTS_SPEED', '0.95') or '0.95')
+    except ValueError:
+        return 0.95
+    return min(4.0, max(0.25, v))
+OPENAI_TTS_SPEED = _env_tts_speed()
+# Instrucciones de estilo (v10.2): solo gpt-4o-mini-tts las acepta; así
+# Isis suena cálida y natural, como gerente mexicana hablando por
+# teléfono con su jefe, sin sonar robot ni exagerada.
+_ISIS_TTS_INSTRUCTIONS_DEFAULT = ('Habla con voz cálida y natural, como la gerente de un restaurante '
+    'mexicano hablando por teléfono con su jefe: cercana, segura y clara, con ritmo tranquilo y '
+    'pausas naturales. Nunca suenes robot ni exagerada.')
+OPENAI_TTS_INSTRUCTIONS = (os.getenv('OPENAI_TTS_INSTRUCTIONS', '') or _ISIS_TTS_INSTRUCTIONS_DEFAULT).strip() or _ISIS_TTS_INSTRUCTIONS_DEFAULT
+OPENAI_TTS_URL = 'https://api.openai.com/v1/audio/speech'
 _ISIS_CONFIRM = {}  # token -> {'intent': dict, 'expires': float}
 
 # --- Memoria de conversación (v4): solo en memoria del servidor, nunca en BD ---
@@ -3015,6 +3048,7 @@ def isis_voice_status(db: Session = Depends(db_session), user: User = Depends(au
     except Exception:
         morning_brief = ''
     return {'ok': True, 'isis_user_exists': exists, 'fableai_configured': bool(FABLEAI_API_KEY),
+            'openai_tts_configured': bool(OPENAI_API_KEY),
             'voice': 'kokoro-ef-dora', 'mode': 'solo-mitote', 'alerts': alerts,
             'morning_brief': morning_brief}
 
@@ -3026,6 +3060,92 @@ def isis_voice_end_call(user: User = Depends(auth)):
         raise HTTPException(403, 'Este panel de voz es solo para Isis')
     _isis_history_clear(user.id)
     return {'ok': True}
+
+class IsisTTSIn(BaseModel):
+    text: str = Field(min_length=1, max_length=1000)
+    voice: Optional[str] = None  # v10.2: probar voces; se valida contra la lista
+
+def _isis_tts_text(text):
+    """Copia del texto SOLO para la voz (v10.2): puntuación y caracteres
+    que la voz lee mejor, para que la entonación salga natural. El texto
+    que se muestra en pantalla NO cambia: solo cambia la copia que se
+    manda a OpenAI. Pura y testeable."""
+    t = ' '.join(str(text or '').split())
+    t = re.sub(r'\$(\d+)', r'\1 pesos', t)  # "$40" -> "40 pesos"
+    t = re.sub(r'(\d)\s*%', r'\1 por ciento', t)  # "50%" -> "50 por ciento"
+    t = t.replace('&', ' y ').replace('+', ' más ').replace('°', ' grados ')
+    t = t.replace('#', ' número ').replace('@', ' arroba ')
+    t = t.replace('...', '…')
+    # Espacio tras el punto si falta ("Hola.Santiago" -> "Hola. Santiago");
+    # el punto entre dígitos ("1.2", "40.50") no se toca.
+    t = re.sub(r'([.!?…])(?=[A-Za-zÁÉÍÓÚÜÑáéíóúüñ])', r'\1 ', t)
+    t = ' '.join(t.split())
+    if t and t[-1] not in '.?!…':
+        t += '.'
+    return t
+
+def _isis_openai_tts_open(text, voice):
+    """Abre la petición de voz en streaming (v10.2, stream=true) y devuelve
+    (status, respuesta) para leer los trozos después, en el generador del
+    StreamingResponse. Corre en un hilo (asyncio.to_thread): urllib es
+    bloqueante. La llave nunca se registra ni se devuelve."""
+    payload = {'model': OPENAI_TTS_MODEL, 'input': _isis_tts_text(text),
+               'voice': voice, 'response_format': 'mp3',
+               'speed': OPENAI_TTS_SPEED, 'stream': True}
+    # Las instrucciones de estilo solo las acepta gpt-4o-mini-tts.
+    if OPENAI_TTS_MODEL.startswith('gpt-4o-mini-tts'):
+        payload['instructions'] = OPENAI_TTS_INSTRUCTIONS
+    req = urllib.request.Request(OPENAI_TTS_URL, data=json.dumps(payload).encode('utf-8'),
+                                 headers={'Content-Type': 'application/json',
+                                          'Authorization': 'Bearer ' + OPENAI_API_KEY},
+                                 method='POST')
+    try:
+        resp = urllib.request.urlopen(req, timeout=20)
+        return resp.status, resp
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception:
+        return None, None
+
+@app.post('/api/isis-voice/tts')
+async def isis_voice_tts(data: IsisTTSIn, user: User = Depends(auth)):
+    """Voz de Isis con OpenAI TTS (v10, streaming en v10.2): devuelve el
+    audio MP3 de la frase por trozos, en cuanto OpenAI los genera, para
+    que el frente empiece a sonar sin esperar al audio completo. Solo
+    Isis (o el propietario, para probar). Sin clave en el servidor, 503
+    y el frente usa Dora o la voz del teléfono; si OpenAI falla, 502."""
+    if user.username != 'isis' and user.role != 'owner':
+        raise HTTPException(403, 'Este panel de voz es solo para Isis')
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, 'Voz de OpenAI no configurada en el servidor')
+    text = (data.text or '').strip()
+    if not text:
+        raise HTTPException(400, 'Texto vacío')
+    voice = (data.voice or '').strip().lower() or OPENAI_TTS_VOICE
+    if voice not in OPENAI_TTS_VOICES:
+        raise HTTPException(400, 'Voz no válida')
+    status_code, resp = await asyncio.to_thread(_isis_openai_tts_open, text, voice)
+    if resp is None:
+        raise HTTPException(502, 'No se pudo generar la voz')
+    if status_code != 200:
+        try:
+            resp.close()
+        except Exception:
+            pass
+        raise HTTPException(502, 'OpenAI no pudo generar la voz')
+    def _chunks():
+        try:
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    return StreamingResponse(_chunks(), media_type='audio/mpeg')
 
 class IsisChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=1000)
