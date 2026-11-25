@@ -556,12 +556,17 @@ def _ensure_indexes(conn):
         'ON cash_periods ((1)) WHERE closed_at IS NULL'
     )
 
-def _bootstrap_migrations(conn):
-    """Bloque DDL + backfills de esquema (P15): corre una sola vez por
-    versión; _bootstrap_schema_version() lo salta en arranques posteriores.
-    Subir SCHEMA_VERSION cuando se añada una migración nueva aquí."""
-    # Migración aditiva y compatible con SQLite/PostgreSQL. Los eventos existentes
-    # con acknowledged_at ya representan entregas confirmadas en la UI anterior.
+def _ensure_migration_columns(conn):
+    """Columnas aditivas de las migraciones (P15): DDL idempotente que
+    corre en CADA arranque, no solo cuando sube SCHEMA_VERSION.
+    create_all no agrega columnas a tablas ya creadas y el bloque
+    versionado se salta si settings.schema_version ya está aplicado;
+    sin esto, una columna borrada (o una BD creada antes de la
+    migración) dejaba a _ensure_indexes() sin la columna que el índice
+    necesita (uq_cash_movements_client_key -> client_key) y bootstrap()
+    fallaba (lo cazó test_postgres_integration). Los backfills NO van
+    aquí: solo corresponden a la primera actualización del esquema
+    (ver _bootstrap_migrations)."""
     cash_movement_columns={column['name'] for column in inspect(conn).get_columns('cash_movements')}
     if 'client_key' not in cash_movement_columns:
         conn.exec_driver_sql('ALTER TABLE cash_movements ADD COLUMN client_key VARCHAR(100) NULL')
@@ -583,15 +588,31 @@ def _bootstrap_migrations(conn):
         'last_error':'VARCHAR(240) NULL',
         'delivered_at':'TIMESTAMP WITH TIME ZONE NULL',
     }
-    # Esta limpieza solo corresponde a la primera actualización del esquema.
-    # Ejecutarla en cada arranque borraba el estado de entrega de eventos nuevos
-    # y volvía a enviar notificaciones ya aceptadas por FCM/Web Push.
-    legacy_outbox_schema=any(name not in columns for name in additions)
     for column_name,column_type in additions.items():
         if column_name not in columns:
             conn.exec_driver_sql(
                 f'ALTER TABLE ready_notification_events ADD COLUMN {column_name} {column_type}'
             )
+
+def _bootstrap_migrations(conn):
+    """Bloque DDL + backfills de esquema (P15): corre una sola vez por
+    versión; _bootstrap_schema_version() lo salta en arranques posteriores.
+    Subir SCHEMA_VERSION cuando se añada una migración nueva aquí.
+    Las columnas las asegura _ensure_migration_columns() (que también
+    corre en cada arranque desde bootstrap()); aquí solo quedan los
+    backfills, que NO deben repetirse (ver comentario abajo)."""
+    # Migración aditiva y compatible con SQLite/PostgreSQL. Los eventos existentes
+    # con acknowledged_at ya representan entregas confirmadas en la UI anterior.
+    columns={column['name'] for column in inspect(conn).get_columns('ready_notification_events')}
+    # Esta limpieza solo corresponde a la primera actualización del esquema.
+    # Ejecutarla en cada arranque borraba el estado de entrega de eventos nuevos
+    # y volvía a enviar notificaciones ya aceptadas por FCM/Web Push.
+    legacy_outbox_schema=any(
+        name not in columns for name in (
+            'provider_accepted_at','attempt_count','next_attempt_at','last_error','delivered_at'
+        )
+    )
+    _ensure_migration_columns(conn)
     conn.exec_driver_sql(
         'UPDATE ready_notification_events SET delivered_at=acknowledged_at '
         'WHERE acknowledged_at IS NOT NULL AND delivered_at IS NULL'
@@ -626,12 +647,15 @@ def bootstrap():
     # + backfills corre una sola vez; en arranques posteriores se salta si
     # settings.schema_version ya está aplicado.
     applied_migrations = _bootstrap_schema_version()
-    # Índices en cada arranque (DESPUÉS de las migraciones: algún índice
-    # usa columnas que las migraciones crean, p. ej. client_key). create_all
-    # no agrega índices a tablas ya creadas y el bloque versionado solo
-    # corre una vez; sin esto, un índice borrado ya no se restauraba (lo
-    # cazó test_performance_regressions). DDL idempotente.
+    # Columnas e índices en cada arranque (DESPUÉS de las migraciones:
+    # algún índice usa columnas que las migraciones crean, p. ej.
+    # client_key). create_all no agrega columnas ni índices a tablas ya
+    # creadas y el bloque versionado solo corre una vez; sin esto, una
+    # columna borrada ya no se restauraba y _ensure_indexes() fallaba
+    # (lo cazó test_postgres_integration). DDL idempotente; en una BD
+    # ya migrada no hace nada.
     with engine.begin() as conn:
+        _ensure_migration_columns(conn)
         _ensure_indexes(conn)
     with SessionLocal() as db:
         if not db.get(Setting,1): db.add(Setting(id=1,inventory_on=False,schema_version=SCHEMA_VERSION))
