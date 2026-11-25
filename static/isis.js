@@ -68,7 +68,9 @@
     kokoroPromise = (async () => {
       try {
         const mod = await import('https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm');
-        const tts = await mod.KokoroTTS.from('hexgrad/Kokoro-82M');
+        // kokoro-js 1.2.1 usa from_pretrained con el modelo ONNX, no .from()
+        // con 'hexgrad/Kokoro-82M' (ese repo no tiene archivos ONNX y fallaba).
+        const tts = await mod.KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', { dtype: 'q8', device: 'wasm' });
         kokoroTTS = tts;
         kokoroState = 'ready';
         if (stateEl) stateEl.textContent = 'Voz de Isis lista (Dora).';
@@ -76,9 +78,11 @@
         if (btn) btn.textContent = 'Voz de Isis lista ✓';
         return tts;
       } catch (e) {
+        try { console.error('Kokoro:', e); } catch (_) {}
         kokoroTTS = null;
-        kokoroState = 'failed';
-        if (stateEl) stateEl.textContent = 'No se pudo descargar la voz; Isis hablará con la voz del teléfono.';
+        kokoroState = 'idle'; // permite reintentar tocando de nuevo
+        kokoroPromise = null;
+        if (stateEl) stateEl.textContent = 'No se pudo descargar la voz; toca de nuevo para reintentar. Mientras tanto, Isis hablará con la voz del teléfono.';
         return null;
       }
     })();
