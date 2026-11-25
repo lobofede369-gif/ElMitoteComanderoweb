@@ -872,6 +872,7 @@ def _isis_history_add(user_id, user_msg, reply):
 
 def _isis_history_clear(user_id):
     _ISIS_HISTORY.pop(user_id, None)
+    _ISIS_CASH_CUT.pop(user_id, None)  # un corte a medias tampoco sobrevive al colgado
 
 
 def _isis_history_text(user_id):
@@ -879,6 +880,108 @@ def _isis_history_text(user_id):
     if not turns:
         return ''
     return '\n'.join(f"Usuario: {u}\nIsis: {r}" for u, r in turns)
+
+# --- Corte de caja guiado (v8): estado por usuario, vive junto a la memoria
+# de conversación: se borra al colgar (end-call) y expira a los 30 minutos
+# sin uso, igual que el historial. Nunca se ejecuta un cierre sin la
+# confirmación de Santiago (el token de confirmación que ya existe).
+_ISIS_CASH_CUT = {}  # user_id -> {'step': 'cash'|'card'|'transfer', 'cash': float, 'card': float, 'transfer': float, 'last': float}
+_ISIS_CASH_CUT_QUESTIONS = {
+    'cash': '¿Cuánto hay en efectivo?',
+    'card': '¿Y en tarjeta?',
+    'transfer': '¿Y por transferencias?',
+}
+
+
+def _isis_cash_cut_get(user_id):
+    e = _ISIS_CASH_CUT.get(user_id)
+    if not e or time.time() - e.get('last', 0) > _ISIS_HISTORY_TTL:
+        _ISIS_CASH_CUT.pop(user_id, None)
+        return None
+    return e
+
+
+def _isis_cash_cut_start(user_id):
+    _ISIS_CASH_CUT[user_id] = {'step': 'cash', 'cash': 0.0, 'card': 0.0, 'transfer': 0.0,
+                               'last': time.time()}
+
+
+def _isis_cash_cut_clear(user_id):
+    _ISIS_CASH_CUT.pop(user_id, None)
+
+
+def _isis_cash_cut_question(step, repeat=False):
+    q = _ISIS_CASH_CUT_QUESTIONS[step]
+    return q + (' Dime el monto en pesos.' if repeat else '')
+
+
+def _isis_cash_cut_summary(db, user, flow):
+    """Compara lo dictado con lo que espera el sistema, en corto y en pesos."""
+    total = flow['cash'] + flow['card'] + flow['transfer']
+    base = (f"Conté {_isis_pesos(total)} en total: {_isis_pesos(flow['cash'])} en efectivo, "
+            f"{_isis_pesos(flow['card'])} con tarjeta y {_isis_pesos(flow['transfer'])} por transferencias.")
+    try:
+        c = cash(db, user)
+        if not c.get('open'):
+            return base + ' No hay turno abierto, así que no tengo con qué compararlo.'
+        exp_cash = float(str(c.get('expected') or '0').replace(',', ''))
+        exp_card = float(str(c.get('card') or '0').replace(',', ''))
+        exp_tr = float(str(c.get('transfer') or '0').replace(',', ''))
+        diffs = []
+        for label, got, exp in (('efectivo', flow['cash'], exp_cash),
+                                ('tarjeta', flow['card'], exp_card),
+                                ('transferencias', flow['transfer'], exp_tr)):
+            d = round(got - exp, 2)
+            if d > 0:
+                diffs.append(f"en {label} sobran {_isis_pesos(d)}")
+            elif d < 0:
+                diffs.append(f"en {label} faltan {_isis_pesos(abs(d))}")
+        if not diffs:
+            return base + ' Cuadra perfecto con lo del sistema.'
+        return base + ' ' + '. '.join(x[0].upper() + x[1:] for x in diffs) + '.'
+    except Exception:
+        return base
+
+
+def _isis_cash_cut_step(db, user, raw):
+    """Un paso del corte guiado. Devuelve {'reply', 'needs_confirmation',
+    'confirm_token'} o None si no hay flujo en curso."""
+    uid = user.id
+    flow = _isis_cash_cut_get(uid)
+    if not flow:
+        return None
+    text = _isis_norm(raw)
+    # Volver a pedir el corte en medio del flujo: se reinicia desde cero.
+    if ('corte de caja' in text or 'haz el corte' in text or 'cierra el turno' in text) \
+            and _isis_money_spoken(text) is None:
+        _isis_cash_cut_start(uid)
+        return {'reply': 'Va, empezamos de nuevo el corte. ¿Cuánto hay en efectivo?',
+                'needs_confirmation': False, 'confirm_token': None}
+    if re.search(r'\b(cancela|cancelar|olvidalo|olvida|mejor no|dejalo)\b', text) or text.strip() == 'no':
+        _isis_cash_cut_clear(uid)
+        return {'reply': 'Sale, cancelado. No cerré nada.',
+                'needs_confirmation': False, 'confirm_token': None}
+    amt = _isis_money_spoken(text)
+    step = flow['step']
+    if amt is None:
+        return {'reply': _isis_cash_cut_question(step, repeat=True),
+                'needs_confirmation': False, 'confirm_token': None}
+    flow[step] = float(amt)
+    flow['last'] = time.time()
+    nxt = {'cash': 'card', 'card': 'transfer', 'transfer': None}[step]
+    if nxt:
+        flow['step'] = nxt
+        return {'reply': _isis_cash_cut_question(nxt),
+                'needs_confirmation': False, 'confirm_token': None}
+    # Último paso: comparar y pedir confirmación; el cierre usa el token
+    # que ya existe, nunca se ejecuta solo con decir los montos.
+    _isis_cash_cut_clear(uid)
+    summary = _isis_cash_cut_summary(db, user, flow)
+    intent = {'action': 'close_cash',
+              'params': {'counted': flow['cash'], 'note': 'Corte guiado por voz con Isis'}}
+    token = _isis_confirm_token(intent)
+    return {'reply': summary + ' ¿Lo cierro así?',
+            'needs_confirmation': True, 'confirm_token': token}
 
 # PERSONALIDAD DE ISIS (v5) — NOTA HONESTA: esto es personalidad SIMULADA,
 # un estilo de respuesta programado, no consciencia real. Isis no siente,
@@ -924,7 +1027,7 @@ _ISIS_SYSTEM = (
     "approvals_list, decide_approval, audit_list, reservations_list, "
     "create_reservation, confirm_reservation, reservation_arrive, "
     "prep_config, prep_config_set, product_prep_set, analytics, remember, "
-    "recall, forget, chat, unknown. Params segun la accion: open_cash {opening}, "
+    "recall, forget, chat, unknown, client_info, cash_cut_start. Params segun la accion: open_cash {opening}, "
     "close_cash {counted, note}, create_table {name, area, capacity}, "
     "update_table {table_id, capacity}, new_account {table_id, table_name}, "
     "add_order {account_id, items: [{product_id, product, qty}]}, product_price {product_id, product}, "
@@ -943,6 +1046,7 @@ _ISIS_SYSTEM = (
     "reservation_arrive {reservation_id, table_id, waiter_id}, "
     "prep_config_set {batch_minutes}, product_prep_set {product_id, "
     "minutes}, remember {key, value}, recall {query}, forget {query}, "
+    "client_info {name, table}, cash_cut_start {}, "
     "chat {answer}, analytics {period: today|yesterday|week}. "
     "status de ticket: received, preparing, ready. method es cash, card o "
     "transfer. mode de descuento: percent o fixed. role: waiter, cashier, "
@@ -963,6 +1067,14 @@ _ISIS_SYSTEM = (
     "de lectura mas cercana o unknown con una pregunta. La conversacion "
     "reciente de esta llamada viene en el contexto: usala para seguir el "
     "hilo (por ejemplo, 'y esa mesa?' se refiere a lo ultimo que se hablo). "
+    "Clientes de siempre: si el usuario dice que una mesa es de alguien o "
+    "que alguien siempre pide algo, usa remember con la clave "
+    "'cliente:<nombre>' y el valor 'mesa <n>; siempre pide <lo que pide>'. "
+    "Si pregunta por un cliente de siempre (quien es la mesa, que pide), "
+    "usa client_info; si no esta registrado, dilo, nunca inventes clientes. "
+    "Si pide el corte de caja sin decir el monto, usa cash_cut_start (el "
+    "corte guiado pregunta efectivo, tarjeta y transferencias y solo cierra "
+    "con confirmacion). "
     "Habla como persona real por telefono: frases cortas de una idea cada "
     "una, como mucho unas 20 palabras por frase, con comas y puntos para "
     "que se oigan las pausas. Usa muletillas mexicanas de vez en cuando "
@@ -983,8 +1095,11 @@ _NUM_WORDS = {'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5,
               'once': 11, 'doce': 12, 'quince': 15, 'veinte': 20}
 
 def _isis_numbers(text):
+    # Primero la forma con separador de miles ('1,200'), luego dígitos
+    # simples: al revés, '5000' se partía en 500 + 0 y un corte de 3500
+    # pesos se leía como 350.
     out = []
-    for m in re.finditer(r'\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)', text):
+    for m in re.finditer(r'\$?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)', text):
         try:
             out.append(float(m.group(1).replace(',', '')))
         except Exception:
@@ -994,6 +1109,71 @@ def _isis_numbers(text):
 def _isis_money(text):
     nums = _isis_numbers(text)
     return nums[0] if nums else None
+
+# Números dictados en palabras (v8): la voz a veces dicta "cinco mil" y no
+# "5000". El texto ya viene normalizado (sin acentos) por _isis_norm.
+_NUM_UNITS = {'cero': 0, 'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5,
+              'seis': 6, 'siete': 7, 'ocho': 8, 'nueve': 9, 'diez': 10, 'once': 11, 'doce': 12,
+              'trece': 13, 'catorce': 14, 'quince': 15, 'dieciseis': 16, 'diecisiete': 17,
+              'dieciocho': 18, 'diecinueve': 19, 'veinte': 20, 'veintiuno': 21, 'veintidos': 22,
+              'veintitres': 23, 'veinticuatro': 24, 'veinticinco': 25, 'veintiseis': 26,
+              'veintisiete': 27, 'veintiocho': 28, 'veintinueve': 29}
+_NUM_TENS = {'treinta': 30, 'cuarenta': 40, 'cincuenta': 50, 'sesenta': 60, 'setenta': 70,
+             'ochenta': 80, 'noventa': 90}
+_NUM_HUNDREDS = {'ciento': 100, 'doscientos': 200, 'trescientos': 300, 'cuatrocientos': 400,
+                 'quinientos': 500, 'seiscientos': 600, 'setecientos': 700, 'ochocientos': 800,
+                 'novecientos': 900}
+
+
+def _isis_monto_palabras(text):
+    """Monto dictado en palabras: 'cinco mil doscientos' -> 5200.0.
+    Devuelve None si no hay ningún número en la frase."""
+    toks = re.findall(r'[a-z]+|\d+(?:\.\d+)?', _isis_norm(text))
+    total = 0.0
+    cur = 0.0
+    seen = False
+    for t in toks:
+        if t == 'mil':
+            if cur == 0:
+                cur = 1
+            total += cur * 1000
+            cur = 0
+            seen = True
+        elif t == 'cien':
+            cur += 100
+            seen = True
+        elif t in _NUM_HUNDREDS:
+            cur += _NUM_HUNDREDS[t]
+            seen = True
+        elif t in _NUM_TENS:
+            cur += _NUM_TENS[t]
+            seen = True
+        elif t in _NUM_UNITS:
+            cur += _NUM_UNITS[t]
+            seen = True
+        elif t == 'y':
+            continue
+        elif re.fullmatch(r'\d+(?:\.\d+)?', t):
+            cur += float(t)
+            seen = True
+        elif seen:
+            break  # palabra que no es número ('pesos', 'en efectivo'): ahí acaba el monto
+    if not seen:
+        return None
+    return total + cur
+
+
+def _isis_money_spoken(text):
+    """Monto dictado por voz: dígitos ('5000') o palabras ('cinco mil').
+    Con 'mil' en la frase, el parser de palabras manda: '2 mil' son 2000, no 2."""
+    if 'mil' in _isis_norm(text):
+        v = _isis_monto_palabras(text)
+        if v is not None:
+            return v
+    nums = _isis_numbers(text)
+    if nums:
+        return nums[0]
+    return _isis_monto_palabras(text)
 
 def _isis_qty(text):
     m = re.search(r'\b(\d+)\b', text)
@@ -1211,6 +1391,129 @@ def _isis_memory_search(db, query):
             out.append((key, value))
     return out
 
+# --- Clientes de siempre (v8): viven en IsisMemory con clave 'cliente:<nombre>' ---
+# El esquema clave/valor ya lo permite; no hace falta otra tabla. Nunca se
+# inventa un cliente: si no hay registro, Isis dice que no lo conoce.
+def _isis_client_key(name):
+    return 'cliente:' + _isis_norm(name).strip()
+
+
+def _isis_client_parse(value):
+    """'mesa 4; siempre pide una birria grande' -> ('4', 'una birria grande')."""
+    table, habit = None, None
+    m = re.search(r'mesa\s+(\d+)', str(value or ''))
+    if m:
+        table = m.group(1)
+    m = re.search(r'siempre pide\s+(.+)$', str(value or ''))
+    if m:
+        habit = m.group(1).strip().rstrip('.')
+    return table, habit
+
+
+def _isis_client_find(db, name=None, table=None):
+    """Busca un cliente frecuente en la memoria, por nombre o por mesa.
+    Devuelve (nombre, mesa, costumbre) o None."""
+    qn = _isis_norm(name) if name else ''
+    qt = str(table).strip() if table is not None else ''
+    for key, value in _isis_memory_all(db):
+        if not key.startswith('cliente:'):
+            continue
+        stored = key[len('cliente:'):]
+        if qn and not (qn in stored or stored in qn):
+            continue
+        t, habit = _isis_client_parse(value)
+        if qt and t != qt:
+            continue
+        return stored, t, habit
+    return None
+
+
+def _isis_client_name_txt(name):
+    return ' '.join(w.capitalize() for w in str(name or '').split())
+
+
+def _isis_client_txt(name, table, habit):
+    """Frase corta para voz: 'Don Pedro, mesa 4. Siempre pide una birria grande.'"""
+    txt = _isis_client_name_txt(name)
+    if table:
+        txt += f", mesa {table}"
+    txt += '.'
+    if habit:
+        txt += f" Siempre pide {habit}."
+    return txt
+
+
+def _isis_client_describe(name, table, habit):
+    """Para la confirmación: 'Anoto a Don Pedro de la mesa 4, que siempre pide...'."""
+    txt = f"Anoto a {_isis_client_name_txt(name)}"
+    if table:
+        txt += f" de la mesa {table}"
+    if habit:
+        txt += f", que siempre pide {habit}"
+    return txt + '.'
+
+
+def _isis_parse_client_remember(text):
+    """'recuerda que la mesa 4 es don Pedro, siempre pide una birria grande'
+    -> remember con clave 'cliente:don pedro'. None si no es un cliente."""
+    if 'recuerda que' not in text:
+        return None
+    body = text.split('recuerda que', 1)[1].strip()
+    name = table = habit = None
+    m = re.search(r'mesa\s+(\d+)\s+es\s+(?:de\s+)?([a-z ]+?)(?:\s*,|\s+siempre\s+pide|\s+pide\s|\s+y\s+|$)', body)
+    if m:
+        table, name = m.group(1), m.group(2).strip()
+    else:
+        m = re.search(r'([a-z ]+?)\s+es\s+de\s+la\s+mesa\s+(\d+)', body)
+        if m:
+            name, table = m.group(1).strip(), m.group(2)
+    if not name:
+        m = re.search(r'([a-z ]+?)\s+siempre\s+pide\s+(.+)$', body)
+        if m:
+            name = m.group(1).strip()
+    if not name:
+        return None
+    name = re.sub(r'^(el|la)\s+', '', name).strip()
+    if not name or len(name) < 3:
+        return None
+    hm = re.search(r'(?:siempre\s+)?pide\s+(.+)$', body)
+    if hm:
+        habit = hm.group(1).strip().rstrip('.')
+    value = (f"mesa {table}; " if table else '') + (f"siempre pide {habit}" if habit else '')
+    if not value:
+        return None
+    return {'action': 'remember', 'params': {'key': _isis_client_key(name), 'value': value}}
+
+
+def _isis_parse_client_question(text):
+    """'¿quién es la mesa 4?' / '¿qué pide siempre don Pedro?' -> client_info."""
+    m = re.search(r'quien\s+(?:es|esta)\s+(?:en\s+)?(?:la\s+)?mesa\s+(\d+)', text)
+    if m:
+        return {'action': 'client_info', 'params': {'table': m.group(1)}}
+    m = re.search(r'de\s+quien\s+es\s+(?:la\s+)?mesa\s+(\d+)', text)
+    if m:
+        return {'action': 'client_info', 'params': {'table': m.group(1)}}
+    m = re.search(r'que\s+pide\s+(?:siempre\s+)?([a-z ]+?)(?:\?|$)', text)
+    if m:
+        nm = re.sub(r'^(el|la)\s+', '', m.group(1).strip())
+        if 'mesa' in nm:
+            mm = re.search(r'(\d+)', nm)
+            if mm:
+                return {'action': 'client_info', 'params': {'table': mm.group(1)}}
+        elif len(nm) >= 3:
+            return {'action': 'client_info', 'params': {'name': nm}}
+    m = re.search(r'que\s+le\s+gusta\s+a\s+([a-z ]+?)(?:\?|$)', text)
+    if m:
+        nm = re.sub(r'^(el|la)\s+', '', m.group(1).strip())
+        if len(nm) >= 3:
+            return {'action': 'client_info', 'params': {'name': nm}}
+    m = re.search(r'quien\s+es\s+([a-z ]+?)(?:\?|$)', text)
+    if m:
+        nm = re.sub(r'^(el|la)\s+', '', m.group(1).strip())
+        if len(nm) >= 3 and 'mesa' not in nm:
+            return {'action': 'client_info', 'params': {'name': nm}}
+    return None
+
 def _isis_day_summary(db, user):
     """Resumen del día para que Isis responda con contexto (v2)."""
     try:
@@ -1371,6 +1674,13 @@ def _isis_parse_local(db, user, raw, history=None):
     follow = _isis_resolve_followup(db, user, text, history)
     if follow is not None:
         return follow
+    # --- Clientes de siempre (v8): antes que la memoria genérica ---
+    cli = _isis_parse_client_remember(text)
+    if cli is not None:
+        return cli
+    cli_q = _isis_parse_client_question(text)
+    if cli_q is not None:
+        return cli_q
     # --- Memoria (v2) ---
     if 'recuerdas' in text or 'que sabes de' in text or 'que tienes guardado' in text:
         q = text
@@ -1668,7 +1978,8 @@ def _isis_parse_local(db, user, raw, history=None):
     if 'cierra el turno' in text or 'corte de caja' in text or 'haz el corte' in text or 'cerrar caja' in text:
         amt = _isis_money(text)
         if amt is None:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Cuánto efectivo contaste para el corte? Dime el importe.'}
+            # Sin monto en la misma frase: corte guiado paso a paso (v8).
+            return {'action': 'cash_cut_start', 'params': {}}
         return {'action': 'close_cash', 'params': {'counted': amt, 'note': 'Corte por voz con Isis'}}
     if 'crea' in text and 'mesa' in text:
         m_raw = re.search(r'mesa\s+([A-Za-z0-9 ]+?)\s*$', raw.strip(), re.IGNORECASE)
@@ -1869,6 +2180,50 @@ def _isis_week_trend(db, user):
             f"Mejor día: {_DIAS_SEMANA[best_day.weekday()]} ({best_val:.0f} pesos). {comp}")
 
 
+def _isis_morning_brief(db, user):
+    """Resumen hablado al entrar (v8): cómo cerró el día anterior, en 3
+    frases cortas como mucho. Total vendido ayer, lo más vendido y lo que
+    se acabó o anda bajo de inventario. Solo datos reales: si no hubo
+    ventas ayer, se dice así, sin inventar."""
+    parts = []
+    sold_ids = set()
+    try:
+        local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+        yday = datetime.now(local_tz).date() - timedelta(days=1)
+        d = mitote_extensions.owner_analytics(start=yday, end=yday, scope='history', db=db, user=user)
+        sales = float(d.get('sales') or 0)
+        paid = int(d.get('paid_accounts') or 0)
+        top = [x.get('name') for x in (d.get('products') or [])[:3] if x.get('name')]
+        sold_ids = {x.get('product_id') for x in (d.get('products') or [])}
+        if sales > 0 or paid > 0:
+            parts.append(f"Ayer vendimos {_isis_pesos(sales)} en {_isis_n(paid, 'cuenta pagada', 'cuentas pagadas')}.")
+            if top:
+                parts.append('Lo más vendido: ' + ', '.join(top) + '.')
+        else:
+            parts.append('Ayer no hubo ventas registradas.')
+    except Exception:
+        parts.append('No pude ver cómo cerró ayer.')
+    try:
+        prods = products(db, user)
+        out = [p.get('name') for p in prods
+               if p.get('inventory_enabled') and p.get('id') in sold_ids
+               and p.get('stock') is not None and float(p.get('stock') or 0) <= 0]
+        low = [p for p in prods
+               if p.get('inventory_enabled') and p.get('id') in sold_ids
+               and p.get('stock') is not None and 0 < float(p.get('stock') or 0) <= _ISIS_LOW_STOCK]
+        if out or low:
+            bits = []
+            if out:
+                bits.append('se acabó la ' + ', '.join(out[:3]))
+            if low:
+                bits.append('quedan pocos de ' + ', '.join(f"{p.get('name')} ({p.get('stock')})" for p in low[:3]))
+            sent = ' y '.join(bits) + '.'
+            parts.append(sent[0].upper() + sent[1:])
+    except Exception:
+        pass
+    return ' '.join(parts)
+
+
 def _isis_decision_context(db, user):
     """Para decidir (v4): comparaciones y riesgos para que Claude recomiende con criterio.
     Cada sección con su propio try/except: un fallo no rompe el contexto."""
@@ -2044,7 +2399,8 @@ def _isis_context(db, user):
 _READ_ACTIONS = {'tables', 'overview', 'cash', 'cash_history', 'inventory', 'inventory_movements',
                  'account_detail', 'accounts_list', 'tickets_list', 'cashier_overview',
                  'menu_list', 'product_price', 'staff_list', 'tips_pool', 'approvals_list', 'audit_list',
-                 'reservations_list', 'prep_config', 'analytics', 'recall', 'chat'}
+                 'reservations_list', 'prep_config', 'analytics', 'recall', 'chat',
+                 'client_info', 'cash_cut_start'}
 
 _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'new_account',
                   'add_order', 'pay_account', 'close_account', 'transfer_account', 'restock',
@@ -2089,6 +2445,10 @@ def _isis_describe(intent):
     if a == 'cash_movement':
         return f"Registro una {'salida' if p.get('kind') == 'out' else 'entrada'} de {_isis_pesos(p.get('amount'))} en caja."
     if a == 'remember':
+        if str(p.get('key') or '').startswith('cliente:'):
+            name = str(p.get('key'))[len('cliente:'):]
+            t, habit = _isis_client_parse(p.get('value'))
+            return _isis_client_describe(name, t, habit)
         return f"Anoto en mi memoria: {p.get('key')}, {p.get('value')}."
     if a == 'forget':
         return f"Olvido lo de '{p.get('query')}'."
@@ -2179,8 +2539,18 @@ async def _isis_execute(db, user, intent):
     if a == 'account_detail':
         d = account_detail(p.get('account_id'), db, user)
         label = d.get('table_name') if d.get('table_name') else d.get('name')
-        return (f"La cuenta {d.get('id')}, {label}: en total son {_isis_pesos(d.get('total'))}, "
-                f"ya pagaron {_isis_pesos(d.get('paid'))} y faltan {_isis_pesos(d.get('due'))}.")
+        reply = (f"La cuenta {d.get('id')}, {label}: en total son {_isis_pesos(d.get('total'))}, "
+                 f"ya pagaron {_isis_pesos(d.get('paid'))} y faltan {_isis_pesos(d.get('due'))}.")
+        # Cliente de siempre (v8): si esa mesa es de alguien conocido, se dice en corto.
+        try:
+            m = re.search(r'(\d+)', str(d.get('table_name') or ''))
+            found = _isis_client_find(db, table=m.group(1)) if m else None
+            if found:
+                nm, _t, habit = found
+                reply += f" Es {_isis_client_name_txt(nm)}, el de siempre." + (f" Siempre pide {habit}." if habit else '')
+        except Exception:
+            pass
+        return reply
     if a == 'open_cash':
         r = await open_cash(OpenPeriodIn(opening=Decimal(str(p.get('opening')))), db, user)
         return f"Turno abierto, folio {r.get('id')}, con {_isis_pesos(p.get('opening'))} de fondo."
@@ -2233,8 +2603,21 @@ async def _isis_execute(db, user, intent):
         return "Movimiento de caja registrado."
     # --- v2: memoria ---
     if a == 'remember':
+        if str(p.get('key') or '').startswith('cliente:'):
+            _isis_memory_set(db, p.get('key'), p.get('value'))
+            name = str(p.get('key'))[len('cliente:'):]
+            t, habit = _isis_client_parse(p.get('value'))
+            return _isis_say(_isis_client_describe(name, t, habit) + ' No se me olvida.', warm=True)
         _isis_memory_set(db, p.get('key'), p.get('value'))
         return _isis_say(f"Anotado: {p.get('key')}, {p.get('value')}. No se me olvida.", warm=True)
+    if a == 'client_info':
+        found = _isis_client_find(db, name=p.get('name'), table=p.get('table'))
+        if not found:
+            if p.get('name'):
+                return _isis_say(f"No tengo a {_isis_client_name_txt(p.get('name'))} anotado. No lo conozco.", warm=True)
+            return "No tengo a nadie anotado en esa mesa."
+        name, table, habit = found
+        return _isis_say(f"Es {_isis_client_txt(name, table, habit)}", warm=True)
     if a == 'recall':
         q = (p.get('query') or '').strip()
         hits = _isis_memory_search(db, q) if q else _isis_memory_all(db)
@@ -2502,8 +2885,14 @@ def isis_voice_status(db: Session = Depends(db_session), user: User = Depends(au
         alerts = _isis_alerts(db, user)
     except Exception:
         alerts = []
+    # Resumen de ayer (v8): cómo cerró el día anterior; nunca rompe el status.
+    try:
+        morning_brief = _isis_morning_brief(db, user)
+    except Exception:
+        morning_brief = ''
     return {'ok': True, 'isis_user_exists': exists, 'fableai_configured': bool(FABLEAI_API_KEY),
-            'voice': 'kokoro-ef-dora', 'mode': 'solo-mitote', 'alerts': alerts}
+            'voice': 'kokoro-ef-dora', 'mode': 'solo-mitote', 'alerts': alerts,
+            'morning_brief': morning_brief}
 
 
 @app.post('/api/isis-voice/end-call')
@@ -2548,6 +2937,18 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         audit(db, user, 'isis.voice_execute', actor=actor, isis_action=entry['intent'].get('action'))
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': True}
+    # Corte guiado (v8): si hay un corte en curso, el mensaje es un paso del flujo.
+    if _isis_cash_cut_get(user.id) is not None:
+        res = _isis_cash_cut_step(db, user, data.message)
+        if res is not None:
+            if res.get('needs_confirmation'):
+                audit(db, user, 'isis.voice_propose', actor=actor, isis_action='close_cash')
+            _record(res['reply'])
+            out = {'ok': True, 'reply': res['reply'], 'executed': False}
+            if res.get('needs_confirmation'):
+                out['needs_confirmation'] = True
+                out['confirm_token'] = res['confirm_token']
+            return out
     # Nueva orden: interprete local primero, IA despues
     intent = _isis_parse_local(db, user, data.message, history=_isis_history_get(user.id))
     if intent is None or intent.get('action') == 'unknown':
@@ -2568,6 +2969,11 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         return {'ok': True, 'reply': q, 'executed': False}
     if intent.get('action') not in _WRITE_ACTIONS and intent.get('action') not in _READ_ACTIONS:
         reply = 'Eso no lo puedo hacer en El Mitote. Te ayudo con mesas, cuentas, caja, menú, inventario y ventas.'
+        _record(reply)
+        return {'ok': True, 'reply': reply, 'executed': False}
+    if intent.get('action') == 'cash_cut_start':
+        _isis_cash_cut_start(user.id)
+        reply = 'Va, hacemos el corte. ¿Cuánto hay en efectivo?'
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
     if intent.get('action') in _WRITE_ACTIONS:
