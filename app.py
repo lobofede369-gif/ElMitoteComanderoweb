@@ -875,16 +875,16 @@ _ISIS_SYSTEM = (
     "update_table, new_account, add_order, pay_account, close_account, "
     "transfer_account, restock, inventory_adjust, create_inventory_item, "
     "void_account, cash_movement, tickets_list, ticket_status, "
-    "cashier_overview, apply_discount, menu_list, create_product, "
+    "cashier_overview, apply_discount, menu_list, product_price, create_product, "
     "archive_product, add_variant, add_promotion, edit_product_price, "
     "staff_list, create_staff, staff_pin, tips_pool, tips_distribute, "
     "approvals_list, decide_approval, audit_list, reservations_list, "
     "create_reservation, confirm_reservation, reservation_arrive, "
     "prep_config, prep_config_set, product_prep_set, analytics, remember, "
-    "recall, forget, unknown. Params segun la accion: open_cash {opening}, "
+    "recall, forget, chat, unknown. Params segun la accion: open_cash {opening}, "
     "close_cash {counted, note}, create_table {name, area, capacity}, "
     "update_table {table_id, capacity}, new_account {table_id, table_name}, "
-    "add_order {account_id, items: [{product_id, product, qty}]}, "
+    "add_order {account_id, items: [{product_id, product, qty}]}, product_price {product_id, product}, "
     "pay_account {account_id, amount, method, all}, close_account "
     "{account_id}, transfer_account {account_id, table_id}, restock "
     "{product_id, product, qty, reason}, inventory_adjust {product_id, "
@@ -899,12 +899,19 @@ _ISIS_SYSTEM = (
     "party_size, scheduled_at}, confirm_reservation {reservation_id}, "
     "reservation_arrive {reservation_id, table_id, waiter_id}, "
     "prep_config_set {batch_minutes}, product_prep_set {product_id, "
-    "minutes}, remember {key, value}, recall {query}, forget {query}. "
+    "minutes}, remember {key, value}, recall {query}, forget {query}, "
+    "chat {answer}, analytics {period: today|yesterday|week}. "
     "status de ticket: received, preparing, ready. method es cash, card o "
     "transfer. mode de descuento: percent o fixed. role: waiter, cashier, "
     "kitchen, bar, admin. Si falta un dato indispensable para una "
     "escritura, pon action unknown y en question pregunta solo por ese "
-    "dato, en espanol."
+    "dato, en espanol. Si el mensaje es una pregunta o una charla que no "
+    "corresponde a ninguna accion concreta (un saludo, como va la noche, "
+    "un consejo), usa chat con una respuesta corta de 1-2 frases, calida, "
+    "con tono mexicano de restaurante, usando SOLO los datos del contexto; "
+    "nunca inventes numeros ni datos. Si la pregunta necesita datos que "
+    "no estan en el contexto, usa la accion de lectura mas cercana o "
+    "unknown con una pregunta."
 )
 
 def _isis_norm(s):
@@ -1001,7 +1008,22 @@ def _isis_find_product(db, user, text):
     best = None
     for p in prods:
         name = _isis_norm(p.get('name', ''))
-        if name and name in norm and (best is None or len(name) > len(_isis_norm(best.get('name', '')))):
+        if not name:
+            continue
+        # Coincidencia exacta ("corona 355") o palabras del nombre en orden
+        # con huecos ("la corona de 355 ml" encuentra "Corona 355"). Sin
+        # esto, preguntar por un precio caía al menú completo.
+        ok = name in norm
+        if not ok:
+            pos = 0
+            ok = True
+            for w in name.split():
+                m = re.search(r'\b' + re.escape(w) + r'\b', norm[pos:])
+                if not m:
+                    ok = False
+                    break
+                pos += m.end()
+        if ok and (best is None or len(name) > len(_isis_norm(best.get('name', '')))):
             best = p
     return best
 
@@ -1201,10 +1223,15 @@ def _isis_parse_local(db, user, raw):
                 break
         return {'action': 'forget', 'params': {'query': q}}
     # --- 14. Estadísticas (antes que el resumen viejo de ventas) ---
+    if 'ventas de ayer' in text or 'ventas de anoche' in text:
+        return {'action': 'analytics', 'params': {'period': 'yesterday'}}
+    if ('ventas de la semana' in text or 'ventas de esta semana' in text
+            or 'ventas en la semana' in text):
+        return {'action': 'analytics', 'params': {'period': 'week'}}
     if ('estadistica' in text or 'ventas del dia' in text or 'ventas de hoy' in text
             or 'productos mas vendidos' in text or 'lo mas vendido' in text
             or 'como van las ventas' in text):
-        return {'action': 'analytics', 'params': {}}
+        return {'action': 'analytics', 'params': {'period': 'today'}}
     # --- 11. Auditoría ---
     if ('auditoria' in text or 'que paso hoy' in text or 'que se hizo' in text
             or 'registro de operaciones' in text or 'que movimientos hubo hoy' in text):
@@ -1284,7 +1311,11 @@ def _isis_parse_local(db, user, raw):
     # Las sub-órdenes (presentación, promoción, precio) no siempre dicen
     # la palabra "menú", así que también disparan por su propio verbo.
     if ('menu' in text or 'carta' in text or 'presentacion' in text
-            or 'promocion' in text or 'cambia el precio' in text):
+            or 'promocion' in text or 'cambia el precio' in text
+            or 'cuanto cuesta' in text or 'cual es el costo' in text
+            or 'cual es el precio' in text or 'que precio tiene' in text
+            or 'cuanto vale' in text or 'a cuanto esta' in text
+            or 'costo de' in text or 'dime el precio' in text or 'dime el costo' in text):
         if 'presentacion' in text:
             p = _isis_find_product(db, user, text)
             if not p:
@@ -1308,6 +1339,18 @@ def _isis_parse_local(db, user, raw):
             if not p:
                 return {'action': 'unknown', 'params': {}, 'question': '¿Qué producto archivo del menú?'}
             return {'action': 'archive_product', 'params': {'product_id': p.get('id')}}
+        # Pregunta por el precio de UN producto: responde solo ese precio,
+        # nunca la lista completa del menú. Va antes de "cambia el precio"
+        # porque "cuál es el precio de la corona 355" también trae "precio
+        # de" y el 355 se confundiría con un precio nuevo.
+        if (any(k in text for k in ('cuanto cuesta', 'cual es el costo', 'cual es el precio',
+                                     'que precio tiene', 'cuanto vale', 'a cuanto esta',
+                                     'dime el costo', 'dime el precio'))
+                or ('costo de' in text and 'cambia' not in text and 'pon' not in text)):
+            p = _isis_find_product(db, user, text)
+            if not p:
+                return {'action': 'unknown', 'params': {}, 'question': '¿De qué producto quieres saber el precio?'}
+            return {'action': 'product_price', 'params': {'product_id': p.get('id'), 'product': p.get('name')}}
         if 'cambia el precio' in text or 'precio de' in text:
             p = _isis_find_product(db, user, text)
             if not p:
@@ -1535,6 +1578,37 @@ def _isis_call_fableai(message, context):
     except Exception:
         return None
 
+def _isis_sales_context(db, user):
+    """Ventas de hoy, caja y pendientes, para que Isis conteste con datos reales (v3).
+    Cada sección con su propio try/except: un fallo no rompe el contexto."""
+    parts = []
+    try:
+        today = datetime.now(timezone.utc).date()
+        d = mitote_extensions.owner_analytics(start=today, end=today, scope='current', db=db, user=user)
+        top = d.get('products') or []
+        top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in top[:3]) or 'nada todavía'
+        parts.append(f"Ventas de hoy: ${d.get('sales')} en {d.get('paid_accounts')} cuentas pagadas, "
+                     f"ticket promedio ${d.get('average_ticket')}. Lo más vendido hoy: {top_txt}.")
+    except Exception:
+        parts.append('Ventas de hoy: no disponible.')
+    try:
+        c = cash(db, user)
+        if c.get('open'):
+            parts.append(f"Caja abierta, efectivo esperado ${c.get('expected')} (efectivo ${c.get('cash')}, "
+                         f"tarjeta ${c.get('card')}, transferencia ${c.get('transfer')}).")
+        else:
+            parts.append('Caja cerrada, no hay turno abierto.')
+    except Exception:
+        parts.append('Caja: no disponible.')
+    try:
+        accs = accounts(db, user)
+        pend = [x for x in accs if x.get('status') in ('open', 'pending')]
+        total = sum(float(x.get('due') or 0) for x in pend)
+        parts.append(f"Cuentas pendientes de cobro: {len(pend)}, total por cobrar ${total:.2f}.")
+    except Exception:
+        parts.append('Cuentas pendientes: no disponible.')
+    return ' '.join(parts)
+
 def _isis_context(db, user):
     try:
         tables = dining_tables(db, user)
@@ -1557,13 +1631,18 @@ def _isis_context(db, user):
         m_txt = '; '.join(f"{k}: {v}" for k, v in mems) if mems else 'ninguna'
     except Exception:
         m_txt = 'no disponible'
+    try:
+        s_txt = _isis_sales_context(db, user)
+    except Exception:
+        s_txt = 'Ventas y caja: no disponible.'
     return (f"Mesas: {t_txt}\nProductos con inventario: {p_txt}\nCuentas abiertas: {a_txt}\n"
-            f"Memoria de Isis: {m_txt}\nResumen del día: {_isis_day_summary(db, user)}")
+            f"Memoria de Isis: {m_txt}\nResumen del día: {_isis_day_summary(db, user)}\n"
+            f"Ventas y caja: {s_txt}")
 
 _READ_ACTIONS = {'tables', 'overview', 'cash', 'cash_history', 'inventory', 'inventory_movements',
                  'account_detail', 'accounts_list', 'tickets_list', 'cashier_overview',
-                 'menu_list', 'staff_list', 'tips_pool', 'approvals_list', 'audit_list',
-                 'reservations_list', 'prep_config', 'analytics', 'recall'}
+                 'menu_list', 'product_price', 'staff_list', 'tips_pool', 'approvals_list', 'audit_list',
+                 'reservations_list', 'prep_config', 'analytics', 'recall', 'chat'}
 
 _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'new_account',
                   'add_order', 'pay_account', 'close_account', 'transfer_account', 'restock',
@@ -1811,6 +1890,15 @@ async def _isis_execute(db, user, intent):
             return "El menú está vacío. ¿Agrego el primer producto?"
         txt = '; '.join(f"{x.get('name')} ${x.get('current_price') or x.get('price')}" for x in rows[:20])
         return _isis_say(f"En el menú hay {len(rows)} productos: {txt}.", warm=True)
+    if a == 'product_price':
+        rows = products(db, user)
+        prod = next((x for x in rows if str(x.get('id')) == str(p.get('product_id'))), None)
+        if not prod and p.get('product'):
+            prod = _isis_find_product(db, user, str(p.get('product')))
+        if not prod:
+            return "No encontré ese producto en el menú."
+        price = prod.get('current_price') or prod.get('price')
+        return _isis_say(f"La {prod.get('name')} cuesta ${price}.", warm=True)
     if a == 'create_product':
         r = await add_product(ProductIn(name=str(p.get('name')), category='General', station=str(p.get('station') or 'kitchen'), price=Decimal(str(p.get('price'))), active=True, blocked=False, inventory_enabled=False, stock=0), db, user)
         return _isis_say(f"Ya está {p.get('name')} en el menú a ${p.get('price')}.", warm=True)
@@ -1928,15 +2016,29 @@ async def _isis_execute(db, user, intent):
     if a == 'product_prep_set':
         await mitote_extensions.put_product_prep(int(p.get('product_id')), mitote_extensions.ProductPrepIn(minutes=int(p.get('minutes'))), db, user)
         return _isis_say(f"El tiempo de preparación de {p.get('product')} ahora es de {p.get('minutes')} minutos.", warm=True)
+    # --- v3: charla libre (solo lectura, la respuesta ya viene redactada) ---
+    if a == 'chat':
+        ans = str(p.get('answer') or '').strip()
+        return ans or '¿Me lo repites?'
     # --- v2: 14. Estadísticas ---
     if a == 'analytics':
+        period = str(p.get('period') or 'today')
         today = datetime.now(timezone.utc).date()
-        d = mitote_extensions.owner_analytics(start=today, end=today, scope='current', db=db, user=user)
+        if period == 'yesterday':
+            start = end = today - timedelta(days=1)
+            label, scope = 'Ayer', 'history'
+        elif period == 'week':
+            start, end = today - timedelta(days=6), today
+            label, scope = 'Esta semana', 'history'
+        else:
+            start = end = today
+            label, scope = 'Hoy', 'current'
+        d = mitote_extensions.owner_analytics(start=start, end=end, scope=scope, db=db, user=user)
         top = d.get('products') or []
         top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in top[:3])
         prep = d.get('prep_avg_minutes')
         prep_txt = f" Preparación promedio: {prep} minutos." if prep else ""
-        return _isis_say(f"Hoy llevamos ${d.get('sales')} en ventas, {d.get('paid_accounts')} cuentas pagadas, ticket promedio ${d.get('average_ticket')}. Lo más vendido: {top_txt or 'nada todavía'}.{prep_txt}", warm=True)
+        return _isis_say(f"{label} llevamos ${d.get('sales')} en ventas, {d.get('paid_accounts')} cuentas pagadas, ticket promedio ${d.get('average_ticket')}. Lo más vendido: {top_txt or 'nada todavía'}.{prep_txt}", warm=True)
     raise HTTPException(400, 'No sé cómo hacer eso en El Mitote.')
 
 class IsisSetupIn(BaseModel):
