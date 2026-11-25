@@ -906,6 +906,7 @@ def _isis_history_add(user_id, user_msg, reply):
 def _isis_history_clear(user_id):
     _ISIS_HISTORY.pop(user_id, None)
     _ISIS_CASH_CUT.pop(user_id, None)  # un corte a medias tampoco sobrevive al colgado
+    _ISIS_SPLIT.pop(user_id, None)  # ni una división a medias (v11)
 
 
 def _isis_history_text(user_id):
@@ -1140,6 +1141,97 @@ def _isis_cash_cut_step(db, user, raw):
     return {'reply': summary + ' ¿Lo cierro así?',
             'needs_confirmation': True, 'confirm_token': token}
 
+
+# --- División guiada de cuentas (v11): estado por usuario, como el corte ---
+# La división necesita tres datos (cuenta origen, producto con cantidad y
+# destino). Si la frase trae los tres, el parser arma el intent directo; si
+# falta el producto o el destino, Isis pregunta paso a paso. Se borra al
+# colgar (end-call) y expira a los 30 minutos sin uso, igual que el historial.
+_ISIS_SPLIT = {}  # user_id -> {'source_account_id', 'source_table', 'step', ...}
+
+
+def _isis_split_get(user_id):
+    e = _ISIS_SPLIT.get(user_id)
+    if not e or time.time() - e.get('last', 0) > _ISIS_HISTORY_TTL:
+        _ISIS_SPLIT.pop(user_id, None)
+        return None
+    return e
+
+
+def _isis_split_set(user_id, flow):
+    flow['last'] = time.time()
+    _ISIS_SPLIT[user_id] = flow
+
+
+def _isis_split_clear(user_id):
+    _ISIS_SPLIT.pop(user_id, None)
+
+
+def _isis_split_start(user_id, account_id, table_name):
+    _ISIS_SPLIT[user_id] = {'source_account_id': account_id, 'source_table': table_name,
+                            'step': 'product', 'last': time.time()}
+
+
+def _isis_split_step(db, user, raw):
+    """Un paso de la división guiada. Devuelve {'reply', 'needs_confirmation',
+    'confirm_token'} o None si no hay flujo en curso."""
+    uid = user.id
+    flow = _isis_split_get(uid)
+    if not flow:
+        return None
+    text = _isis_norm(raw)
+    if re.search(r'\b(cancela|cancelar|olvidalo|olvida|mejor no|dejalo)\b', text) or text.strip() == 'no':
+        _isis_split_clear(uid)
+        return {'reply': 'Sale, cancelado. No dividí nada.',
+                'needs_confirmation': False, 'confirm_token': None}
+    if flow['step'] == 'product':
+        p = _isis_find_product(db, user, text)
+        if not p:
+            return {'reply': '¿Qué producto muevo de esa cuenta? Dime el producto y cuántos.',
+                    'needs_confirmation': False, 'confirm_token': None}
+        qty = _isis_qty(text)
+        item, ready = _isis_find_account_item(db, flow['source_account_id'], p.get('id'))
+        if not item:
+            return {'reply': f"No veo {p.get('name')} en esa cuenta. ¿Qué producto muevo?",
+                    'needs_confirmation': False, 'confirm_token': None}
+        if qty > item['qty']:
+            return {'reply': f"Solo quedan {item['qty']} de {p.get('name')} en la cuenta. ¿Cuántos muevo?",
+                    'needs_confirmation': False, 'confirm_token': None}
+        if not ready:
+            return {'reply': 'Ese producto todavía no está listo en cocina o barra, no lo puedo dividir todavía.',
+                    'needs_confirmation': False, 'confirm_token': None}
+        flow.update({'product_id': p.get('id'), 'product': p.get('name'),
+                     'qty': qty, 'item_id': item['id'], 'step': 'target'})
+        _isis_split_set(uid, flow)
+        return {'reply': f"Va, muevo {qty} {p.get('name')}. ¿A qué mesa los mando? Dime la mesa, o di 'cuenta nueva'.",
+                'needs_confirmation': False, 'confirm_token': None}
+    # Paso destino: una mesa con cuenta (mover ahí) o sin cuenta (cuenta
+    # nueva en esa mesa) o 'cuenta nueva' (cuenta nueva sin mesa).
+    if 'cuenta nueva' in text or text.strip() == 'nueva':
+        target_id, table_id, target_table = None, None, None
+    else:
+        nums = _isis_table_numbers(text)
+        t = _isis_find_table(db, user, text)
+        if not t:
+            return {'reply': '¿A qué mesa lo muevo? Dime el número de mesa, o di "cuenta nueva".',
+                    'needs_confirmation': False, 'confirm_token': None}
+        acc = _isis_find_account(db, user, 'mesa ' + (nums[-1] if nums else ''))
+        if acc:
+            target_id, table_id, target_table = acc.get('id'), None, acc.get('table_name')
+        else:
+            target_id, table_id, target_table = None, t.get('id'), t.get('name')
+    _isis_split_clear(uid)
+    intent = _isis_split_build(db, flow['source_account_id'], flow['source_table'],
+                               {'id': flow['product_id'], 'name': flow['product']},
+                               flow['qty'], target_id, table_id, target_table)
+    if intent.get('action') == 'chat':
+        return {'reply': intent['params'].get('answer', 'No se pudo dividir.'),
+                'needs_confirmation': False, 'confirm_token': None}
+    token = _isis_confirm_token(intent, delicate=True)
+    summary = _isis_describe(intent)
+    return {'reply': _isis_warm() + ' ' + summary + ' ¿Confirmas?',
+            'needs_confirmation': True, 'confirm_token': token}
+
 # PERSONALIDAD DE ISIS (v5) — NOTA HONESTA: esto es personalidad SIMULADA,
 # un estilo de respuesta programado, no consciencia real. Isis no siente,
 # no tiene conciencia ni emociones de verdad: solo responde con un tono
@@ -1184,10 +1276,14 @@ _ISIS_SYSTEM = (
     "approvals_list, decide_approval, audit_list, reservations_list, "
     "create_reservation, confirm_reservation, reservation_arrive, "
     "prep_config, prep_config_set, product_prep_set, analytics, remember, "
-    "recall, forget, chat, unknown, client_info, cash_cut_start. Params segun la accion: open_cash {opening}, "
+    "recall, forget, chat, unknown, client_info, cash_cut_start, "
+    "split_account_start, merge_accounts, split_account, reopen_closed, "
+    "tip_payout, todo_add, todo_list, todo_remove, day_close, "
+    "shift_handover, pay_and_close_account, shopping_list, oldest_ticket, "
+    "cancel_item. Params segun la accion: open_cash {opening}, "
     "close_cash {counted, note}, create_table {name, area, capacity}, "
     "update_table {table_id, capacity}, new_account {table_id, table_name}, "
-    "add_order {account_id, items: [{product_id, product, qty}]}, product_price {product_id, product}, "
+    "add_order {account_id, items: [{product_id, product, qty, note}]}, product_price {product_id, product}, "
     "pay_account {account_id, amount, method, all}, close_account "
     "{account_id}, transfer_account {account_id, table_id}, restock "
     "{product_id, product, qty, reason}, inventory_adjust {product_id, "
@@ -1204,7 +1300,23 @@ _ISIS_SYSTEM = (
     "prep_config_set {batch_minutes}, product_prep_set {product_id, "
     "minutes}, remember {key, value}, recall {query}, forget {query}, "
     "client_info {name, table}, cash_cut_start {}, "
+    "merge_accounts {account_id, target_account_id, source_table, target_table}, "
+    "split_account {account_id, source_table, item_id, product, qty, target_account_id, table_id, target_table}, "
+    "split_account_start {account_id, table_name}, reopen_closed {account_id, table_id, table_name}, "
+    "tip_payout {distribution_id, share_id, amount, method, employee_name}, "
+    "todo_add {text}, todo_list {}, todo_remove {text}, day_close {}, "
+    "shift_handover {}, pay_and_close_account {account_id, method, table_name}, "
+    "shopping_list {}, oldest_ticket {}, cancel_item {account_id, item_id, product, qty}, "
     "chat {answer}, analytics {period: today|yesterday|week}. "
+    "Las acciones delicadas (unir o dividir cuentas, reabrir una cuenta "
+    "cerrada, pagar la propina de un empleado) siempre piden dos "
+    "confirmaciones: Isis repite los datos y pregunta dos veces. Las "
+    "cuentas se pueden buscar por nombre de cliente ('la mesa de Juanita', "
+    "'mesa Juanita'); las mesas por numero en palabra ('mesa cinco'); los "
+    "productos por tamano o palabra distintiva ('la de 355', 'la corona'). "
+    "En add_order, items puede llevar note con el comentario del cliente "
+    "('sin cebolla', 'poco picante'). 'Quitale X a la mesa Y' quita un "
+    "producto de la cuenta (cancel_item). "
     "status de ticket: received, preparing, ready. method es cash, card o "
     "transfer. mode de descuento: percent o fixed. role: waiter, cashier, "
     "kitchen, bar, admin. Si falta un dato indispensable para una "
@@ -1249,7 +1361,9 @@ def _isis_norm(s):
 
 _NUM_WORDS = {'uno': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5,
               'seis': 6, 'siete': 7, 'ocho': 8, 'nueve': 9, 'diez': 10,
-              'once': 11, 'doce': 12, 'quince': 15, 'veinte': 20}
+              'once': 11, 'doce': 12, 'trece': 13, 'catorce': 14, 'quince': 15,
+              'dieciseis': 16, 'diecisiete': 17, 'dieciocho': 18, 'diecinueve': 19,
+              'veinte': 20}
 
 def _isis_numbers(text):
     # Primero la forma con separador de miles ('1,200'), luego dígitos
@@ -1393,8 +1507,45 @@ def _isis_table_name(text):
     m = re.search(r'\bmesa\s+(\d+)\b', text)
     if m:
         return m.group(1)
+    # v11: número de mesa en palabra ("mesa cinco" -> "5").
+    m = re.search(r'\bmesa\s+(' + '|'.join(_NUM_WORDS) + r')\b', text)
+    if m:
+        return str(_NUM_WORDS[m.group(1)])
     m = re.search(r'mesa\s+([a-z0-9 ]+?)(?:\s+(?:con|por|en|todo|la|el|de)\b|$)', text)
-    return m.group(1).strip() if m else None
+    name = m.group(1).strip() if m else None
+    if name:
+        # "mesa número cinco" -> la última palabra es el número.
+        last = name.split()[-1]
+        if last in _NUM_WORDS:
+            return str(_NUM_WORDS[last])
+    return name
+
+
+# Números de mesa, en dígito o en palabra, para quitar la referencia de
+# mesa del texto antes de leer cantidades o dinero ("mesa cinco" no es
+# una cantidad ni un monto).
+_MESA_NUM = r'(?:\d+|' + '|'.join(_NUM_WORDS) + r')'
+
+
+def _isis_strip_mesa(text):
+    return re.sub(r'mesa\s+' + _MESA_NUM + r'\b', ' ', text)
+
+
+def _isis_qty_for_product(text, product):
+    """Cantidad para un producto (v11): el primer número que no sea parte
+    del nombre del producto ('agrega una corona de 355' agrega 1, no 355;
+    'agrega 2 coronas de 355' agrega 2). La rama de división ya lo hacía
+    a medias, pero su respaldo (_isis_qty) seguía leyendo el tamaño como
+    cantidad; aquí el respaldo solo lee palabras de número o 1."""
+    qty_text = _isis_strip_mesa(text)
+    prod_nums = _isis_numbers(_isis_norm(product.get('name') or '')) if product else []
+    for n in _isis_numbers(qty_text):
+        if n not in prod_nums:
+            return int(n)
+    for w, v in _NUM_WORDS.items():
+        if re.search(r'\b' + w + r'\b', qty_text):
+            return v
+    return 1
 
 def _isis_find_table(db, user, text):
     try:
@@ -1431,7 +1582,78 @@ def _isis_find_account(db, user, text):
         for a in accs:
             if _isis_norm(a.get('table_name') or '') == _isis_norm(t.get('name', '')):
                 return a
+    # v11: por nombre de cliente ("la mesa de Juanita"). Solo si hay una
+    # única coincidencia; si hay dos con el mismo nombre, no se adivina
+    # (eso lo pregunta _isis_resolve_account).
+    acc, _amb = _isis_find_account_by_client(db, user, text)
+    return acc
+
+
+def _isis_client_name_of(a):
+    """Nombre de cliente de una cuenta, o None si el nombre es el de la mesa."""
+    if not a:
+        return None
+    name = a.get('name')
+    if name and name != a.get('table_name'):
+        return name
     return None
+
+
+def _isis_find_account_by_client(db, user, text):
+    """Cuenta abierta por nombre de cliente (v11): 'la mesa de Juanita',
+    'la cuenta de Juanita', 'cobra a Juanita'. Devuelve (cuenta|None,
+    [coincidencias] si hay más de una). Nunca adivina entre dos."""
+    try:
+        accs = [x for x in accounts(db, user) if x.get('status') in ('open', 'pending')]
+        table_names = {_isis_norm(t.get('name', '')) for t in dining_tables(db, user)}
+    except Exception:
+        return None, []
+    norm = _isis_norm(text)
+    matches = []
+    for a in accs:
+        an = _isis_norm(a.get('name') or '')
+        if not an or len(an) < 3 or an in table_names:
+            continue
+        if an in norm:
+            matches.append(a)
+            continue
+        first = an.split()[0]
+        if re.search(r'\b' + re.escape(first) + r'\b', norm):
+            matches.append(a)
+    if len(matches) == 1:
+        return matches[0], []
+    if len(matches) > 1:
+        return None, matches
+    return None, []
+
+
+def _isis_resolve_account(db, user, text, question):
+    """Cuenta por folio, mesa o nombre de cliente (v11). Devuelve
+    (cuenta|None, intent_unknown|None). Si dos cuentas abiertas tienen el
+    mismo nombre, pregunta cuál en vez de adivinar."""
+    a = _isis_find_account(db, user, text)
+    if a:
+        return a, None
+    _acc, amb = _isis_find_account_by_client(db, user, text)
+    if amb:
+        opts = ' o '.join(
+            f"la {_isis_mesa_txt(x.get('table_name'))}" if x.get('table_name')
+            else f"la cuenta {x.get('id')}" for x in amb)
+        return None, {'action': 'unknown', 'params': {},
+                      'question': f"Hay dos cuentas de ese nombre. ¿Cuál, {opts}?"}
+    return None, {'action': 'unknown', 'params': {}, 'question': question}
+
+
+def _isis_describe_account(p):
+    """'la cuenta de Juanita en la Mesa 5' si hay nombre de cliente; si no,
+    'la cuenta N' como hoy (v11)."""
+    client = p.get('client_name')
+    tname = p.get('table_name')
+    if client:
+        if tname:
+            return f"la cuenta de {client} en la {_isis_mesa_txt(tname)}"
+        return f"la cuenta de {client}"
+    return f"la cuenta {p.get('account_id')}"
 
 def _isis_find_product(db, user, text):
     try:
@@ -1446,20 +1668,160 @@ def _isis_find_product(db, user, text):
             continue
         # Coincidencia exacta ("corona 355") o palabras del nombre en orden
         # con huecos ("la corona de 355 ml" encuentra "Corona 355"). Sin
-        # esto, preguntar por un precio caía al menú completo.
+        # esto, preguntar por un precio caía al menú completo. El plural se
+        # tolera ("coronas" casa con "corona", v11).
         ok = name in norm
         if not ok:
             pos = 0
             ok = True
             for w in name.split():
-                m = re.search(r'\b' + re.escape(w) + r'\b', norm[pos:])
+                m = re.search(r'\b' + re.escape(w) + r'(?:s|es)?\b', norm[pos:])
                 if not m:
                     ok = False
                     break
                 pos += m.end()
         if ok and (best is None or len(name) > len(_isis_norm(best.get('name', '')))):
             best = p
+    if best is None:
+        # v11: solo por tamaño o por palabra distintiva ("la de 355",
+        # "la corona" sin decir el tamaño). Si casa con un solo producto,
+        # es ese; si casa con varios, no se adivina (eso lo pregunta el
+        # parser con _isis_ambiguous_product).
+        cands = _isis_find_products_by_token(db, user, text)
+        if len(cands) == 1:
+            best = cands[0]
     return best
+
+
+def _isis_find_products_by_token(db, user, text):
+    """Candidatos por token distintivo (v11): cuando ningún producto casa
+    por nombre completo, puntúa por palabras distintivas del nombre
+    presentes en el texto (plural tolerado) y por tamaños (355, 1.2).
+    Las palabras de número (dos, tres...) no puntúan: son cantidades.
+    Devuelve los empatados con la mejor puntuación."""
+    try:
+        prods = products(db, user)
+    except Exception:
+        return []
+    norm = _isis_strip_mesa(_isis_norm(text))
+    size_tokens = set(re.findall(r'\b(?:\d{2,}(?:\.\d+)?|\d+\.\d+|\d+[a-z])\b', norm))
+    scored = []
+    for p in prods:
+        name = _isis_norm(p.get('name', ''))
+        if not name:
+            continue
+        score = 0
+        for w in name.split():
+            if w in _NUM_WORDS:
+                continue
+            if w in size_tokens:
+                score += 1
+            elif re.search(r'\b' + re.escape(w) + r'(?:s|es)?\b', norm):
+                score += 1
+        if score:
+            scored.append((score, p))
+    if not scored:
+        return []
+    top = max(s for s, _ in scored)
+    return [p for s, p in scored if s == top]
+
+
+def _isis_ambiguous_product(db, user, text):
+    """Pregunta '¿Cuál, ...?' cuando el token casa con varios productos
+    (v11), o None si no hay ambigüedad."""
+    cands = _isis_find_products_by_token(db, user, text)
+    if len(cands) > 1:
+        opts = ' o '.join(f"la {c.get('name')}" for c in cands)
+        return f"¿Cuál, {opts}?"
+    return None
+
+
+def _isis_find_account_item(db, account_id, product_id):
+    """Primer producto de la cuenta con existencias (v11): devuelve
+    (item_dict, listo), donde listo dice si su comanda ya está lista en
+    cocina/barra. La división exige comanda lista, como el endpoint."""
+    rows = db.scalars(select(OrderItem).join(Batch, Batch.id == OrderItem.batch_id)
+                      .where(Batch.account_id == account_id, OrderItem.product_id == product_id)
+                      .order_by(OrderItem.id)).all()
+    for it in rows:
+        avail = int(it.qty or 0) - int(it.cancelled_qty or 0)
+        if avail <= 0:
+            continue
+        batch = db.get(Batch, it.batch_id)
+        ticket = db.scalar(select(StationTicket).where(
+            StationTicket.batch_id == it.batch_id, StationTicket.station == it.station))
+        ready = (ticket is not None and ticket.status == 'ready') or bool(
+            batch and batch.client_key and batch.client_key.startswith('split-'))
+        return {'id': it.id, 'product_id': it.product_id, 'name': it.name,
+                'qty': avail, 'station': it.station}, ready
+    return None, False
+
+
+def _isis_find_closed_account(db, user, text):
+    """Cuenta cerrada (pagada) por número o por mesa (v11). Devuelve
+    (account_dict, table_dict|None). La mesa se busca por el nombre de la
+    cuenta, que es el nombre de la mesa cuando se abrió desde ahí."""
+    m = re.search(r'cuenta\s*#?\s*(\d+)', text)
+    if m:
+        a = db.get(Account, int(m.group(1)))
+        if a and a.status == 'paid':
+            t = next((x for x in dining_tables(db, user)
+                      if _isis_norm(x.get('name', '')) == _isis_norm(a.name)), None)
+            return account_dict(db, a), t
+        return None, None
+    t = _isis_find_table(db, user, text)
+    if not t:
+        # Por nombre de cliente: "reabre la cuenta de Juanita".
+        for a in db.scalars(select(Account).where(Account.status == 'paid').order_by(Account.id.desc())).all():
+            if _isis_norm(a.name) and _isis_norm(a.name) in _isis_norm(text):
+                tt = next((x for x in dining_tables(db, user)
+                           if _isis_norm(x.get('name', '')) == _isis_norm(a.name)), None)
+                return account_dict(db, a), tt
+        return None, None
+    a = db.scalars(select(Account).where(
+        Account.status == 'paid', Account.name == t.get('name')
+    ).order_by(Account.id.desc())).first()
+    if not a:
+        return None, None
+    return account_dict(db, a), t
+
+
+def _isis_find_tip_share(db, user_id):
+    """Último reparto de propinas y la parte de un empleado (v11):
+    (dist_dict|None, share_dict|None, pendiente_en_centavos)."""
+    dist = db.scalars(select(TipDistribution).order_by(TipDistribution.id.desc())).first()
+    if not dist:
+        return None, None, 0
+    share = db.scalars(select(TipDistributionShare).where(
+        TipDistributionShare.distribution_id == dist.id,
+        TipDistributionShare.user_id == user_id)).first()
+    if not share:
+        return {'id': dist.id}, None, 0
+    paid = db.scalar(select(func.coalesce(func.sum(TipPayout.cents), 0)).where(
+        TipPayout.share_id == share.id)) or 0
+    return {'id': dist.id}, {'id': share.id, 'employee_name': share.employee_name,
+                             'share_cents': share.share_cents}, int(share.share_cents - paid)
+
+
+def _isis_split_build(db, source_id, source_table, product, qty,
+                      target_acc_id, target_table_id, target_table):
+    """Arma el intent split_account o un chat con el motivo del bloqueo (v11).
+    Comparte las guardas del endpoint: existencias, comanda lista y destino
+    distinto del origen."""
+    item, ready = _isis_find_account_item(db, source_id, product.get('id'))
+    if not item:
+        return {'action': 'chat', 'params': {'answer': f"No veo {product.get('name')} en esa cuenta."}}
+    if qty > item['qty']:
+        return {'action': 'chat', 'params': {'answer': f"Solo quedan {item['qty']} de {product.get('name')} en la cuenta."}}
+    if not ready:
+        return {'action': 'chat', 'params': {'answer': f"Ese producto todavía no está listo en cocina o barra, no lo puedo dividir todavía."}}
+    if target_acc_id and target_acc_id == source_id:
+        return {'action': 'chat', 'params': {'answer': 'Esa es la misma cuenta, dime otra mesa.'}}
+    return {'action': 'split_account', 'params': {
+        'account_id': source_id, 'source_table': source_table,
+        'item_id': item['id'], 'product': product.get('name'), 'qty': qty,
+        'target_account_id': target_acc_id, 'table_id': target_table_id,
+        'target_table': target_table}}
 
 # --- Personalidad simulada (v5): frases cortas y variadas, nunca la misma ---
 # Coloquiales, como en una llamada: a veces con el nombre de Santiago.
@@ -1580,6 +1942,24 @@ def _isis_memory_search(db, query):
     words = [w for w in re.findall(r'\w+', q) if len(w) > 2]
     out = []
     for key, value in _isis_memory_all(db):
+        hay = _isis_norm(key + ' ' + value)
+        if not words or any(w in hay for w in words):
+            out.append((key, value))
+    return out
+
+
+# --- Pendientes por voz (v11): un pendiente por clave 'pendiente:<texto>' ---
+def _isis_todo_list(db):
+    """Todos los pendientes, en orden de clave: [(key, texto)]."""
+    return [(k, v) for k, v in _isis_memory_all(db) if k.startswith('pendiente:')]
+
+
+def _isis_todo_find(db, query):
+    """Pendientes que hablan de algo: busca por palabras (más de 2 letras)
+    en la clave o el texto, como _isis_memory_search."""
+    words = [w for w in re.findall(r'\w+', _isis_norm(query)) if len(w) > 2]
+    out = []
+    for key, value in _isis_todo_list(db):
         hay = _isis_norm(key + ' ' + value)
         if not words or any(w in hay for w in words):
             out.append((key, value))
@@ -1792,8 +2172,34 @@ def _isis_unit_word(text):
             return u
     return 'botellas'
 
+
+def _isis_parse_order_note(text):
+    """Nota/comentario de un pedido por voz (v11): 'agrega dos coronas a la
+    mesa cinco, sin cebolla' -> 'sin cebolla'. Marcadores explícitos
+    ('con nota', 'nota', 'con comentario', 'comentario') en cualquier
+    posición, o cola después de la mesa ('sin X', 'con poco X'). Si no hay
+    nota, None. Pura y testeable."""
+    t = _isis_norm(text)
+    m = re.search(r'\b(?:con\s+nota|con\s+comentario|nota|comentario)\s*:?\s*(.+)$', t)
+    if m:
+        note = re.sub(r'\s+a\s+la\s+mesa\s+(?:\d+|[a-z]+).*$', '', m.group(1).strip())
+        note = note.rstrip(' .?!').strip()
+        if note:
+            return note[:200]
+    m = re.search(r'mesa\s+(?:\d+|[a-z]+)\s*,?\s*((?:sin|con\s+poco|con\s+poca)\s+.+)$', t)
+    if m:
+        note = m.group(1).strip().rstrip(' .?!').strip()
+        if note:
+            return note[:200]
+    return None
+
 def _isis_table_numbers(text):
-    return re.findall(r'mesa\s+(\d+)', text)
+    """Números de mesa, en dígito o en palabra ('mesa cinco' -> '5')."""
+    out = []
+    for m in re.finditer(r'mesa\s+(\d+|' + '|'.join(_NUM_WORDS) + r')\b', text):
+        v = m.group(1)
+        out.append(v if v.isdigit() else str(_NUM_WORDS[v]))
+    return out
 
 def _isis_parse_reservation_time(text):
     """'hoy a las 20' / 'mañana a las 19:30' -> datetime en hora de CDMX, o None.
@@ -1875,6 +2281,45 @@ def _isis_parse_local(db, user, raw, history=None):
     cli_q = _isis_parse_client_question(text)
     if cli_q is not None:
         return cli_q
+    # --- Pendientes por voz (v11): lista de cosas por hacer, en IsisMemory ---
+    # Un pendiente por clave ('pendiente:<texto>'): así 'olvida lo del
+    # carbón' borra solo ese pendiente y nunca la lista entera. No choca
+    # con 'recuerda que...': eso es memoria general, esto es la lista.
+    if 'anota pendiente' in text or 'anota que hay que' in text or ('anota' in text and 'hay que' in text):
+        body = text
+        for pref in ('anota pendiente:', 'anota pendiente', 'anota que hay que', 'anota'):
+            if pref in body:
+                body = body.split(pref, 1)[1].strip(' :')
+                break
+        body = body.strip().rstrip('.')
+        if not body:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué anoto en tus pendientes?'}
+        key = 'pendiente:' + _isis_norm(body)[:100]
+        if _isis_memory_get(db, key) is not None:
+            return {'action': 'chat', 'params': {'answer': f"Ese ya lo tienes anotado: {body}."}}
+        return {'action': 'todo_add', 'params': {'key': key, 'text': body}}
+    if ('que tengo pendiente' in text or 'que pendientes tengo' in text
+            or 'mis pendientes' in text or 'que pendientes hay' in text):
+        return {'action': 'todo_list', 'params': {}}
+    if (('borra' in text or 'quita' in text or 'ya quedo' in text) and 'pendiente' in text) \
+            or 'ya quedo lo de' in text or 'ya quedo lo del' in text:
+        q = text
+        for pref in ('borra el pendiente del', 'borra el pendiente de', 'borra el pendiente',
+                     'quita el pendiente del', 'quita el pendiente de', 'quita el pendiente',
+                     'ya quedo lo del', 'ya quedo el pendiente del', 'ya quedo el pendiente de',
+                     'ya quedo lo de', 'ya quedo'):
+            if pref in q:
+                q = q.split(pref, 1)[1].strip()
+                break
+        q = re.sub(r'^(el|la|los|las|lo|de|del)\s+', '', q).strip().rstrip('.')
+        if not q:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué pendiente borro? Dime de qué era.'}
+        hits = _isis_todo_find(db, q)
+        if not hits:
+            return {'action': 'chat', 'params': {'answer': f"No tengo anotado nada de '{q}'."}}
+        return {'action': 'todo_remove', 'params': {'query': q,
+                                                    'keys': [k for k, _v in hits],
+                                                    'texts': [v for _k, v in hits]}}
     # --- Memoria (v2) ---
     if 'recuerdas' in text or 'que sabes de' in text or 'que tienes guardado' in text:
         q = text
@@ -1904,6 +2349,20 @@ def _isis_parse_local(db, user, raw, history=None):
                 break
         return {'action': 'forget', 'params': {'query': q}}
     # --- 14. Estadísticas (antes que el resumen viejo de ventas) ---
+    # v11: cierre del día hablado. Va antes que 'resumen' (overview): "resumen
+    # del día" es el cierre, no el resumen general. "¿cómo nos fue ayer?" no
+    # entra aquí: eso lo cubre el resumen de ayer al entrar.
+    if 'ayer' not in text and ('como nos fue' in text or 'cierre del dia' in text
+                               or 'resumen del dia' in text or 'cierre de dia' in text):
+        return {'action': 'day_close', 'params': {}}
+    # v11: resumen de cambio de turno.
+    if ('que le dejo' in text or 'que le dejamos' in text or 'resumen de turno' in text
+            or 'cambio de turno' in text or 'resumen para el cambio' in text):
+        return {'action': 'shift_handover', 'params': {}}
+    # v11: lista de compras automática.
+    if ('que hay que pedir' in text or 'que hay que comprar' in text
+            or 'lista de compras' in text or 'que falta pedir' in text):
+        return {'action': 'shopping_list', 'params': {}}
     if 'ventas de ayer' in text or 'ventas de anoche' in text:
         return {'action': 'analytics', 'params': {'period': 'yesterday'}}
     if ('ventas de la semana' in text or 'ventas de esta semana' in text
@@ -1956,6 +2415,12 @@ def _isis_parse_local(db, user, raw, history=None):
             return {'action': 'create_reservation', 'params': {'name': name, 'party_size': party, 'scheduled_at': when.isoformat()}}
         return {'action': 'reservations_list', 'params': {}}
     # --- 3. Estaciones ---
+    # v11: la comanda más atrasada va antes que el resto de comandas: si no,
+    # 'comanda' la mandaría a la lista de tickets.
+    if ('comanda mas atrasada' in text or 'que comanda lleva mas tiempo' in text
+            or 'comanda lleva mas tiempo' in text or 'cual es la comanda mas atrasada' in text
+            or 'que comanda va mas atrasada' in text or 'comanda mas vieja' in text):
+        return {'action': 'oldest_ticket', 'params': {}}
     if 'comanda' in text or 'ticket' in text:
         station = _isis_station_word(text)
         if 'lista' in text or 'listo' in text:
@@ -1976,18 +2441,34 @@ def _isis_parse_local(db, user, raw, history=None):
         return {'action': 'tickets_list', 'params': {'station': station}}
     # --- 4. Cobros ---
     if 'descuento' in text:
-        a = _isis_find_account(db, user, text)
-        if not a:
-            return {'action': 'unknown', 'params': {}, 'question': '¿A qué mesa le aplico el descuento?'}
+        a, missing = _isis_resolve_account(db, user, text, '¿A qué mesa le aplico el descuento?')
+        if missing:
+            return missing
         pm = re.search(r'(\d+)\s*(?:%|por ciento)', text)
         if pm:
             return {'action': 'apply_discount', 'params': {'account_id': a.get('id'), 'mode': 'percent', 'value': int(pm.group(1))}}
-        amt = _isis_money(re.sub(r'mesa\s+\d+', '', text))
+        amt = _isis_money(_isis_strip_mesa(text))
         if amt is None:
             return {'action': 'unknown', 'params': {}, 'question': '¿De cuánto es el descuento, en pesos o en porcentaje?'}
         return {'action': 'apply_discount', 'params': {'account_id': a.get('id'), 'mode': 'fixed', 'value': amt}}
     if 'por cobrar' in text or 'pendientes de cobro' in text or 'cuentas por cobrar' in text:
         return {'action': 'cashier_overview', 'params': {}}
+    # --- v10.5: "añade al inventario 5 piezas de arrachera" es reponer, no
+    # preguntar cuánto hay. Antes caía en la lectura de inventario y solo
+    # decía el stock, sin sumar nada. Va antes del menú para que 'añade' no
+    # se lea como crear un producto nuevo. 'insumo' queda fuera: eso lo
+    # maneja la rama de registro de insumos de abajo.
+    if (any(k in text for k in ('anade', 'agrega', 'sumale', 'pon', 'mete'))
+            and any(k in text for k in ('inventario', 'existencias', 'stock'))
+            and 'insumo' not in text):
+        p = _isis_find_product(db, user, text)
+        if not p:
+            amb = _isis_ambiguous_product(db, user, text)
+            return {'action': 'unknown', 'params': {},
+                    'question': amb or '¿Qué producto quieres reponer? Dime su nombre.'}
+        return {'action': 'restock', 'params': {'product_id': p.get('id'), 'product': p.get('name'),
+                                                'qty': _isis_qty_for_product(text, p),
+                                                'reason': 'Reposicion por voz con Isis'}}
     # --- 6. Menú ---
     # Las sub-órdenes (presentación, promoción, precio) no siempre dicen
     # la palabra "menú", así que también disparan por su propio verbo.
@@ -2030,7 +2511,9 @@ def _isis_parse_local(db, user, raw, history=None):
                 or ('costo de' in text and 'cambia' not in text and 'pon' not in text)):
             p = _isis_find_product(db, user, text)
             if not p:
-                return {'action': 'unknown', 'params': {}, 'question': '¿De qué producto quieres saber el precio?'}
+                amb = _isis_ambiguous_product(db, user, text)
+                return {'action': 'unknown', 'params': {},
+                        'question': amb or '¿De qué producto quieres saber el precio?'}
             return {'action': 'product_price', 'params': {'product_id': p.get('id'), 'product': p.get('name')}}
         if 'cambia el precio' in text or 'precio de' in text:
             p = _isis_find_product(db, user, text)
@@ -2040,7 +2523,11 @@ def _isis_parse_local(db, user, raw, history=None):
             if not nums:
                 return {'action': 'unknown', 'params': {}, 'question': '¿En cuánto lo dejo?'}
             return {'action': 'edit_product_price', 'params': {'product_id': p.get('id'), 'price': nums[-1]}}
-        if any(k in text for k in ('agrega', 'anade', 'crea', 'nuevo producto')):
+        # v11: crear un producto exige decirlo en el menú ('agrega X al
+        # menú'). Sin 'menú' ni 'carta', 'agrega X a la mesa Y' es un pedido
+        # (add_order), no un producto nuevo.
+        if (('menu' in text or 'carta' in text) and any(k in text for k in ('agrega', 'anade'))) \
+                or 'crea' in text or 'nuevo producto' in text:
             price = _isis_money(text)
             if price is None:
                 return {'action': 'unknown', 'params': {}, 'question': '¿Cuánto cuesta el producto nuevo? Dime el precio en pesos.'}
@@ -2090,6 +2577,25 @@ def _isis_parse_local(db, user, raw, history=None):
         return {'action': 'staff_list', 'params': {}}
     # --- 9. Propinas ---
     if 'propina' in text:
+        # v11, acción delicada: pagarle su parte a una persona concreta.
+        # Va antes del fondo/reparto: "págale su propina a María" no es
+        # preguntar por el fondo. Por defecto en efectivo; si dice
+        # "por transferencia", así se paga. Se paga TODO lo pendiente.
+        if any(k in text for k in ('pagale', 'dale', 'paga la propina', 'paga su propina', 'entregale')):
+            u = _isis_find_user(db, user, text)
+            if not u:
+                return {'action': 'unknown', 'params': {}, 'question': '¿A quién le pago su propina? Dime el nombre.'}
+            dist, share, pending = _isis_find_tip_share(db, u.get('id'))
+            if not dist or not share:
+                return {'action': 'chat', 'params': {'answer': f"{u.get('display')} no está en el reparto de propinas."}}
+            if pending <= 0:
+                return {'action': 'chat', 'params': {'answer': f"A {u.get('display')} ya se le pagó toda su propina."}}
+            method = 'transfer' if 'transfer' in text else 'cash'
+            return {'action': 'tip_payout', 'params': {'distribution_id': dist.get('id'),
+                                                       'share_id': share.get('id'),
+                                                       'employee': u.get('display'),
+                                                       'amount': round(pending / 100, 2),
+                                                       'method': method}}
         if 'reparte' in text or 'reparto' in text:
             return {'action': 'tips_distribute', 'params': {}}
         return {'action': 'tips_pool', 'params': {}}
@@ -2126,9 +2632,9 @@ def _isis_parse_local(db, user, raw, history=None):
     if 'cuentas abiertas' in text or 'que cuentas hay' in text or 'cuentas activas' in text:
         return {'action': 'accounts_list', 'params': {}}
     if 'cambia la cuenta' in text or 'mueve la cuenta' in text or 'transfiere la cuenta' in text:
-        a = _isis_find_account(db, user, text)
-        if not a:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Qué cuenta cambio de mesa? Dime la mesa de origen.'}
+        a, missing = _isis_resolve_account(db, user, text, '¿Qué cuenta cambio de mesa? Dime la mesa de origen.')
+        if missing:
+            return missing
         nums = _isis_table_numbers(text)
         if len(nums) < 2:
             return {'action': 'unknown', 'params': {}, 'question': '¿A qué mesa la muevo? Dime la mesa destino.'}
@@ -2136,6 +2642,55 @@ def _isis_parse_local(db, user, raw, history=None):
         if not t:
             return {'action': 'unknown', 'params': {}, 'question': 'No encontré esa mesa. ¿A cuál la muevo?'}
         return {'action': 'transfer_account', 'params': {'account_id': a.get('id'), 'table_id': t.get('id'), 'table_name': t.get('name')}}
+    # --- v11, acciones delicadas: unir y dividir cuentas (doble confirmación) ---
+    if re.search(r'\b(une|junta)\b', text) and 'cuenta' in text:
+        nums = _isis_table_numbers(text)
+        if len(nums) >= 2:
+            a = _isis_find_account(db, user, 'mesa ' + nums[0])
+            b = _isis_find_account(db, user, 'mesa ' + nums[1])
+            if not a or not b:
+                return {'action': 'unknown', 'params': {}, 'question': 'No encontré una de esas cuentas. ¿De qué mesas son?'}
+        else:
+            # Por nombre de cliente: "une la cuenta de Juanita con la de María".
+            parts = re.split(r'\s+con\s+', text, maxsplit=1)
+            a, missing_a = _isis_resolve_account(db, user, parts[0], '¿Qué dos cuentas uno? Dime las dos mesas.')
+            if missing_a:
+                return missing_a
+            b = None
+            if len(parts) > 1:
+                b, missing_b = _isis_resolve_account(db, user, parts[1], '¿Con qué cuenta la uno? Dime la segunda mesa.')
+                if missing_b:
+                    return missing_b
+            if not a or not b:
+                return {'action': 'unknown', 'params': {}, 'question': '¿Qué dos cuentas uno? Dime las dos mesas.'}
+        if a.get('id') == b.get('id'):
+            return {'action': 'unknown', 'params': {}, 'question': 'Son la misma cuenta, dime dos mesas distintas.'}
+        return {'action': 'merge_accounts', 'params': {'account_id': a.get('id'),
+                                                       'target_account_id': b.get('id'),
+                                                       'source_table': a.get('table_name') or a.get('name'),
+                                                       'target_table': b.get('table_name') or b.get('name')}}
+    if ('divide' in text or 'separa' in text or 'parte la cuenta' in text) and 'cuenta' in text:
+        a, missing = _isis_resolve_account(db, user, text, '¿Qué cuenta divido? Dime la mesa.')
+        if missing:
+            return missing
+        p = _isis_find_product(db, user, text)
+        nums = _isis_table_numbers(text)
+        if not p or len(nums) < 2:
+            # Falta el producto o el destino: Isis pregunta paso a paso.
+            return {'action': 'split_account_start', 'params': {'account_id': a.get('id'),
+                                                                'table_name': a.get('table_name') or a.get('name')}}
+        # Cantidad: el primer número que no sea parte del nombre del
+        # producto ("mueve la corona 355" mueve 1, no 355).
+        qty = _isis_qty_for_product(text, p)
+        t = _isis_find_table(db, user, 'mesa ' + nums[-1])
+        if not t:
+            return {'action': 'unknown', 'params': {}, 'question': 'No encontré esa mesa destino. ¿A cuál lo muevo?'}
+        tgt = _isis_find_account(db, user, 'mesa ' + nums[-1])
+        if tgt:
+            return _isis_split_build(db, a.get('id'), a.get('table_name') or a.get('name'),
+                                     p, qty, tgt.get('id'), None, tgt.get('table_name'))
+        return _isis_split_build(db, a.get('id'), a.get('table_name') or a.get('name'),
+                                 p, qty, None, t.get('id'), t.get('name'))
     # --- 2. Mesas: cambiar capacidad ---
     if 'capacidad' in text and 'mesa' in text:
         t = _isis_find_table(db, user, text)
@@ -2159,9 +2714,9 @@ def _isis_parse_local(db, user, raw, history=None):
     if 'caja' in text and any(k in text for k in ('cuanto hay', 'cuanto tenemos', 'estado', 'como esta')):
         return {'action': 'cash', 'params': {}}
     if 'cuanto debe' in text or 'cuanto es' in text or 'saldo' in text or 'detalle de la cuenta' in text:
-        a = _isis_find_account(db, user, text)
-        if not a:
-            return {'action': 'unknown', 'params': {}, 'question': '¿De qué mesa quieres saber el saldo? Dime el nombre o el número.'}
+        a, missing = _isis_resolve_account(db, user, text, '¿De qué mesa quieres saber el saldo? Dime el nombre o el número.')
+        if missing:
+            return missing
         return {'action': 'account_detail', 'params': {'account_id': a.get('id')}}
     # Escrituras (todas con confirmacion)
     if 'abre el turno' in text or 'abrir turno' in text or 'abre caja' in text:
@@ -2185,27 +2740,56 @@ def _isis_parse_local(db, user, raw, history=None):
             return {'action': 'unknown', 'params': {}, 'question': '¿Qué mesa quieres abrir? Dime el nombre o el número.'}
         return {'action': 'new_account', 'params': {'table_id': t.get('id'), 'table_name': t.get('name')}}
     if 'anula' in text and 'cuenta' in text:
-        a = _isis_find_account(db, user, text)
-        if not a:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Qué cuenta quieres anular? Dime la mesa.'}
+        a, missing = _isis_resolve_account(db, user, text, '¿Qué cuenta quieres anular? Dime la mesa.')
+        if missing:
+            return missing
         return {'action': 'void_account', 'params': {'account_id': a.get('id'), 'reason': 'Anulacion por voz con Isis'}}
     if 'cierra la cuenta' in text or 'cerrar la cuenta' in text:
-        a = _isis_find_account(db, user, text)
+        a, missing = _isis_resolve_account(db, user, text, '¿Qué cuenta quieres cerrar? Dime la mesa.')
+        if missing:
+            return missing
+        return {'action': 'close_account', 'params': {'account_id': a.get('id'),
+                                                      'table_name': a.get('table_name'),
+                                                      'client_name': _isis_client_name_of(a)}}
+    # v11, acción delicada: reabrir una cuenta que se cerró como pagada.
+    # Si su mesa sigue libre, vuelve a esa mesa; si ya está ocupada, la
+    # cuenta queda abierta sin mesa.
+    if 'reabr' in text and 'cuenta' in text:
+        a, t = _isis_find_closed_account(db, user, text)
         if not a:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Qué cuenta quieres cerrar? Dime la mesa.'}
-        return {'action': 'close_account', 'params': {'account_id': a.get('id')}}
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué cuenta reabro? Dime la mesa de la cuenta que se cerró.'}
+        occupied = bool(t and db.get(TableOccupancy, t.get('id')) is not None)
+        return {'action': 'reopen_closed', 'params': {'account_id': a.get('id'),
+                                                      'table_name': t.get('name') if t else a.get('name'),
+                                                      'table_id': t.get('id') if (t and not occupied) else None,
+                                                      'table_occupied': occupied}}
+    # v11: cobrar y cerrar en una sola frase. Va antes que 'cobra' solo:
+    # si solo se cobra, la cuenta queda pendiente; aquí se cierra también.
+    if ('cobra' in text and 'cierra' in text) or ('paga' in text and 'cierra' in text and 'mesa' in text):
+        a, missing = _isis_resolve_account(db, user, text, '¿Qué mesa quieres cobrar y cerrar? Dime el nombre o el número.')
+        if missing:
+            return missing
+        method = _isis_method(text)
+        if not method:
+            return {'action': 'unknown', 'params': {}, 'question': '¿En efectivo, con tarjeta o por transferencia?'}
+        return {'action': 'pay_and_close_account', 'params': {'account_id': a.get('id'),
+                                                              'method': method,
+                                                              'table_name': a.get('table_name') or a.get('name'),
+                                                              'client_name': _isis_client_name_of(a)}}
     if 'cobra' in text or 'paga la mesa' in text or 'pagar la mesa' in text:
-        a = _isis_find_account(db, user, text)
-        if not a:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Qué mesa quieres cobrar? Dime el nombre o el número.'}
+        a, missing = _isis_resolve_account(db, user, text, '¿Qué mesa quieres cobrar? Dime el nombre o el número.')
+        if missing:
+            return missing
         method = _isis_method(text)
         all_flag = 'todo' in text or 'completo' in text or 'total' in text
-        amt = None if all_flag else _isis_money(re.sub(r'mesa\s+\d+', '', text))
+        amt = None if all_flag else _isis_money(_isis_strip_mesa(text))
         if not all_flag and amt is None:
             return {'action': 'unknown', 'params': {}, 'question': '¿Cuánto cobro, o todo el saldo?'}
         if not method:
             return {'action': 'unknown', 'params': {}, 'question': '¿En efectivo, con tarjeta o por transferencia?'}
-        return {'action': 'pay_account', 'params': {'account_id': a.get('id'), 'amount': amt, 'method': method, 'all': all_flag}}
+        return {'action': 'pay_account', 'params': {'account_id': a.get('id'), 'amount': amt, 'method': method, 'all': all_flag,
+                                                    'table_name': a.get('table_name'),
+                                                    'client_name': _isis_client_name_of(a)}}
     if 'repon' in text or 'reponer' in text or 'surte' in text:
         p = _isis_find_product(db, user, text)
         if not p:
@@ -2219,14 +2803,51 @@ def _isis_parse_local(db, user, raw, history=None):
         if amt is None:
             return {'action': 'unknown', 'params': {}, 'question': '¿En cuánto dejo ese producto?'}
         return {'action': 'inventory_adjust', 'params': {'product_id': p.get('id'), 'product': p.get('name'), 'qty': int(amt), 'mode': 'count', 'reason': 'Ajuste por voz con Isis'}}
-    if ('agrega' in text or 'anade' in text or 'pon' in text or 'pide' in text) and 'mesa' in text:
-        a = _isis_find_account(db, user, text)
+    # v11 (robustez): 'súmale' también es pedir, igual que 'agrega'/'pon'.
+    if ('agrega' in text or 'anade' in text or 'pon' in text or 'pide' in text or 'sumale' in text) and 'mesa' in text:
+        a, missing = _isis_resolve_account(db, user, text, '¿A qué mesa le agrego el pedido?')
+        if missing:
+            return missing
         p = _isis_find_product(db, user, text)
-        if not a:
-            return {'action': 'unknown', 'params': {}, 'question': '¿A qué mesa le agrego el pedido?'}
         if not p:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Qué producto le agrego a esa mesa?'}
-        return {'action': 'add_order', 'params': {'account_id': a.get('id'), 'items': [{'product_id': p.get('id'), 'product': p.get('name'), 'qty': _isis_qty(re.sub(r'mesa\s+\d+', '', text))}]}}
+            amb = _isis_ambiguous_product(db, user, text)
+            return {'action': 'unknown', 'params': {},
+                    'question': amb or '¿Qué producto le agrego a esa mesa?'}
+        item = {'product_id': p.get('id'), 'product': p.get('name'),
+                'qty': _isis_qty_for_product(text, p)}
+        note = _isis_parse_order_note(text)
+        if note:
+            item['note'] = note
+        return {'action': 'add_order', 'params': {'account_id': a.get('id'), 'items': [item],
+                                                  'table_name': a.get('table_name'),
+                                                  'client_name': _isis_client_name_of(a)}}
+    # v11: quitar un producto de una cuenta ("quítale la corona a la mesa 5",
+    # "cancela la corona de la mesa de Juanita"). La app no tiene un
+    # endpoint directo: la cancelación es solicitud + decisión del
+    # propietario, y eso es justo lo que hace _isis_execute (Isis actúa
+    # como propietaria). 'cancela la cuenta' queda fuera: eso es anular.
+    if (('quitale' in text or 'quita' in text or ('cancela' in text and 'cuenta' not in text))
+            and ('mesa' in text or 'cuenta' in text)):
+        a, missing = _isis_resolve_account(db, user, text, '¿De qué mesa quito el producto?')
+        if missing:
+            return missing
+        p = _isis_find_product(db, user, text)
+        if not p:
+            amb = _isis_ambiguous_product(db, user, text)
+            return {'action': 'unknown', 'params': {},
+                    'question': amb or '¿Qué producto quito de esa mesa?'}
+        qty = _isis_qty_for_product(text, p)
+        item, _ready = _isis_find_account_item(db, a.get('id'), p.get('id'))
+        label = _isis_describe_account({'account_id': a.get('id'), 'table_name': a.get('table_name'),
+                                        'client_name': _isis_client_name_of(a)})
+        if not item:
+            return {'action': 'chat', 'params': {'answer': f"No hay {p.get('name')} en {label}, no quité nada."}}
+        if qty > item['qty']:
+            return {'action': 'chat', 'params': {'answer': f"Solo quedan {item['qty']} de {p.get('name')} en {label}."}}
+        return {'action': 'cancel_item', 'params': {'account_id': a.get('id'), 'item_id': item['id'],
+                                                    'product': p.get('name'), 'qty': qty,
+                                                    'table_name': a.get('table_name'),
+                                                    'client_name': _isis_client_name_of(a)}}
     if ('entrada' in text or 'salida' in text) and ('efectivo' in text or 'caja' in text or '$' in text or _isis_money(text) is not None):
         amt = _isis_money(text)
         if amt is None:
@@ -2514,6 +3135,206 @@ def _isis_decision_context(db, user):
     return ' '.join(parts)
 
 
+def _isis_day_close(db, user):
+    """Cierre del día hablado (v11): ventas de hoy por método, ticket
+    promedio, lo más vendido, mejor mesero por ventas, cuentas abiertas y
+    estado de caja. Solo datos reales; si no hubo ventas, se dice así."""
+    local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+    today = datetime.now(local_tz).date()
+    try:
+        d = mitote_extensions.owner_analytics(start=today, end=today, scope='history', db=db, user=user)
+    except Exception:
+        d = {}
+    sales = float(d.get('sales') or 0)
+    paid = int(d.get('paid_accounts') or 0)
+    methods = d.get('methods') or {}
+    avg = float(d.get('average_ticket') or 0)
+    top = [x.get('name') for x in (d.get('products') or [])[:1] if x.get('name')]
+    best = None
+    try:
+        begin = datetime(today.year, today.month, today.day, tzinfo=local_tz).astimezone(timezone.utc)
+        finish = begin + timedelta(days=1)
+        rows = db.execute(
+            select(Account.owner_id, func.coalesce(func.sum(Payment.cents), 0))
+            .join(Payment, Payment.account_id == Account.id)
+            .where(Payment.created_at >= begin, Payment.created_at < finish)
+            .group_by(Account.owner_id)).all()
+        if rows:
+            uid, cents_ = max(rows, key=lambda r: r[1])
+            if int(cents_ or 0) > 0:
+                u = db.get(User, uid)
+                best = (u.display if u else '?', float(cents_) / 100)
+    except Exception:
+        best = None
+    try:
+        accs = accounts(db, user)
+        pend = [x for x in accs if x.get('status') in ('open', 'pending')]
+        due = sum(float(x.get('due') or 0) for x in pend)
+    except Exception:
+        pend, due = [], 0
+    try:
+        c = cash(db, user)
+        cash_txt = (f"En caja deberían haber {_isis_pesos(c.get('expected'))}."
+                    if c.get('open') else "La caja está cerrada.")
+    except Exception:
+        cash_txt = ''
+    if sales <= 0 and paid == 0:
+        parts = ['Hoy no hay ventas registradas todavía.']
+    else:
+        parts = [f"Hoy llevamos {_isis_pesos(sales)} en {_isis_n(paid, 'cuenta pagada', 'cuentas pagadas')}: "
+                 f"{_isis_pesos(methods.get('cash'))} en efectivo, {_isis_pesos(methods.get('card'))} con tarjeta "
+                 f"y {_isis_pesos(methods.get('transfer'))} por transferencia. "
+                 f"Ticket promedio de {_isis_pesos(avg)}."]
+        if top:
+            parts.append(f"Lo más vendido: {top[0]}.")
+        if best:
+            parts.append(f"El mejor mesero fue {best[0]}, con {_isis_pesos(best[1])}.")
+    if pend:
+        parts.append(f"Quedan {_isis_n(len(pend), 'cuenta abierta', 'cuentas abiertas')} por cobrar, {_isis_pesos(due)}.")
+    else:
+        parts.append('No quedan cuentas abiertas.')
+    if cash_txt:
+        parts.append(cash_txt)
+    return ' '.join(parts)
+
+
+def _isis_shopping_list(db, user):
+    """Lista de compras automática (v11): productos con inventario activado
+    y stock bajo (mismo umbral que la lectura de inventario) + cuánto se
+    vendió hoy de cada uno. Solo datos: producto, cuánto queda y cuánto se
+    vendió hoy. Nunca inventa cantidades sugeridas."""
+    try:
+        prods = products(db, user)
+        low = [x for x in prods if x.get('inventory_enabled') and (x.get('stock') or 0) <= 3]
+    except Exception:
+        return 'No pude revisar el inventario.'
+    if not low:
+        return 'Nada, todo tiene más de 3 en existencia.'
+    sold = {x.get('product_id'): x.get('quantity') for x in _isis_sold_today(db, user)}
+    items = []
+    for x in low:
+        s = f"{x.get('name')}: quedan {x.get('stock')}"
+        qty_sold = sold.get(x.get('id'))
+        if qty_sold:
+            s += f", hoy se vendieron {qty_sold}"
+        items.append(s)
+    return 'Hay que pedir: ' + _isis_short_list(items, len(items)) + '.'
+
+
+def _isis_oldest_ticket(db, user):
+    """La comanda más atrasada (v11): la pendiente más antigua, con tiempo
+    transcurrido en hora local, mesa y cantidad de productos."""
+    try:
+        rows = db.scalars(select(StationTicket).where(
+            StationTicket.status != 'ready').order_by(StationTicket.created_at)).all()
+    except Exception:
+        return 'No pude revisar las comandas.'
+    for t in rows:
+        batch = db.get(Batch, t.batch_id)
+        if not batch:
+            continue
+        acc = db.get(Account, batch.account_id)
+        if not acc or acc.status not in ('open', 'pending'):
+            continue
+        items = db.scalars(select(OrderItem).where(OrderItem.batch_id == batch.id)).all()
+        qty = sum(max(0, int(i.qty or 0) - int(i.cancelled_qty or 0)) for i in items)
+        if qty <= 0:
+            continue
+        created = t.created_at
+        if created is None:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        mins = int((now() - created).total_seconds() // 60)
+        if mins < 0:
+            mins = 0
+        if mins < 60:
+            tiempo = _isis_n(mins, 'minuto', 'minutos')
+        else:
+            tiempo = _isis_n(mins // 60, 'hora', 'horas')
+            if mins % 60:
+                tiempo += f" con {_isis_n(mins % 60, 'minuto', 'minutos')}"
+        occ = db.scalar(select(TableOccupancy).where(TableOccupancy.account_id == acc.id))
+        table = db.get(DiningTable, occ.table_id) if occ else None
+        tname = table.name if table else acc.name
+        station = 'cocina' if t.station == 'kitchen' else 'barra'
+        return (f"La comanda más atrasada es la de {tname}, de {station}: lleva {tiempo}, "
+                f"son {_isis_n(qty, 'producto', 'productos')}.")
+    return 'No hay comandas pendientes ahorita.'
+
+
+def _isis_shift_handover(db, user):
+    """Resumen para el cambio de turno (v11): qué le deja Isis al siguiente
+    turno. Corto: cuentas abiertas con antigüedad y saldo, pendientes
+    (autorizaciones y reservaciones de hoy), stock bajo, caja y ventas del
+    día hasta ahora. Solo datos reales."""
+    parts = []
+    try:
+        accs = accounts(db, user)
+        pend = [x for x in accs if x.get('status') in ('open', 'pending')]
+        if pend:
+            items = []
+            for a in pend:
+                created = _isis_parse_dt(a.get('created_at'))
+                age = ''
+                if created:
+                    h = (now() - created).total_seconds() / 3600
+                    age = f", hace {h:.0f} h" if h >= 1 else ', hace menos de una hora'
+                items.append(f"{a.get('table_name') or a.get('name')} debe {_isis_pesos(a.get('due'))}{age}")
+            parts.append('Cuentas abiertas: ' + _isis_short_list(items, len(items)) + '.')
+        else:
+            parts.append('No hay cuentas abiertas.')
+    except Exception:
+        parts.append('Cuentas abiertas: no disponible.')
+    try:
+        pend_ap = [r for r in requests(db, user) if r.get('status') == 'pending']
+        rows = mitote_extensions.reservations(db, user)
+        local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+        today_local = datetime.now(local_tz).date()
+        pend_res = [r for r in rows if r.get('status') in ('pending', 'confirmed')
+                    and _isis_parse_dt(r.get('scheduled_at')) is not None
+                    and _isis_parse_dt(r.get('scheduled_at')).astimezone(local_tz).date() == today_local]
+        bits = []
+        if pend_ap:
+            bits.append(f"{len(pend_ap)} autorizaciones pendientes")
+        if pend_res:
+            bits.append(f"{len(pend_res)} reservaciones para hoy")
+        parts.append('Pendientes: ' + ('; '.join(bits) + '.' if bits else 'nada.'))
+    except Exception:
+        parts.append('Pendientes: no disponible.')
+    try:
+        prods = products(db, user)
+        low = [x for x in prods if x.get('inventory_enabled') and (x.get('stock') or 0) <= 3]
+        if low:
+            parts.append('Stock bajo: ' + _isis_short_list(
+                [f"{x.get('name')} ({x.get('stock')})" for x in low], len(low)) + '.')
+        else:
+            parts.append('Stock en orden.')
+    except Exception:
+        parts.append('Stock: no disponible.')
+    try:
+        c = cash(db, user)
+        if c.get('open'):
+            parts.append(f"Caja abierta, en caja deberían haber {_isis_pesos(c.get('expected'))}.")
+        else:
+            parts.append('La caja está cerrada.')
+    except Exception:
+        parts.append('Caja: no disponible.')
+    try:
+        local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+        today = datetime.now(local_tz).date()
+        d = mitote_extensions.owner_analytics(start=today, end=today, scope='history', db=db, user=user)
+        sales = float(d.get('sales') or 0)
+        paid = int(d.get('paid_accounts') or 0)
+        if sales > 0 or paid > 0:
+            parts.append(f"Hoy llevamos {_isis_pesos(sales)} en {_isis_n(paid, 'cuenta pagada', 'cuentas pagadas')}.")
+        else:
+            parts.append('Hoy no hay ventas registradas todavía.')
+    except Exception:
+        parts.append('Ventas de hoy: no disponible.')
+    return ' '.join(parts)
+
+
 def _isis_alerts(db, user):
     """Hasta 3 alertas cortas de lo que necesita atención AHORA (v4). Solo lectura."""
     alerts = []
@@ -2535,6 +3356,34 @@ def _isis_alerts(db, user):
             hours = int((now - created).total_seconds() // 3600)
             if hours > 2:
                 alerts.append(f"La {a.get('table_name') or a.get('name')} lleva {hours} {'hora' if hours == 1 else 'horas'} abierta y debe {_isis_pesos(a.get('due'))}.")
+    except Exception:
+        pass
+    try:
+        # v11: reservaciones próximas (en los próximos 60 minutos). Van
+        # antes que el stock bajo: hay que preparar la mesa. Como mucho 2,
+        # para que un solo tipo no se coma las 3 alertas.
+        rows = mitote_extensions.reservations(db, user)
+        local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+        now_local = datetime.now(local_tz)
+        upcoming = []
+        for r in rows:
+            if r.get('status') not in ('pending', 'confirmed'):
+                continue
+            when = _isis_parse_dt(r.get('scheduled_at'))
+            if not when:
+                continue
+            mins = (when.astimezone(local_tz) - now_local).total_seconds() / 60
+            if 0 <= mins <= 60:
+                upcoming.append((mins, r))
+        upcoming.sort(key=lambda x: x[0])
+        for mins, r in upcoming[:2]:
+            if mins < 1:
+                cuando = 'ahorita mismo'
+            elif mins < 60:
+                cuando = f"en {int(mins)} minutos"
+            else:
+                cuando = 'en una hora'
+            alerts.append(f"Reservación de {r.get('name')} ({r.get('party_size')} personas) {cuando}.")
     except Exception:
         pass
     try:
@@ -2594,7 +3443,8 @@ _READ_ACTIONS = {'tables', 'overview', 'cash', 'cash_history', 'inventory', 'inv
                  'account_detail', 'accounts_list', 'tickets_list', 'cashier_overview',
                  'menu_list', 'product_price', 'staff_list', 'tips_pool', 'approvals_list', 'audit_list',
                  'reservations_list', 'prep_config', 'analytics', 'recall', 'chat',
-                 'client_info', 'cash_cut_start'}
+                 'client_info', 'cash_cut_start', 'split_account_start', 'todo_list',
+                 'day_close', 'shift_handover', 'shopping_list', 'oldest_ticket'}
 
 _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'new_account',
                   'add_order', 'pay_account', 'close_account', 'transfer_account', 'restock',
@@ -2603,7 +3453,9 @@ _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'ne
                   'add_variant', 'add_promotion', 'edit_product_price', 'create_staff',
                   'staff_pin', 'tips_distribute', 'decide_approval', 'create_reservation',
                   'confirm_reservation', 'reservation_arrive', 'prep_config_set',
-                  'product_prep_set', 'remember', 'forget'}
+                  'product_prep_set', 'remember', 'forget', 'merge_accounts', 'split_account',
+                  'reopen_closed', 'tip_payout', 'todo_add', 'todo_remove',
+                  'pay_and_close_account', 'cancel_item'}
 
 def _isis_describe(intent):
     """Resumen de lo que Isis propone hacer, para pedir confirmación por voz.
@@ -2621,15 +3473,20 @@ def _isis_describe(intent):
     if a == 'new_account':
         return f"Abro una cuenta en {mesa(p.get('table_name'))}."
     if a == 'add_order':
-        items = ', '.join(f"{i.get('qty')} {i.get('product')}" for i in p.get('items') or [])
-        return f"A la cuenta {p.get('account_id')} le agrego: {items}."
+        def _it(i):
+            t = f"{i.get('qty')} {i.get('product')}"
+            if i.get('note'):
+                t += f", nota: {i.get('note')}"
+            return t
+        items = ', '.join(_it(i) for i in p.get('items') or [])
+        return f"A {_isis_describe_account(p)} le agrego: {items}."
     if a == 'pay_account':
         amt = 'todo el saldo' if p.get('all') else _isis_pesos(p.get('amount'))
         metodo = {'cash': 'en efectivo', 'card': 'con tarjeta',
                   'transfer': 'por transferencia'}.get(p.get('method'))
-        return f"Cobro {amt} de la cuenta {p.get('account_id')}" + (f" {metodo}." if metodo else '.')
+        return f"Cobro {amt} de {_isis_describe_account(p)}" + (f" {metodo}." if metodo else '.')
     if a == 'close_account':
-        return f"Cierro la cuenta {p.get('account_id')}."
+        return f"Cierro {_isis_describe_account(p)}."
     if a == 'restock':
         return f"Repongo {p.get('qty')} de {p.get('product')}."
     if a == 'inventory_adjust':
@@ -2688,12 +3545,53 @@ def _isis_describe(intent):
         return f"Pongo el límite de preparación en {p.get('batch_minutes')} minutos por comanda."
     if a == 'product_prep_set':
         return f"Pongo el tiempo de preparación de {p.get('product')} en {p.get('minutes')} minutos."
+    # --- v11, acciones delicadas (doble confirmación) ---
+    if a == 'merge_accounts':
+        return f"Uno la cuenta de {mesa(p.get('source_table'))} con la de {mesa(p.get('target_table'))}: todo lo de la primera pasa a la segunda y la primera se cierra."
+    if a == 'split_account':
+        if p.get('target_account_id'):
+            dest = f"a la cuenta de {mesa(p.get('target_table'))}"
+        elif p.get('table_id'):
+            dest = f"a una cuenta nueva en {mesa(p.get('target_table'))}"
+        else:
+            dest = "a una cuenta nueva"
+        return f"Muevo {p.get('qty')} {p.get('product')} de la cuenta de {mesa(p.get('source_table'))} {dest}."
+    if a == 'reopen_closed':
+        extra = " La mesa está ocupada, así que la cuenta queda sin mesa." if p.get('table_occupied') else ""
+        return f"Reabro la cuenta de {mesa(p.get('table_name'))}, que estaba cerrada como pagada.{extra}"
+    if a == 'tip_payout':
+        metodo = 'en efectivo' if p.get('method') == 'cash' else 'por transferencia'
+        return f"Le pago a {p.get('employee')} sus {_isis_pesos(p.get('amount'))} de propina {metodo}."
+    # --- v11: pendientes por voz ---
+    if a == 'cancel_item':
+        return f"Quito {p.get('qty')} {p.get('product')} de {_isis_describe_account(p)}."
+    if a == 'todo_add':
+        return f"Anoto pendiente: {p.get('text')}."
+    if a == 'todo_remove':
+        txt = _isis_short_list(p.get('texts') or [], len(p.get('texts') or []))
+        return f"Borro de tus pendientes: {txt}."
+    # --- v11: cobrar y cerrar en una sola frase (una sola confirmación) ---
+    if a == 'pay_and_close_account':
+        metodo = {'cash': 'en efectivo', 'card': 'con tarjeta',
+                  'transfer': 'por transferencia'}.get(p.get('method'))
+        if p.get('client_name'):
+            return f"Cobro todo de {_isis_describe_account(p)} {metodo} y la cierro."
+        return f"Cobro todo de {mesa(p.get('table_name'))} {metodo} y la cierro."
     return "Hago eso."
 
-def _isis_confirm_token(intent):
+def _isis_confirm_token(intent, delicate=False, stage=1):
     token = secrets.token_urlsafe(24)
-    _ISIS_CONFIRM[token] = {'intent': intent, 'expires': time.time() + 120}
+    _ISIS_CONFIRM[token] = {'intent': intent, 'expires': time.time() + 120,
+                            'delicate': bool(delicate), 'stage': stage}
     return token
+
+
+# Acciones delicadas (v11): unir/dividir cuentas, reabrir una cerrada y pagar
+# la propina de una persona piden DOS confirmaciones: el primer "sí" solo
+# repite los datos exactos y pregunta "¿Seguro, lo hago?", y solo el segundo
+# "sí" ejecuta. Cualquier "no" cancela. El token expira a los 2 minutos,
+# igual que el de confirmación normal.
+_DELICATE_ACTIONS = {'merge_accounts', 'split_account', 'reopen_closed', 'tip_payout'}
 
 async def _isis_execute(db, user, intent):
     """Ejecuta un intent reutilizando las funciones reales de la app."""
@@ -2733,6 +3631,8 @@ async def _isis_execute(db, user, intent):
     if a == 'account_detail':
         d = account_detail(p.get('account_id'), db, user)
         label = d.get('table_name') if d.get('table_name') else d.get('name')
+        if d.get('table_name') and d.get('name') and d.get('name') != d.get('table_name'):
+            label = f"{d.get('table_name')}, de {d.get('name')}"
         reply = (f"La cuenta {d.get('id')}, {label}: en total son {_isis_pesos(d.get('total'))}, "
                  f"ya pagaron {_isis_pesos(d.get('paid'))} y faltan {_isis_pesos(d.get('due'))}.")
         # Cliente de siempre (v8): si esa mesa es de alguien conocido, se dice en corto.
@@ -2758,8 +3658,11 @@ async def _isis_execute(db, user, intent):
         r = await new_account(AccountIn(name=None, table_id=int(p.get('table_id')) if p.get('table_id') else None, client_key=secrets.token_urlsafe(16)), db, user)
         return f"Cuenta abierta en la {_isis_mesa_txt(p.get('table_name'))}, folio {r.get('id')}."
     if a == 'add_order':
-        items = [OrderLine(product_id=int(i.get('product_id')), qty=int(i.get('qty') or 1)) for i in p.get('items') or []]
+        items = [OrderLine(product_id=int(i.get('product_id')), qty=int(i.get('qty') or 1),
+                           note=str(i.get('note') or '')) for i in p.get('items') or []]
         r = await send_order(int(p.get('account_id')), OrderIn(items=items, client_key=secrets.token_urlsafe(16)), db, user)
+        if p.get('client_name'):
+            return f"Ya mandé la comanda a {_isis_describe_account(p)}, folio {r.get('batch_id')}."
         return f"Ya mandé la comanda, folio {r.get('batch_id')}."
     if a == 'pay_account':
         acc = account_detail(int(p.get('account_id')), db, user)
@@ -2775,12 +3678,32 @@ async def _isis_execute(db, user, intent):
         lines = [PaymentLine(method=p.get('method'), amount=amt, tip=Decimal('0'))]
         r = await pay(int(p.get('account_id')), PaymentIn(client_key=secrets.token_urlsafe(16), lines=lines), db, user)
         due_rest = float(r.get('due') or 0)
+        prefix = f"Pago registrado en {_isis_describe_account(p)}." if p.get('client_name') else "Pago registrado."
         if due_rest <= 0:
-            return "Pago registrado. Ya quedó pagada por completo."
-        return f"Pago registrado. Faltan {_isis_pesos(due_rest)} por pagar."
+            return prefix + " Ya quedó pagada por completo."
+        return prefix + f" Faltan {_isis_pesos(due_rest)} por pagar."
     if a == 'close_account':
         await close_account(int(p.get('account_id')), db, user)
+        if p.get('client_name'):
+            return f"{_isis_describe_account(p).capitalize()} ya quedó cerrada y pagada."
         return f"La cuenta {p.get('account_id')} ya quedó cerrada y pagada."
+    # --- v11: cobrar y cerrar en una sola frase ---
+    # Reutiliza la lógica de pay_account (pedir la cuenta primero si sigue
+    # abierta) y luego close_account. Si el cobro falla, la excepción sube
+    # y NO se cierra nada.
+    if a == 'pay_and_close_account':
+        acc = account_detail(int(p.get('account_id')), db, user)
+        if acc.get('status') == 'open':
+            await request_bill(int(p.get('account_id')), db, user)
+            acc = account_detail(int(p.get('account_id')), db, user)
+        due = Decimal(str(acc.get('due') or '0'))
+        if due > 0:
+            lines = [PaymentLine(method=p.get('method'), amount=due, tip=Decimal('0'))]
+            await pay(int(p.get('account_id')),
+                      PaymentIn(client_key=secrets.token_urlsafe(16), lines=lines), db, user)
+        await close_account(int(p.get('account_id')), db, user)
+        dest = _isis_describe_account(p) if p.get('client_name') else _isis_mesa_txt(p.get('table_name'))
+        return _isis_say(f"Listo, cobré todo de {dest} y la cuenta quedó cerrada.", warm=True)
     if a == 'restock':
         prod = db.get(Product, int(p.get('product_id')))
         r = await restock(int(p.get('product_id')), RestockIn(delta=int(p.get('qty')), reason=str(p.get('reason') or 'Reposicion por voz'), expected_version=int(prod.version)), db, user)
@@ -2827,6 +3750,46 @@ async def _isis_execute(db, user, intent):
         for k, _v in hits:
             _isis_memory_delete(db, k)
         return _isis_say(f"Ya olvidé lo de '{q}'.", warm=True)
+    # --- v11: quitar un producto de una cuenta. La app no tiene endpoint
+    # directo: la cancelación es solicitud + decisión del propietario, y
+    # eso es lo que se hace aquí (Isis actúa como propietaria, con su
+    # confirmación de voz previa). Sin devolver stock: el producto ya se
+    # descontó al mandar la comanda y no se sabe si se preparó.
+    if a == 'cancel_item':
+        acc = db.get(Account, int(p.get('account_id')))
+        if not acc:
+            raise HTTPException(404, 'La cuenta ya no existe.')
+        _total, paid = acc_totals(db, acc)
+        if paid > 0:
+            raise HTTPException(409, 'Cuenta con pagos: requiere ajuste administrativo especial')
+        item = db.get(OrderItem, int(p.get('item_id')))
+        if not item or int(item.qty or 0) - int(item.cancelled_qty or 0) < int(p.get('qty')):
+            raise HTTPException(409, 'La cantidad ya cambió')
+        r = await request_approval(int(p.get('account_id')),
+                                   ApprovalIn(kind='cancel', item_id=int(p.get('item_id')),
+                                              qty=int(p.get('qty')),
+                                              reason='Cancelación por voz con Isis'),
+                                   db, user)
+        await decide(int(r.get('id')), DecisionIn(approve=True, return_stock=False), db, user)
+        return f"Listo, quité {p.get('qty')} {p.get('product')} de {_isis_describe_account(p)}."
+    # --- v11: pendientes por voz ---
+    if a == 'todo_add':
+        _isis_memory_set(db, p.get('key'), p.get('text'))
+        return _isis_say(f"Anotado: {p.get('text')}. No se me olvida.", warm=True)
+    if a == 'todo_list':
+        items = _isis_todo_list(db)
+        if not items:
+            return "No tienes pendientes anotados. Todo en orden."
+        txt = _isis_short_list([v for _k, v in items], len(items))
+        return _isis_say(f"Tienes pendientes: {txt}", warm=True)
+    if a == 'todo_remove':
+        gone = [v for k, v in _isis_todo_list(db) if k in (p.get('keys') or [])]
+        for k in (p.get('keys') or []):
+            _isis_memory_delete(db, k)
+        if not gone:
+            return f"No encontré nada de '{p.get('query')}' en tus pendientes."
+        txt = _isis_short_list(gone, len(gone))
+        return _isis_say(f"Listo, borré: {txt}", warm=True)
     # --- v2: 1. Cuentas ---
     if a == 'accounts_list':
         rows = [x for x in accounts(db, user) if x.get('status') in ('open', 'pending')]
@@ -2837,6 +3800,35 @@ async def _isis_execute(db, user, intent):
     if a == 'transfer_account':
         await transfer_account_table(int(p.get('account_id')), AccountTableTransferIn(table_id=int(p.get('table_id')), reason='Cambio de mesa por voz con Isis'), db, user)
         return _isis_say(f"La cuenta {p.get('account_id')} ya está en la {_isis_mesa_txt(p.get('table_name'))}.", warm=True)
+    # --- v11, acciones delicadas (doble confirmación) ---
+    if a == 'merge_accounts':
+        await merge_accounts(int(p.get('account_id')),
+                             AccountMergeIn(target_account_id=int(p.get('target_account_id')),
+                                            reason='Union por voz con Isis'), db, user)
+        return _isis_say(f"Listo, uní la cuenta de {_isis_mesa_txt(p.get('source_table'))} con la de {_isis_mesa_txt(p.get('target_table'))}. Todo quedó en la segunda.", warm=True)
+    if a == 'split_account':
+        r = await split_account(int(p.get('account_id')),
+                                AccountSplitIn(item_id=int(p.get('item_id')), qty=int(p.get('qty')),
+                                               target_account_id=int(p.get('target_account_id')) if p.get('target_account_id') else None,
+                                               table_id=int(p.get('table_id')) if p.get('table_id') else None,
+                                               reason='Division por voz con Isis'), db, user)
+        dest = f"la cuenta {r.get('target_account_id')}"
+        return _isis_say(f"Listo, moví {p.get('qty')} {p.get('product')} a {dest}.", warm=True)
+    if a == 'reopen_closed':
+        await reopen_closed_account(int(p.get('account_id')),
+                                    AccountReopenClosedIn(reason='Reapertura por voz con Isis',
+                                                          table_id=int(p.get('table_id')) if p.get('table_id') else None), db, user)
+        return _isis_say(f"La cuenta de {_isis_mesa_txt(p.get('table_name'))} quedó reabierta.", warm=True)
+    if a == 'tip_payout':
+        r = await record_tip_payout(int(p.get('distribution_id')), int(p.get('share_id')),
+                                    TipPayoutIn(client_key=secrets.token_urlsafe(16),
+                                                amount=Decimal(str(p.get('amount'))),
+                                                method=str(p.get('method') or 'cash'),
+                                                note='Pago de propina por voz con Isis'), db, user)
+        rest = float(r.get('pending') or 0)
+        metodo = 'en efectivo' if p.get('method') == 'cash' else 'por transferencia'
+        extra = f" Le quedan {_isis_pesos(rest)} pendientes." if rest > 0 else ''
+        return _isis_say(f"Listo, a {p.get('employee')} ya le pagué sus {_isis_pesos(p.get('amount'))} de propina {metodo}.{extra}", warm=True)
     # --- v2: 2. Mesas ---
     if a == 'update_table':
         cur = next((t for t in dining_tables(db, user) if t.get('id') == int(p.get('table_id'))), None)
@@ -3022,6 +4014,18 @@ async def _isis_execute(db, user, intent):
         if _ISIS_CHAT_COUNT[0] % 3 == 0:
             ans = random.choice(_ISIS_DOUBT) + ' ' + ans
         return ans
+    # --- v11: cierre del día hablado ---
+    if a == 'day_close':
+        return _isis_say(_isis_day_close(db, user), warm=True)
+    # --- v11: resumen de cambio de turno ---
+    if a == 'shift_handover':
+        return _isis_say(_isis_shift_handover(db, user), warm=True)
+    # --- v11: lista de compras automática ---
+    if a == 'shopping_list':
+        return _isis_say(_isis_shopping_list(db, user), warm=True)
+    # --- v11: la comanda más atrasada ---
+    if a == 'oldest_ticket':
+        return _isis_say(_isis_oldest_ticket(db, user), warm=True)
     # --- v2: 14. Estadísticas ---
     if a == 'analytics':
         period = str(p.get('period') or 'today')
@@ -3337,6 +4341,16 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
             reply = 'Sale, cancelado. No hice nada.'
             _record(reply)
             return {'ok': True, 'reply': reply, 'executed': False}
+        if entry.get('delicate') and entry.get('stage', 1) == 1:
+            # Primera confirmación de una acción delicada: no se ejecuta
+            # nada todavía, solo se repiten los datos exactos y se pide
+            # la segunda confirmación con un token nuevo.
+            token = _isis_confirm_token(entry['intent'], delicate=True, stage=2)
+            summary = _isis_describe(entry['intent'])
+            reply = _isis_warm() + ' Para estar seguros: ' + summary + ' ¿Seguro, lo hago?'
+            _record(reply)
+            return {'ok': True, 'reply': reply, 'executed': False,
+                    'needs_confirmation': True, 'confirm_token': token}
         try:
             reply = await _isis_execute(db, user, entry['intent'])
         except HTTPException as e:
@@ -3352,6 +4366,18 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         if res is not None:
             if res.get('needs_confirmation'):
                 audit(db, user, 'isis.voice_propose', actor=actor, isis_action='close_cash')
+            _record(res['reply'])
+            out = {'ok': True, 'reply': res['reply'], 'executed': False}
+            if res.get('needs_confirmation'):
+                out['needs_confirmation'] = True
+                out['confirm_token'] = res['confirm_token']
+            return out
+    # División guiada (v11): si hay una división en curso, el mensaje es un paso del flujo.
+    if _isis_split_get(user.id) is not None:
+        res = _isis_split_step(db, user, message)
+        if res is not None:
+            if res.get('needs_confirmation'):
+                audit(db, user, 'isis.voice_propose', actor=actor, isis_action='split_account')
             _record(res['reply'])
             out = {'ok': True, 'reply': res['reply'], 'executed': False}
             if res.get('needs_confirmation'):
@@ -3397,12 +4423,18 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
     if intent.get('action') in _WRITE_ACTIONS:
-        token = _isis_confirm_token(intent)
+        token = _isis_confirm_token(intent, delicate=intent.get('action') in _DELICATE_ACTIONS)
         summary = _isis_describe(intent)
         audit(db, user, 'isis.voice_propose', actor=actor, isis_action=intent.get('action'))
         reply = _isis_warm() + ' ' + summary + ' ¿Confirmas?'
         _record(reply)
         return {'ok': True, 'reply': reply, 'needs_confirmation': True, 'confirm_token': token, 'executed': False}
+    if intent.get('action') == 'split_account_start':
+        _isis_split_start(user.id, int(intent['params'].get('account_id')),
+                          str(intent['params'].get('table_name') or ''))
+        reply = f"Va, dividimos la cuenta de {_isis_mesa_txt(intent['params'].get('table_name'))}. ¿Qué producto muevo y cuántos?"
+        _record(reply)
+        return {'ok': True, 'reply': reply, 'executed': False}
     try:
         reply = await _isis_execute(db, user, intent)
     except HTTPException as e:
