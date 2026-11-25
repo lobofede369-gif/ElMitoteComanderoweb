@@ -956,8 +956,10 @@ _ISIS_SYSTEM = (
     "o analisis (que me recomiendas, como va la noche, que hago con, como "
     "ves), responde con criterio en 2-4 frases cortas: que ves en los "
     "datos, que recomiendas hacer y por que, y ofrece ejecutar la accion "
-    "(tu solo propones, la ejecucion siempre pide confirmacion). Si la "
-    "pregunta necesita datos que no estan en el contexto, usa la accion "
+    "(tu solo propones, la ejecucion siempre pide confirmacion). Puedes "
+    "comparar dias y semanas con los datos de tendencia ('hoy va mejor que "
+    "ayer', 'esta semana va mejor que la pasada'), sin inventar numeros. "
+    "Si la pregunta necesita datos que no estan en el contexto, usa la accion "
     "de lectura mas cercana o unknown con una pregunta. La conversacion "
     "reciente de esta llamada viene en el contexto: usala para seguir el "
     "hilo (por ejemplo, 'y esa mesa?' se refiere a lo ultimo que se hablo). "
@@ -1098,6 +1100,12 @@ def _isis_warm(kind='ok'):
 def _isis_say(text, warm=False):
     return (f"{_isis_warm()} {text}" if warm else text)
 
+# --- Duda natural (v7): en la charla libre Isis a veces duda antes de
+# contestar, como una persona que está pensando ("Mmm, a ver…"). Una de
+# cada 3 respuestas de chat, con contador para que sea medible y no al azar.
+_ISIS_DOUBT = ['Mmm, a ver…', 'Déjame ver…', 'A ver, Santiago…']
+_ISIS_CHAT_COUNT = [0]
+
 # --- v5 "persona real": nunca leer listas largas en voz alta ---
 _ISIS_LIST_MAX = 5
 
@@ -1191,8 +1199,11 @@ def _isis_memory_all(db):
     return [(r.key, r.value) for r in db.scalars(select(IsisMemory).order_by(IsisMemory.key)).all()]
 
 def _isis_memory_search(db, query):
+    # Las preguntas siempre traen '?' al final ("¿qué recuerdas de la
+    # birria?") y ese signo quedaba pegado a la última palabra, así que
+    # 'birria?' nunca casaba con 'birria': se extraen solo las palabras.
     q = _isis_norm(query)
-    words = [w for w in q.split() if len(w) > 2]
+    words = [w for w in re.findall(r'\w+', q) if len(w) > 2]
     out = []
     for key, value in _isis_memory_all(db):
         hay = _isis_norm(key + ' ' + value)
@@ -1817,10 +1828,56 @@ def _isis_sold_today(db, user):
         return []
 
 
+_DIAS_SEMANA = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
+
+
+def _isis_week_trend(db, user):
+    """Tendencia de los últimos 7 días (v7): total vendido por día, mejor día
+    y comparación con la semana anterior. Solo lectura, con datos reales."""
+    local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+    today = datetime.now(local_tz).date()
+    start = today - timedelta(days=6)
+    d = mitote_extensions.owner_analytics(start=start, end=today, scope='history', db=db, user=user)
+    totals = []
+    for row in (d.get('sales_by_day') or []):
+        try:
+            day = datetime.fromisoformat(str(row.get('label'))).date()
+            totals.append((day, float(row.get('amount') or 0)))
+        except Exception:
+            continue
+    if not totals:
+        return None
+    total_week = sum(v for _, v in totals)
+    best_day, best_val = max(totals, key=lambda x: x[1])
+    per_day = ', '.join(f"{_DIAS_SEMANA[day.weekday()]} {v:.0f}" for day, v in totals)
+    d_prev = mitote_extensions.owner_analytics(start=start - timedelta(days=7), end=today - timedelta(days=7),
+                                               scope='history', db=db, user=user)
+    prev_total = sum(float(r.get('amount') or 0) for r in (d_prev.get('sales_by_day') or []))
+    if prev_total > 0:
+        diff = total_week - prev_total
+        if diff > 0:
+            comp = f"Esta semana va {diff:.0f} pesos mejor que la semana pasada."
+        elif diff < 0:
+            comp = f"Esta semana va {abs(diff):.0f} pesos peor que la semana pasada."
+        else:
+            comp = 'Esta semana va igual que la semana pasada.'
+    elif total_week > 0:
+        comp = 'La semana pasada no hubo ventas registradas.'
+    else:
+        comp = 'No hubo ventas ni esta semana ni la pasada.'
+    return (f"Tendencia de los últimos 7 días: {per_day}. Total de la semana: {total_week:.0f} pesos. "
+            f"Mejor día: {_DIAS_SEMANA[best_day.weekday()]} ({best_val:.0f} pesos). {comp}")
+
+
 def _isis_decision_context(db, user):
     """Para decidir (v4): comparaciones y riesgos para que Claude recomiende con criterio.
     Cada sección con su propio try/except: un fallo no rompe el contexto."""
     parts = []
+    try:
+        trend = _isis_week_trend(db, user)
+        parts.append(trend if trend else 'Tendencia de la semana: no disponible.')
+    except Exception:
+        parts.append('Tendencia de la semana: no disponible.')
     try:
         local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
         today = datetime.now(local_tz).date()
@@ -2379,9 +2436,15 @@ async def _isis_execute(db, user, intent):
         await mitote_extensions.put_product_prep(int(p.get('product_id')), mitote_extensions.ProductPrepIn(minutes=int(p.get('minutes'))), db, user)
         return _isis_say(f"El tiempo de preparación de {p.get('product')} ahora es de {p.get('minutes')} minutos.", warm=True)
     # --- v3: charla libre (solo lectura, la respuesta ya viene redactada) ---
+    # v7: una de cada 3 respuestas empieza con una duda corta, como persona.
     if a == 'chat':
         ans = str(p.get('answer') or '').strip()
-        return ans or '¿Me lo repites?'
+        if not ans:
+            return '¿Me lo repites?'
+        _ISIS_CHAT_COUNT[0] += 1
+        if _ISIS_CHAT_COUNT[0] % 3 == 0:
+            ans = random.choice(_ISIS_DOUBT) + ' ' + ans
+        return ans
     # --- v2: 14. Estadísticas ---
     if a == 'analytics':
         period = str(p.get('period') or 'today')
