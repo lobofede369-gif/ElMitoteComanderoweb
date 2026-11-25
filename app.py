@@ -1519,7 +1519,9 @@ _ISIS_SYSTEM = (
     "o analisis (que me recomiendas, como va la noche, que hago con, como "
     "ves), responde con criterio en 2-4 frases cortas: que ves en los "
     "datos, que recomiendas hacer y por que, y ofrece ejecutar la accion "
-    "(tu solo propones, la ejecucion siempre pide confirmacion). Regla "
+    "(tu solo propones; la ejecucion pide confirmacion, salvo añadir "
+    "productos a una mesa, que se ejecuta directo y se confirma despues "
+    "hablando lo que se agrego). Regla "
     "DETALLE: (v12) cuando el usuario pide una explicación, un análisis o "
     "una recomendación, la respuesta hablada (answer) es solo el resumen "
     "corto en 2-4 frases; el análisis completo va SOLO ESCRITO, después "
@@ -1864,6 +1866,19 @@ def _isis_find_account_by_client(db, user, text):
     return None, []
 
 
+def _isis_mentions_account(db, user, text):
+    """¿El texto nombra una mesa, una cuenta o un cliente con cuenta
+    abierta? (v13) Para que 'agrega dos coronas a Juanita' entre al
+    parser local sin la palabra 'mesa' y sin irse a Claude (segundos
+    por algo que el parser ya sabía resolver)."""
+    if 'mesa' in text or 'cuenta' in text:
+        return True
+    if _isis_find_account(db, user, text) is not None:
+        return True
+    _a, amb = _isis_find_account_by_client(db, user, text)
+    return _a is not None or len(amb) > 0
+
+
 def _isis_resolve_account(db, user, text, question):
     """Cuenta por folio, mesa o nombre de cliente (v11). Devuelve
     (cuenta|None, intent_unknown|None). Si dos cuentas abiertas tienen el
@@ -1892,6 +1907,22 @@ def _isis_describe_account(p):
         return f"la cuenta de {client}"
     return f"la cuenta {p.get('account_id')}"
 
+# Palabras que no distinguen un producto de otro ('de', 'la', 'con'):
+# en la puntuación por token no suman, o 'la de 355' empataba con
+# cualquier producto que tuviera un 'de' en el nombre (v13).
+_ISIS_STOP_WORDS = {'de', 'la', 'el', 'los', 'las', 'con', 'y', 'a', 'en',
+                    'un', 'una', 'del', 'al'}
+
+def _isis_name_words(name):
+    """Palabras de un nombre de producto, partiendo las compuestas por
+    guion ('coca-cola' -> ['coca', 'cola']): así 'coca' casa con
+    'Coca-Cola 600 ml' sin tener que decir el nombre completo (v13)."""
+    words = []
+    for w in _isis_norm(name).split():
+        words.extend([p for p in w.split('-') if p])
+    return words
+
+
 def _isis_find_product(db, user, text):
     try:
         prods = _isis_cached('products', lambda: products(db, user))
@@ -1912,11 +1943,18 @@ def _isis_find_product(db, user, text):
             pos = 0
             ok = True
             for w in name.split():
-                m = re.search(r'\b' + re.escape(w) + r'(?:s|es)?\b', norm[pos:])
-                if not m:
+                # Palabra compuesta por guion ('coca-cola'): casa con
+                # cualquiera de sus partes ('coca' o 'cola', v13).
+                matched = False
+                for part in _isis_name_words(w):
+                    m = re.search(r'\b' + re.escape(part) + r'(?:s|es)?\b', norm[pos:])
+                    if m:
+                        pos += m.end()
+                        matched = True
+                        break
+                if not matched:
                     ok = False
                     break
-                pos += m.end()
         if ok and (best is None or len(name) > len(_isis_norm(best.get('name', '')))):
             best = p
     if best is None:
@@ -1935,7 +1973,10 @@ def _isis_find_products_by_token(db, user, text):
     por nombre completo, puntúa por palabras distintivas del nombre
     presentes en el texto (plural tolerado) y por tamaños (355, 1.2).
     Las palabras de número (dos, tres...) no puntúan: son cantidades.
-    Devuelve los empatados con la mejor puntuación."""
+    (v13) Las palabras vacías ('de', 'la') no puntúan y el tamaño pesa
+    más (+3): antes 'la de 355' empataba con cualquier producto que
+    tuviera un 'de' en el nombre. Devuelve los empatados con la mejor
+    puntuación."""
     try:
         prods = _isis_cached('products', lambda: products(db, user))
     except Exception:
@@ -1951,10 +1992,17 @@ def _isis_find_products_by_token(db, user, text):
         for w in name.split():
             if w in _NUM_WORDS:
                 continue
-            if w in size_tokens:
-                score += 1
-            elif re.search(r'\b' + re.escape(w) + r'(?:s|es)?\b', norm):
-                score += 1
+            parts = _isis_name_words(w)
+            # El tamaño pesa más que una palabra común.
+            if any(part in size_tokens for part in parts):
+                score += 3
+                continue
+            if w in _ISIS_STOP_WORDS:
+                continue
+            for part in parts:
+                if re.search(r'\b' + re.escape(part) + r'(?:s|es)?\b', norm):
+                    score += 1
+                    break
         if score:
             scored.append((score, p))
     if not scored:
@@ -3059,7 +3107,9 @@ def _isis_parse_local(db, user, raw, history=None):
             return {'action': 'unknown', 'params': {}, 'question': '¿En cuánto dejo ese producto?'}
         return {'action': 'inventory_adjust', 'params': {'product_id': p.get('id'), 'product': p.get('name'), 'qty': int(amt), 'mode': 'count', 'reason': 'Ajuste por voz con Isis'}}
     # v11 (robustez): 'súmale' también es pedir, igual que 'agrega'/'pon'.
-    if ('agrega' in text or 'anade' in text or 'pon' in text or 'pide' in text or 'sumale' in text) and 'mesa' in text:
+    # v13: también sin la palabra 'mesa', si el texto nombra a un cliente
+    # con cuenta abierta ('agrega dos coronas a Juanita').
+    if ('agrega' in text or 'anade' in text or 'pon' in text or 'pide' in text or 'sumale' in text) and _isis_mentions_account(db, user, text):
         a, missing = _isis_resolve_account(db, user, text, '¿A qué mesa le agrego el pedido?')
         if missing:
             return missing
@@ -3117,6 +3167,26 @@ _ISIS_ANALYSIS_WORDS = ('recomiendas', 'recomienda', 'que hago', 'que me aconsej
                         'analiza', 'analizame', 'que harias', 'te parece', 'como andamos')
 
 
+def _isis_parse_fableai_text(content):
+    """Extrae el intent JSON de la respuesta de Claude (v13: compartido
+    por el llamado normal y el streaming, para que ambos entiendan lo
+    mismo)."""
+    if not content:
+        return None
+    start = content.find('{')
+    end = content.rfind('}')
+    if start < 0 or end < 0:
+        return None
+    try:
+        parsed = json.loads(content[start:end + 1])
+    except Exception:
+        return None
+    if not isinstance(parsed, dict) or 'action' not in parsed:
+        return None
+    parsed.setdefault('params', {})
+    return parsed
+
+
 def _isis_call_fableai(message, context):
     """Llama a Claude via FableAI y devuelve un intent, o None si no se puede."""
     if not FABLEAI_API_KEY:
@@ -3135,17 +3205,325 @@ def _isis_call_fableai(message, context):
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode('utf-8'))
         content = data['choices'][0]['message']['content']
-        start = content.find('{')
-        end = content.rfind('}')
-        if start < 0 or end < 0:
-            return None
-        parsed = json.loads(content[start:end + 1])
-        if not isinstance(parsed, dict) or 'action' not in parsed:
-            return None
-        parsed.setdefault('params', {})
-        return parsed
+        return _isis_parse_fableai_text(content)
     except Exception:
         return None
+
+
+class _FableAIStreamUnsupported(Exception):
+    """El gateway no sirve SSE (o falló antes del primer trozo): el
+    llamador cae al llamado normal sin romper nada (v13)."""
+
+
+def _isis_json_string_value(raw):
+    """Decodifica el valor de un string JSON que puede venir incompleto
+    (trozo de stream): devuelve (valor_decodificado, completo). Un escape
+    partido al final del trozo se deja para el siguiente trozo."""
+    out = []
+    i, n = 0, len(raw)
+    simple = {'"': '"', '\\': '\\', '/': '/', 'n': '\n', 'r': '\r',
+              't': '\t', 'b': '\b', 'f': '\f'}
+    while i < n:
+        c = raw[i]
+        if c == '"':
+            return ''.join(out), True
+        if c == '\\':
+            if i + 1 >= n:
+                break
+            e = raw[i + 1]
+            if e in simple:
+                out.append(simple[e])
+                i += 2
+                continue
+            if e == 'u' and i + 5 < n:
+                try:
+                    out.append(chr(int(raw[i + 2:i + 6], 16)))
+                    i += 6
+                    continue
+                except Exception:
+                    pass
+            if e == 'u':
+                break
+            out.append(e)
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return ''.join(out), False
+
+
+class _IsisAnswerScanner:
+    """Escanea el JSON que Claude va soltando por el stream y extrae el
+    valor de "answer" en cuanto se sabe que action es "chat", ya sin
+    escapes JSON. Si action no es chat, no suelta nada: la respuesta no
+    se habla por partes. Tolera que "answer" llegue antes que "action"
+    en el texto (se busca en todo lo acumulado)."""
+
+    def __init__(self):
+        self.buf = ''
+        self.action = None
+        self.in_answer = False
+        self.answer_done = False
+        self.emitted = 0
+        self.answer_start = 0
+        self.answer_text = ''
+
+    def feed(self, delta):
+        self.buf += delta
+        if self.action is None:
+            m = re.search(r'"action"\s*:\s*"([^"]*)"', self.buf)
+            if m:
+                self.action = m.group(1)
+        if self.action == 'chat' and not self.in_answer and not self.answer_done:
+            m = re.search(r'"answer"\s*:\s*"', self.buf)
+            if m:
+                self.in_answer = True
+                self.answer_start = m.end()
+        if not self.in_answer or self.answer_done:
+            return ''
+        val, complete = _isis_json_string_value(self.buf[self.answer_start:])
+        new = val[self.emitted:]
+        self.emitted = len(val)
+        self.answer_text = val
+        if complete:
+            self.answer_done = True
+        return new
+
+
+def _isis_split_speech_parts(text):
+    """Parte en frases para hablar (espejo en Python del JS
+    splitIntoSpeechParts de v10.5): en . ? ! ; … seguidos de espacio o
+    fin, sin romper decimales; las frases de más de 120 caracteres se
+    parten por comas; las cortas se fusionan hasta ~160 (tope ~200).
+    Lo usa el streaming para soltar frases listas, no trozos sueltos."""
+    clean = re.sub(r'\s+', ' ', text or '').strip()
+    if not clean:
+        return []
+    parts = []
+    start = 0
+    for m in re.finditer(r'[.?!;…](?=\s|$)', clean):
+        piece = clean[start:m.end()].strip()
+        if piece:
+            parts.append(piece)
+        start = m.end()
+    tail = clean[start:].strip()
+    if tail:
+        parts.append(tail)
+    out = []
+    for p in parts:
+        if len(p) <= 120:
+            out.append(p)
+            continue
+        cur = ''
+        for seg in p.split(','):
+            chunk = cur + ',' + seg if cur else seg
+            if len(chunk) > 120 and cur:
+                out.append(cur.strip())
+                cur = seg.strip()
+            else:
+                cur = chunk
+        if cur.strip():
+            out.append(cur.strip())
+    merged = []
+    for p in [x for x in out if x]:
+        last = merged[-1] if merged else None
+        if last and len(last) < 160 and len(last) + 1 + len(p) <= 200:
+            merged[-1] = last + ' ' + p
+        else:
+            merged.append(p)
+    return merged
+
+
+class _IsisStreamSpeech:
+    """Acumula el answer de Claude conforme llega y suelta frases listas
+    para hablar, y el detalle escrito tras la línea DETALLE:. Todo lo
+    que va después de DETALLE: nunca se habla (v12). Las frases se
+    sueltan en cuanto se completan, sin esperar a la línea entera: la
+    única que se retiene es la línea incompleta en curso, por si es el
+    marcador DETALLE: a medias."""
+
+    # Prefijo del marcador: una línea incompleta que pueda ser DETALLE:
+    # se retiene hasta que se complete o se descarte ('De acuerdo...'
+    # se retiene un trozo y se suelta en cuanto llega más texto).
+    _DETAIL_PREFIX = re.compile(r'^[ \t]*D?E?T?A?L?L?E?:?[ \t]*$')
+
+    def __init__(self):
+        self._line = ''      # línea incompleta en curso
+        self._spoken = ''    # texto hablado acumulado sin partir
+        self._detail = []    # líneas del detalle
+        self._in_detail = False
+
+    def _take_parts(self):
+        parts = _isis_split_speech_parts(self._spoken)
+        if len(parts) <= 1:
+            return []
+        ready, self._spoken = parts[:-1], parts[-1]
+        return ready
+
+    def _classify_line(self, line):
+        if not self._in_detail and _ISIS_DETAIL_SEP.match(line):
+            self._in_detail = True
+            return []
+        if self._in_detail:
+            self._detail.append(line)
+            return []
+        self._spoken += line + '\n'
+        return self._take_parts()
+
+    def feed(self, delta):
+        self._line += delta
+        parts = []
+        while '\n' in self._line:
+            line, self._line = self._line.split('\n', 1)
+            parts.extend(self._classify_line(line))
+        if self._in_detail:
+            return parts
+        # Línea incompleta: si puede ser el marcador a medias, se
+        # retiene; si no, es texto hablado en curso.
+        if not self._DETAIL_PREFIX.match(self._line):
+            self._spoken += self._line
+            self._line = ''
+            parts.extend(self._take_parts())
+        return parts
+
+    def finish(self):
+        parts = []
+        if self._line:
+            line, self._line = self._line, ''
+            parts.extend(self._classify_line(line))
+        rest = [p for p in _isis_split_speech_parts(self._spoken) if p]
+        self._spoken = ''
+        return parts + rest
+
+    def detail_text(self):
+        d = '\n'.join(self._detail).strip()
+        return d or None
+
+
+def _isis_fableai_stream_raw(message, context, on_delta):
+    """Bloqueante (corre en un hilo): pide a FableAI con stream=true y
+    llama on_delta(texto) por cada trozo de contenido. Devuelve el texto
+    completo. Si el gateway no sirve SSE (devuelve JSON normal o un
+    error), lanza _FableAIStreamUnsupported: el llamador cae al llamado
+    normal. La documentación pública de FableAI no dice si el streaming
+    está soportado, así que se prueba en vivo y se degrada solo."""
+    if not FABLEAI_API_KEY:
+        raise _FableAIStreamUnsupported('sin llave')
+    is_analysis = any(w in _isis_norm(message) for w in _ISIS_ANALYSIS_WORDS)
+    payload = {'model': FABLEAI_MODEL, 'temperature': 0.3 if is_analysis else 0,
+               'max_tokens': 900 if is_analysis else 600, 'stream': True,
+               'messages': [{'role': 'system', 'content': _ISIS_SYSTEM},
+                            {'role': 'user', 'content': 'Contexto del restaurante (mesas, productos y cuentas abiertas, resumido):\n' + context + '\n\nOrden del usuario: ' + message}]}
+    req = urllib.request.Request(FABLEAI_URL, data=json.dumps(payload).encode('utf-8'),
+                                 headers={'Content-Type': 'application/json',
+                                          'Authorization': 'Bearer ' + FABLEAI_API_KEY,
+                                          'Accept': 'text/event-stream'},
+                                 method='POST')
+    try:
+        resp = urllib.request.urlopen(req, timeout=20)
+    except Exception as e:
+        raise _FableAIStreamUnsupported('no conecta: ' + str(e))
+    ctype = resp.headers.get('Content-Type', '') if hasattr(resp, 'headers') else ''
+    if 'text/event-stream' not in ctype:
+        try:
+            resp.close()
+        except Exception:
+            pass
+        raise _FableAIStreamUnsupported('sin SSE: ' + ctype)
+    full = []
+    try:
+        while True:
+            raw = resp.readline()
+            if not raw:
+                break
+            line = raw.decode('utf-8', 'replace').strip()
+            if not line:
+                continue
+            if line.startswith(':'):
+                continue
+            if not line.startswith('data:'):
+                continue
+            data = line[5:].strip()
+            if data == '[DONE]':
+                break
+            try:
+                obj = json.loads(data)
+            except Exception:
+                continue
+            if isinstance(obj, dict) and obj.get('error'):
+                raise _FableAIStreamUnsupported('error del gateway')
+            choice = (obj.get('choices') or [{}])[0] if isinstance(obj, dict) else {}
+            delta = (choice.get('delta') or {}).get('content')
+            if delta is None:
+                delta = (choice.get('message') or {}).get('content') or ''
+            if delta:
+                full.append(delta)
+                on_delta(delta)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    return ''.join(full)
+
+
+async def _isis_call_fableai_streamed(message, context, emit):
+    """Pide a Claude en streaming y emite eventos 'part' por cada frase
+    lista y 'detail' al final. Si el gateway no sirve SSE o el stream se
+    corta antes de soltar nada hablado, cae al llamado normal sin romper
+    nada. Si el stream se corta DESPUÉS de haber hablado algo, no se
+    vuelve a pedir: se usa lo que llegó (respuesta parcial) para no
+    repetir la respuesta entera. Devuelve el intent parseado o None."""
+    from collections import deque
+    import threading
+    buf = deque()
+    finished = threading.Event()
+    result = {}
+
+    def _run():
+        try:
+            result['text'] = _isis_fableai_stream_raw(message, context, buf.append)
+        except _FableAIStreamUnsupported:
+            result['text'] = None
+        except Exception:
+            result['text'] = None
+        finally:
+            finished.set()
+
+    task = asyncio.create_task(asyncio.to_thread(_run))
+    scanner = _IsisAnswerScanner()
+    speech = _IsisStreamSpeech()
+    got_spoken = False
+    while not finished.is_set() or buf:
+        while buf:
+            answer_delta = scanner.feed(buf.popleft())
+            if answer_delta:
+                got_spoken = True
+                for part in speech.feed(answer_delta):
+                    await emit({'type': 'part', 'text': part})
+        if finished.is_set():
+            break
+        await asyncio.sleep(0.05)
+    await task
+    text = result.get('text')
+    if text is None and got_spoken:
+        # Se cortó a mitad de una respuesta hablada: usar lo que llegó,
+        # para no repetir la respuesta entera con otro llamado.
+        text = '{"action": "chat", "params": {"answer": ' + json.dumps(scanner.answer_text, ensure_ascii=False) + '}}'
+    if text is None:
+        # El stream no sirvió (sin SSE, error o cortado antes de soltar
+        # nada): llamado normal, como siempre.
+        return await asyncio.to_thread(_isis_call_fableai, message, context)
+    if not got_spoken:
+        # El stream sirvió pero el intent no es chat: nada que hablar
+        # por partes; se parsea el texto completo, sin otro llamado.
+        return _isis_parse_fableai_text(text)
+    for part in speech.finish():
+        await emit({'type': 'part', 'text': part})
+    detail = speech.detail_text()
+    if detail:
+        await emit({'type': 'detail', 'text': detail})
+    return _isis_parse_fableai_text(text)
 
 def _isis_sales_context(db, user):
     """Ventas de hoy, caja y pendientes, para que Isis conteste con datos reales (v3).
@@ -3713,6 +4091,15 @@ _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'ne
                   'reopen_closed', 'tip_payout', 'todo_add', 'todo_remove',
                   'pay_and_close_account', 'cancel_item'}
 
+# v13: añadir a mesa se ejecuta directo, sin pedir confirmación antes:
+# es rutinario y reversible (el producto se puede quitar con la voz),
+# y pedirla duplicaba el viaje de cada orden (proponer + responder con
+# "sí" + ejecutar + hablar). Lo delicado sigue pidiendo confirmación
+# previa (y doble, ver _DELICATE_ACTIONS). La respuesta hablada tras
+# ejecutar dice exactamente lo agregado, para que Santiago lo oiga y
+# lo corrija si se entendió mal.
+_ISIS_DIRECT_ACTIONS = {'add_order'}
+
 def _isis_describe(intent):
     """Resumen de lo que Isis propone hacer, para pedir confirmación por voz.
     En primera persona y en pesos: antes decía 'Cobrar $200 con cash' y
@@ -3917,9 +4304,17 @@ async def _isis_execute(db, user, intent):
         items = [OrderLine(product_id=int(i.get('product_id')), qty=int(i.get('qty') or 1),
                            note=str(i.get('note') or '')) for i in p.get('items') or []]
         r = await send_order(int(p.get('account_id')), OrderIn(items=items, client_key=secrets.token_urlsafe(16)), db, user)
-        if p.get('client_name'):
-            return f"Ya mandé la comanda a {_isis_describe_account(p)}, folio {r.get('batch_id')}."
-        return f"Ya mandé la comanda, folio {r.get('batch_id')}."
+        # v13: sin confirmación previa, la respuesta dice exactamente lo
+        # agregado ('Ya agregué 2 Corona 355 a la cuenta de Juanita en la
+        # mesa cinco, folio 1.'): Santiago lo oye y lo corrige si algo
+        # se entendió mal.
+        def _it(i):
+            t = f"{i.get('qty')} {i.get('product')}"
+            if i.get('note'):
+                t += f", nota: {i.get('note')}"
+            return t
+        items_txt = ', '.join(_it(i) for i in p.get('items') or [])
+        return f"Ya agregué {items_txt} a {_isis_describe_account(p)}, folio {r.get('batch_id')}."
     if a == 'pay_account':
         acc = account_detail(int(p.get('account_id')), db, user)
         # Cobrar exige cuenta en estado pendiente: si sigue abierta, se pide
@@ -4575,10 +4970,107 @@ async def isis_voice_tts(data: IsisTTSIn, user: User = Depends(auth)):
 class IsisChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=1000)
     confirm_token: Optional[str] = None
+    client_key: Optional[str] = None
+
+# Idempotencia de voz (v13): añadir a mesa se ejecuta directo, así que un
+# reintento del cliente tras perder la respuesta no debe pedir dos veces.
+# Cada petición de voz lleva una llave única por frase del usuario; si la
+# misma llave vuelve en menos de 5 minutos, se devuelve la respuesta
+# guardada sin ejecutar nada de nuevo. En memoria (1 worker en Render),
+# con limpieza de entradas viejas en cada uso.
+_ISIS_CHAT_IDEM = {}
+_ISIS_CHAT_IDEM_TTL = 300
+
+def _isis_chat_idem_get(user_id, key):
+    if not key:
+        return None
+    now = time.time()
+    for k in [k for k, (_, ts) in _ISIS_CHAT_IDEM.items() if now - ts > _ISIS_CHAT_IDEM_TTL]:
+        _ISIS_CHAT_IDEM.pop(k, None)
+    hit = _ISIS_CHAT_IDEM.get((user_id, key))
+    return dict(hit[0]) if hit else None
+
+def _isis_chat_idem_put(user_id, key, out):
+    if not key:
+        return
+    _ISIS_CHAT_IDEM[(user_id, key)] = (dict(out), time.time())
 
 @app.post('/api/isis-voice/chat')
 async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), user: User = Depends(auth)):
     """Solo Isis (o el propietario, para probar) habla con este cerebro."""
+    if user.username != 'isis' and user.role != 'owner':
+        raise HTTPException(403, 'Este panel de voz es solo para Isis')
+    return await _isis_chat_run(db, user, data)
+
+
+@app.post('/api/isis-voice/chat-stream')
+async def isis_voice_chat_stream(data: IsisChatIn, db: Session = Depends(db_session), user: User = Depends(auth)):
+    """Chat de voz en streaming (SSE, v13). Mismo flujo que /chat; cuando
+    Claude responde, las frases se sueltan en eventos 'part' conforme se
+    completan, el detalle escrito en 'detail' y al final 'done' con el
+    mismo JSON del chat normal. Si el stream falla antes del primer
+    evento, el cliente usa el chat normal."""
+    if user.username != 'isis' and user.role != 'owner':
+        raise HTTPException(403, 'Este panel de voz es solo para Isis')
+    cached = _isis_chat_idem_get(user.id, data.client_key)
+    if cached is not None:
+        async def _cached_gen():
+            yield 'data: ' + json.dumps({'type': 'done', **cached}, ensure_ascii=False) + '\n\n'
+        return StreamingResponse(_cached_gen(), media_type='text/event-stream')
+    queue = asyncio.Queue()
+
+    async def emit(ev):
+        await queue.put(ev)
+
+    flow_task = asyncio.create_task(_isis_chat_run(db, user, data, emit=emit))
+
+    async def gen():
+        last_yield = time.monotonic()
+        try:
+            while not flow_task.done():
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if time.monotonic() - last_yield > 10:
+                        yield ': ping\n\n'
+                        last_yield = time.monotonic()
+                    continue
+                yield 'data: ' + json.dumps(ev, ensure_ascii=False) + '\n\n'
+                last_yield = time.monotonic()
+            while not queue.empty():
+                ev = queue.get_nowait()
+                yield 'data: ' + json.dumps(ev, ensure_ascii=False) + '\n\n'
+                last_yield = time.monotonic()
+            try:
+                out = await flow_task
+            except HTTPException as e:
+                out = {'ok': False, 'reply': str(e.detail), 'executed': False}
+            except Exception:
+                out = {'ok': False, 'reply': 'No me pude conectar al restaurante, inténtalo de nuevo.', 'executed': False}
+            yield 'data: ' + json.dumps({'type': 'done', **out}, ensure_ascii=False) + '\n\n'
+        finally:
+            if not flow_task.done():
+                flow_task.cancel()
+    return StreamingResponse(gen(), media_type='text/event-stream')
+
+
+async def _isis_chat_run(db, user, data, emit=None):
+    """Ejecuta el flujo de voz con idempotencia (v13): si la llave del
+    cliente ya se vio, devuelve la respuesta guardada sin ejecutar nada
+    de nuevo. La llave vive en IsisChatIn.client_key (una por frase)."""
+    cached = _isis_chat_idem_get(user.id, data.client_key)
+    if cached is not None:
+        return cached
+    out = await _isis_chat_flow(db, user, data, emit=emit)
+    _isis_chat_idem_put(user.id, data.client_key, out)
+    return out
+
+
+async def _isis_chat_flow(db, user, data, emit=None):
+    """El cerebro de voz. Sin emit devuelve el dict de siempre; con emit
+    (endpoint SSE) además suelta eventos 'part'/'detail' mientras Claude
+    responde en streaming. Los retornos tempranos no emiten nada: el
+    endpoint cierra con 'done' desde el dict que devuelve esta función."""
     if user.username != 'isis' and user.role != 'owner':
         raise HTTPException(403, 'Este panel de voz es solo para Isis')
     # P2: memo por llamada — parser, contexto y ejecución comparten las
@@ -4651,12 +5143,22 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
             return out
     # Nueva orden: interprete local primero, IA despues
     intent = _isis_parse_local(db, user, message, history=_isis_history_get(user.id))
-    if intent is None or intent.get('action') == 'unknown':
+    if intent is not None and intent.get('action') == 'unknown':
+        # v13: el parser local ya sabe qué dato falta y lo pregunta con
+        # precisión; ir a Claude solo sumaba segundos (y tokens) para
+        # volver con la misma pregunta o, peor, adivinar.
+        q = intent.get('question') or '¿Me lo repites con más detalle?'
+        _record(q)
+        return {'ok': True, 'reply': q, 'executed': False}
+    if intent is None:
         context = _isis_context(db, user)
         hist_txt = _isis_history_text(user.id)
         if hist_txt:
             context += ('\nConversación reciente en esta llamada (para seguir el hilo):\n' + hist_txt)
-        ai_intent = await asyncio.to_thread(_isis_call_fableai, message, context)
+        if emit is not None:
+            ai_intent = await _isis_call_fableai_streamed(message, context, emit)
+        else:
+            ai_intent = await asyncio.to_thread(_isis_call_fableai, message, context)
         if ai_intent:
             intent = ai_intent
     if intent is None:
@@ -4687,7 +5189,7 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
             reply = _isis_cash_cut_start_reply(db, user)
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
-    if intent.get('action') in _WRITE_ACTIONS:
+    if intent.get('action') in _WRITE_ACTIONS and intent.get('action') not in _ISIS_DIRECT_ACTIONS:
         token = _isis_confirm_token(intent, delicate=intent.get('action') in _DELICATE_ACTIONS)
         summary = _isis_describe(intent)
         audit(db, user, 'isis.voice_propose', actor=actor, isis_action=intent.get('action'))
@@ -4702,6 +5204,11 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         return {'ok': True, 'reply': reply, 'executed': False}
     try:
         reply = await _isis_execute(db, user, intent)
+        if intent.get('action') in _WRITE_ACTIONS:
+            # v13: las escrituras directas (add_order) también quedan en
+            # auditoría; antes solo se auditaba la propuesta o la ejecución
+            # con token de confirmación.
+            audit(db, user, 'isis.voice_execute', actor=actor, isis_action=intent.get('action'))
     except HTTPException as e:
         reply = 'No se pudo: ' + str(e.detail)
         _record(reply)
