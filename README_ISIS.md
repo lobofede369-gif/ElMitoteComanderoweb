@@ -32,6 +32,40 @@ ningún proxy externo.
 
 ## Qué sabe hacer (solo Mitote)
 
+### v2: personalidad, memoria y los 14 módulos
+
+- **Personalidad (simulada, no consciencia real):** Isis responde con
+  tono cálido, mexicano, profesional y breve, con frases variadas. Se
+  alegra cuando algo sale bien y avisa con preocupación cuando algo anda
+  mal (caja corta, inventario bajo, comanda atrasada). No siente ni tiene
+  conciencia: es un estilo programado, no una persona.
+- **Memoria (solo del restaurante):** "Recuerda que el precio de la
+  birria es 120" lo guarda; "¿Qué recuerdas del precio de la birria?" lo
+  consulta; "Olvida el precio de la birria" lo borra. En cada respuesta
+  con IA, Isis también recibe sus memorias guardadas y un resumen del día
+  (ventas, caja). Nunca guardar aquí datos personales sensibles.
+- **Los 14 módulos por voz** (lectura sin confirmación, escritura SIEMPRE
+  con confirmación por voz antes de ejecutarse):
+  1. Cuentas — cuentas abiertas; cambiar una cuenta de mesa.
+  2. Mesas — libres/ocupadas; cambiar capacidad de una mesa.
+  3. Estaciones — comandas del turno; recibir, preparar y marcar lista.
+  4. Cobros — cuentas por cobrar; aplicar descuento (porcentaje o pesos).
+  5. Caja — estado del turno; historial de cortes.
+  6. Menú — qué hay en el menú; agregar producto, archivar, agregar
+     presentación, poner promoción, cambiar precio.
+  7. Inventario — existencias; movimientos; registrar insumo; reponer;
+     ajustar.
+  8. Personal — quién trabaja; registrar empleado con PIN; cambiar PIN
+     (Isis NO puede cambiar su propio PIN por voz).
+  9. Propinas — fondo del turno; repartir entre empleados activos.
+  10. Autorizaciones — solicitudes pendientes; autorizar o rechazar.
+  11. Auditoría — últimos movimientos (solo lectura).
+  12. Reservaciones — activas; crear, confirmar y recibir (abre cuenta).
+  13. Tiempos — tiempo límite de preparación; cambiarlo por comanda o
+      por producto.
+  14. Estadísticas — ventas del día, cuentas pagadas, ticket promedio,
+      lo más vendido, preparación promedio (solo lectura).
+
 Lecturas (sin confirmación): mesas libres/ocupadas, saldo y detalle de una
 cuenta, inventario y existencias de un producto, resumen y estado de caja.
 
@@ -50,6 +84,12 @@ Ejemplos de voz:
 - "Agrega 2 cervezas a la mesa 3"
 - "Cobra la mesa 3 todo en efectivo"
 - "Haz el corte con 1200 contados"
+- "Recuerda que el precio de la birria es 120"
+- "¿Qué comandas hay en cocina?"
+- "Marca la comanda 1 como lista"
+- "Aplica un descuento del 10 por ciento a la mesa 3"
+- "Reserva para Ana de 4 personas hoy a las 8 de la noche"
+- "¿Cómo van las ventas hoy?"
 
 "Cobrar" significa cobrarle al cliente y cerrar su cuenta, no pagar
 proveedores. Para cobrar, Isis primero pide la cuenta si la mesa sigue
