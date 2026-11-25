@@ -1073,6 +1073,7 @@ _ISIS_TTS_INSTRUCTIONS_DEFAULT = ('Habla con voz cálida y natural, como la gere
 OPENAI_TTS_INSTRUCTIONS = (os.getenv('OPENAI_TTS_INSTRUCTIONS', '') or _ISIS_TTS_INSTRUCTIONS_DEFAULT).strip() or _ISIS_TTS_INSTRUCTIONS_DEFAULT
 OPENAI_TTS_URL = 'https://api.openai.com/v1/audio/speech'
 _ISIS_CONFIRM = {}  # token -> {'intent': dict, 'expires': float}
+_ISIS_CHAIN = {}  # v15: user_id -> {'steps': [intent, ...], 'done': [reply, ...]}: cadena a medias esperando un 'sí'
 
 # --- Memoria de conversación (v4): solo en memoria del servidor, nunca en BD ---
 # Cada llamada guarda sus últimos intercambios para que Isis siga el hilo
@@ -1105,6 +1106,7 @@ def _isis_history_clear(user_id):
     _ISIS_HISTORY.pop(user_id, None)
     _ISIS_CASH_CUT.pop(user_id, None)  # un corte a medias tampoco sobrevive al colgado
     _ISIS_SPLIT.pop(user_id, None)  # ni una división a medias (v11)
+    _ISIS_CHAIN.pop(user_id, None)  # ni una cadena a medias (v15)
 
 
 def _isis_history_text(user_id):
@@ -1253,8 +1255,16 @@ def _isis_cash_cut_breakdown(db):
 
 def _isis_cash_cut_start_reply(db, user):
     """Inicia el flujo guiado y devuelve el desglose + la pregunta por el
-    efectivo del cajón (v8.2)."""
+    efectivo del cajón (v8.2). Con la regla 'corte corto' (v15) el
+    desglose es solo venta total y efectivo esperado."""
     _isis_cash_cut_start(user.id)
+    if _isis_rule_get(db, 'corte') == 'corto':
+        st = _isis_cash_state(db)
+        if st.get('open'):
+            total = st['cash_sales'] + st['card'] + st['transfer']
+            return (f"Venta total de hoy, {_isis_pesos(total / 100)}. "
+                    f"Efectivo esperado, {_isis_pesos(st['expected'] / 100)}. "
+                    + _isis_cash_cut_question('cash'))
     breakdown = _isis_cash_cut_breakdown(db)
     return (breakdown + ' ' if breakdown else '') + _isis_cash_cut_question('cash')
 
@@ -1459,7 +1469,9 @@ ISIS_PERSONA = (
     "Resume, no leas listas largas: si hay muchos datos, da lo importante "
     "y ofrece contarle el resto. Nunca suenes como un guion ni repitas "
     "siempre la misma estructura. Eres breve y cálida: dos o tres frases "
-    "cortas como mucho en lo hablado. Cuando algo está mal — caja corta, inventario "
+    "cortas como mucho en lo hablado. Directa primero: la respuesta empieza "
+    "con el dato o con lo que hiciste, en una frase corta; la explicación "
+    "va después y solo si te la pide. Cuando algo está mal — caja corta, inventario "
     "bajo, una comanda atrasada — avísalo con preocupación y propón qué "
     "hacer. Nunca inventes datos ni hables de temas fuera del restaurante. "
     "Si no sabes algo, dilo con honestidad y pregunta. Los montos siempre "
@@ -1515,6 +1527,16 @@ _ISIS_SYSTEM = (
     "todo_add {text}, todo_list {}, todo_remove {text}, day_close {}, "
     "shift_handover {}, pay_and_close_account {account_id, method, table_name}, "
     "shopping_list {}, oldest_ticket {}, cancel_item {account_id, item_id, product, qty}, "
+    "rules_list {}, rule_forget {keys, texts}, last_session {}. "
+    "DIRECTO PRIMERO (v15): la primera frase de cada respuesta es el dato "
+    "o la acción ('Ya agregué 3 Victoria 355 a la mesa 5.', 'Ventas de hoy: "
+    "4,320 pesos.'). Sin rodeos ni preámbulos antes del dato. La explicación "
+    "va después, corta, y solo si la pidió. "
+    "Reglas del dueño (v15): 'de ahora en adelante, el corte me lo das corto' "
+    "se guarda y se aplica sola (corte corto, reportes cortos); '¿qué reglas "
+    "tienes?' las lista; 'olvida esa regla' la borra. '¿Qué te pedí la última "
+    "vez?' se contesta con lo guardado de la llamada anterior (datos reales, "
+    "nunca inventados). "
     "chat {answer} (ver regla DETALLE: abajo), analytics {period: today|yesterday|week}. "
     "Entiende peticiones indirectas ('¿conviene abrir otra mesa o mejor "
     "esperamos?'), ironías y frases con doble sentido, y errores del "
@@ -1825,6 +1847,12 @@ def _isis_find_table(db, user, text):
         return None
     want = _isis_norm(_isis_table_name(text) or '')
     if not want:
+        # v15: "a la 6", "abre la 6" — la mesa sin la palabra 'mesa'.
+        # Solo 1-2 dígitos: un 355 es un tamaño, nunca una mesa.
+        m = re.search(r'\bla\s+(\d{1,2})\b', _isis_norm(text))
+        if m:
+            want = 'mesa ' + m.group(1)
+    if not want:
         return None
     for t in tables:
         if _isis_norm(t.get('name', '')) == want or _isis_norm(t.get('name', '')).endswith(' ' + want):
@@ -1955,6 +1983,62 @@ def _isis_name_words(name):
     return words
 
 
+# --- v15 "entiende a la primera": apodos y dictado chueco ---
+# Apodos de familia: 'chela' no es un producto, pero sí una familia
+# (corona/victoria/modelo). Un apodo suma menos que la palabra exacta,
+# así 'chela corona' casa con la Corona y 'chela' sola queda ambigua
+# entre las tres y pregunta preciso, en vez de no entender nada.
+_ISIS_PRODUCT_NICKNAMES = {
+    'chela': ('corona', 'victoria', 'modelo'),
+    'cheve': ('corona', 'victoria', 'modelo'),
+    'cerveza': ('corona', 'victoria', 'modelo'),
+    'birria': ('birria',),
+    'soda': ('coca', 'cola'),
+    'refresco': ('coca', 'cola'),
+    'consome': ('consome',),
+    'horchata': ('horchata',),
+}
+
+
+def _isis_lev(a, b):
+    """Distancia de Levenshtein, con tope: si difieren en más de 1 letra
+    de largo, ya es 2 (no casa). Pura y testeable."""
+    if abs(len(a) - len(b)) > 1:
+        return 2
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _isis_word_matches(part, norm):
+    """¿La palabra de un producto casa con el texto? Exacta (con plural
+    tolerado) o, para palabras de 5+ letras, con una letra de diferencia
+    ('corna' casa con 'corona', 'vitoria' con 'victoria'). Las cortas
+    ('coca', 'cola') solo exactas: una letra de diferencia ahí adivina
+    de más ('coca' vs 'casa')."""
+    if re.search(r'\b' + re.escape(part) + r'(?:s|es)?\b', norm):
+        return True
+    if len(part) < 5:
+        return False
+    for w in re.findall(r'[a-z]+', norm):
+        if len(w) < 4:
+            continue
+        # El plural también se quita antes de comparar: 'cornas' es el
+        # typo de 'corona' en plural (distancia 2 si no se quita la 's').
+        forms = {w}
+        if w.endswith('es') and len(w) > 5:
+            forms.add(w[:-2])
+        elif w.endswith('s') and len(w) > 4:
+            forms.add(w[:-1])
+        if any(_isis_lev(part, f) <= 1 for f in forms):
+            return True
+    return False
+
+
 def _isis_find_product(db, user, text):
     try:
         prods = _isis_cached('products', lambda: products(db, user))
@@ -2007,7 +2091,10 @@ def _isis_find_products_by_token(db, user, text):
     Las palabras de número (dos, tres...) no puntúan: son cantidades.
     (v13) Las palabras vacías ('de', 'la') no puntúan y el tamaño pesa
     más (+3): antes 'la de 355' empataba con cualquier producto que
-    tuviera un 'de' en el nombre. Devuelve los empatados con la mejor
+    tuviera un 'de' en el nombre. (v15) La palabra exacta o con una
+    letra de diferencia vale +2, el apodo de familia +1 ('chela' suma
+    a las tres cervezas por igual y queda ambigua; 'chela corona'
+    gana la Corona por el +2). Devuelve los empatados con la mejor
     puntuación."""
     try:
         prods = _isis_cached('products', lambda: products(db, user))
@@ -2015,6 +2102,10 @@ def _isis_find_products_by_token(db, user, text):
         return []
     norm = _isis_strip_mesa(_isis_norm(text))
     size_tokens = set(re.findall(r'\b(?:\d{2,}(?:\.\d+)?|\d+\.\d+|\d+[a-z])\b', norm))
+    nick_words = set()
+    for nick, mapped in _ISIS_PRODUCT_NICKNAMES.items():
+        if re.search(r'\b' + re.escape(nick) + r'(?:s|es)?\b', norm):
+            nick_words.update(mapped)
     scored = []
     for p in prods:
         name = _isis_norm(p.get('name', ''))
@@ -2032,7 +2123,10 @@ def _isis_find_products_by_token(db, user, text):
             if w in _ISIS_STOP_WORDS:
                 continue
             for part in parts:
-                if re.search(r'\b' + re.escape(part) + r'(?:s|es)?\b', norm):
+                if _isis_word_matches(part, norm):
+                    score += 2
+                    break
+                if part in nick_words:
                     score += 1
                     break
         if score:
@@ -2281,6 +2375,51 @@ def _isis_memory_search(db, query):
         if not words or any(w in hay for w in words):
             out.append((key, value))
     return out
+
+
+# --- Reglas del dueño (v15, ítem 6): "de ahora en adelante, el corte me
+# lo das corto". Viven en IsisMemory con clave 'regla:<texto>': duran
+# entre llamadas y se aplican solas. La última regla de cada tipo manda
+# (se ordenan por updated_at, no por clave).
+def _isis_rules_all(db):
+    """Reglas guardadas, de la más reciente a la más vieja."""
+    rows = db.scalars(select(IsisMemory).where(IsisMemory.key.like('regla:%'))
+                      .order_by(IsisMemory.updated_at.desc())).all()
+    return [(r.key, r.value) for r in rows]
+
+
+def _isis_rule_get(db, kind):
+    """'corto'|'completo'|'detallado'|None según las reglas guardadas.
+    kind 'corte': el corte de caja corto o completo. kind 'reporte':
+    los reportes de ventas cortos o detallados."""
+    for _k, v in _isis_rules_all(db):
+        hay = _isis_norm(v)
+        if kind == 'corte' and 'corte' in hay:
+            if 'corto' in hay:
+                return 'corto'
+            if 'completo' in hay or 'detallado' in hay or 'largo' in hay:
+                return 'completo'
+        if kind == 'reporte' and ('reporte' in hay or 'ventas' in hay or 'resumen' in hay):
+            if 'corto' in hay:
+                return 'corto'
+            if 'completo' in hay or 'detallado' in hay or 'largo' in hay:
+                return 'detallado'
+    return None
+
+
+def _isis_session_summary_save(db, user):
+    """Al colgar (v15, ítem 1): guarda en IsisMemory qué se pidió en la
+    llamada que termina ('ultima-sesion'), con fecha y hora. Datos reales
+    de la conversación, nunca inventados: si no hubo turnos, no se guarda
+    nada. Se llama ANTES de borrar el historial."""
+    turns = _isis_history_get(user.id)
+    if not turns:
+        return
+    local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+    when = datetime.now(local_tz).strftime('%d/%m %H:%M')
+    asked = '; '.join(u[:80] for u, _r in turns[-3:] if u)
+    _isis_memory_set(db, 'ultima-sesion',
+                     f"{when}: {len(turns)} turnos. Pediste: {asked}")
 
 
 # --- Pendientes por voz (v11): un pendiente por clave 'pendiente:<texto>' ---
@@ -2600,6 +2739,59 @@ def _isis_resolve_followup(db, user, text, history):
     return {'action': 'product_price', 'params': {'product_id': best.get('id'), 'product': best.get('name')}}
 
 
+def _isis_last_turn_context(db, user, history):
+    """Último intercambio del hilo: (cuenta|None, producto|None).
+    Para frases incompletas (v15): la mesa y el producto de lo que
+    Santiago pidió hace un momento, sin volver a preguntarlos."""
+    if not history:
+        return None, None
+    last_user, last_reply = history[-1]
+    # La mesa y el producto pueden venir del mensaje o de la respuesta:
+    # en "y una coca" no hay mesa escrita, pero la respuesta dice
+    # "a la cuenta de Juanita en la Mesa 5".
+    acc = _isis_find_account(db, user, last_user or '')
+    if acc is None and last_reply:
+        acc = _isis_find_account(db, user, last_reply)
+    prod = _isis_find_product(db, user, last_user or '')
+    if prod is None and last_reply:
+        prod = _isis_find_product(db, user, last_reply)
+    return acc, prod
+
+
+def _isis_continuation_intent(db, user, text, history):
+    """'y una coca', 'agrega dos más' (v15): continuación corta de lo
+    último que se pidió. La mesa y el producto salen del hilo; si el
+    texto trae producto propio, ese manda; si trae solo cantidad,
+    repite el último producto. None si no es continuación o no hay
+    a qué referirse."""
+    if not history:
+        return None
+    if len(text.split()) > 6:
+        return None
+    if not (text.startswith('y ') or text.startswith('agrega') or text.startswith('anade')
+            or text.startswith('pon') or text.startswith('sumale')
+            or ' mas' in text or ' otra' in text or ' otro' in text):
+        return None
+    acc, last_prod = _isis_last_turn_context(db, user, history)
+    if not acc:
+        return None
+    p = _isis_find_product(db, user, text)
+    if not p:
+        # Solo cantidad ("agrega dos más"): repite el último producto.
+        if last_prod and ('mas' in text or 'otra' in text or 'otro' in text):
+            p = last_prod
+    if not p:
+        return None
+    item = {'product_id': p.get('id'), 'product': p.get('name'),
+            'qty': _isis_qty_for_product(text, p)}
+    note = _isis_parse_order_note(text)
+    if note:
+        item['note'] = note
+    return {'action': 'add_order', 'params': {'account_id': acc.get('id'), 'items': [item],
+                                              'table_name': acc.get('table_name'),
+                                              'client_name': _isis_client_name_of(acc)}}
+
+
 def _isis_parse_local(db, user, raw, history=None):
     """Interprete local, sin IA externa. Devuelve intent o None."""
     text = _isis_norm(raw)
@@ -2609,6 +2801,10 @@ def _isis_parse_local(db, user, raw, history=None):
     follow = _isis_resolve_followup(db, user, text, history)
     if follow is not None:
         return follow
+    # --- Continuación corta (v15): "y una coca", "agrega dos más" ---
+    cont = _isis_continuation_intent(db, user, text, history)
+    if cont is not None:
+        return cont
     # --- Clientes de siempre (v8): antes que la memoria genérica ---
     cli = _isis_parse_client_remember(text)
     if cli is not None:
@@ -2655,6 +2851,49 @@ def _isis_parse_local(db, user, raw, history=None):
         return {'action': 'todo_remove', 'params': {'query': q,
                                                     'keys': [k for k, _v in hits],
                                                     'texts': [v for _k, v in hits]}}
+    # --- Última sesión (v15, ítem 1): qué pidió en la llamada anterior ---
+    if (('que te pedi' in text or 'que te dije' in text or 'que hicimos' in text)
+            and ('ultima vez' in text or 'vez pasada' in text or 'la otra vez' in text
+                 or 'ayer' in text)):
+        return {'action': 'last_session', 'params': {}}
+    # --- Reglas del dueño (v15, ítem 6): se guardan y se aplican solas ---
+    if ('de ahora en adelante' in text or 'de aqui en adelante' in text
+            or 'a partir de ahora' in text):
+        body = text
+        for pref in ('de ahora en adelante', 'de aqui en adelante', 'a partir de ahora'):
+            if pref in body:
+                body = body.split(pref, 1)[1].strip(' ,:')
+                break
+        body = body.strip().rstrip('.')
+        if not body:
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué regla te guardo? Dime "de ahora en adelante" y lo que quieres que haga siempre.'}
+        return {'action': 'remember', 'params': {'key': 'regla:' + _isis_norm(body)[:80], 'value': body}}
+    if 'que reglas tienes' in text or 'que reglas me guardaste' in text \
+            or 'cuales son mis reglas' in text or 'mis reglas' in text:
+        return {'action': 'rules_list', 'params': {}}
+    if ('olvida' in text or 'borra' in text or 'quita' in text or 'ya no' in text) and 'regla' in text:
+        rules = _isis_rules_all(db)
+        if not rules:
+            return {'action': 'chat', 'params': {'answer': 'No tienes reglas guardadas.'}}
+        q = text
+        for pref in ('olvida la regla', 'olvida esa regla', 'olvida', 'borra la regla',
+                     'borra', 'quita la regla', 'quita', 'ya no'):
+            if pref in q:
+                q = q.split(pref, 1)[1].strip()
+                break
+        q = re.sub(r'^(la|el|de|del|esa|esta)\s+', '', q).strip().rstrip('.')
+        words = [w for w in re.findall(r'\w+', _isis_norm(q)) if len(w) > 2]
+        # Todas las palabras deben casar: 'corte completo' no borra la
+        # regla del 'corte corto'; si quedan varias, se pregunta cuál.
+        hits = [(k, v) for k, v in rules
+                if not words or all(w in _isis_norm(k + ' ' + v) for w in words)]
+        if not hits:
+            return {'action': 'chat', 'params': {'answer': f"No tengo ninguna regla de '{q}'."}}
+        if len(hits) > 1:
+            opts = ' o '.join(f"'{v}'" for _k, v in hits)
+            return {'action': 'unknown', 'params': {},
+                    'question': f"¿Cuál regla olvido, {opts}?"}
+        return {'action': 'rule_forget', 'params': {'keys': [hits[0][0]], 'texts': [hits[0][1]]}}
     # --- Memoria (v2) ---
     if 'recuerdas' in text or 'que sabes de' in text or 'que tienes guardado' in text:
         q = text
@@ -3069,7 +3308,8 @@ def _isis_parse_local(db, user, raw, history=None):
         m_raw = re.search(r'mesa\s+([A-Za-z0-9 ]+?)\s*$', raw.strip(), re.IGNORECASE)
         name = m_raw.group(1).strip().title() if m_raw else (_isis_table_name(text) or 'Nueva mesa')
         return {'action': 'create_table', 'params': {'name': name, 'area': 'Salon', 'capacity': 4}}
-    if 'abre la mesa' in text or 'abre mesa' in text or 'nueva cuenta' in text:
+    if 'abre la mesa' in text or 'abre mesa' in text or 'nueva cuenta' in text \
+            or re.search(r'\babre la \d', text):  # v15: "abre la 6"
         t = _isis_find_table(db, user, text)
         if not t:
             return {'action': 'unknown', 'params': {}, 'question': '¿Qué mesa quieres abrir? Dime el nombre o el número.'}
@@ -3144,8 +3384,19 @@ def _isis_parse_local(db, user, raw, history=None):
     if ('agrega' in text or 'anade' in text or 'pon' in text or 'pide' in text or 'sumale' in text) and _isis_mentions_account(db, user, text):
         a, missing = _isis_resolve_account(db, user, text, '¿A qué mesa le agrego el pedido?')
         if missing:
-            return missing
+            # v15: frase incompleta — la mesa sale del hilo ("agrega dos
+            # coronas" tras pedir en la mesa 5, sin repetir la mesa).
+            last_acc, _lp = _isis_last_turn_context(db, user, history)
+            if last_acc is not None:
+                a, missing = last_acc, None
+            else:
+                return missing
         p = _isis_find_product(db, user, text)
+        if not p:
+            # v15: solo cantidad ("agrega dos más"): repite el último producto.
+            _la, last_prod = _isis_last_turn_context(db, user, history)
+            if last_prod and len(text.split()) <= 6 and ('mas' in text or 'otra' in text or 'otro' in text):
+                p = last_prod
         if not p:
             amb = _isis_ambiguous_product(db, user, text)
             return {'action': 'unknown', 'params': {},
@@ -4110,7 +4361,8 @@ _READ_ACTIONS = {'tables', 'overview', 'cash', 'cash_history', 'inventory', 'inv
                  'menu_list', 'product_price', 'staff_list', 'tips_pool', 'approvals_list', 'audit_list',
                  'reservations_list', 'prep_config', 'analytics', 'recall', 'chat',
                  'client_info', 'cash_cut_start', 'split_account_start', 'todo_list',
-                 'day_close', 'shift_handover', 'shopping_list', 'oldest_ticket'}
+                 'day_close', 'shift_handover', 'shopping_list', 'oldest_ticket',
+                 'rules_list', 'last_session'}
 
 _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'new_account',
                   'add_order', 'pay_account', 'close_account', 'transfer_account', 'restock',
@@ -4121,7 +4373,7 @@ _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'ne
                   'confirm_reservation', 'reservation_arrive', 'prep_config_set',
                   'product_prep_set', 'remember', 'forget', 'merge_accounts', 'split_account',
                   'reopen_closed', 'tip_payout', 'todo_add', 'todo_remove',
-                  'pay_and_close_account', 'cancel_item'}
+                  'pay_and_close_account', 'cancel_item', 'rule_forget'}
 
 # v13+v14: lo rutinario y reversible se ejecuta DIRECTO, sin pedir
 # confirmación antes, y la respuesta dice exactamente lo que se hizo
@@ -4143,7 +4395,7 @@ _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'ne
 _ISIS_DIRECT_ACTIONS = {'add_order', 'new_account', 'transfer_account', 'restock',
                         'inventory_adjust', 'ticket_status', 'create_product',
                         'confirm_reservation', 'reservation_arrive', 'remember',
-                        'forget', 'todo_add', 'todo_remove'}
+                        'forget', 'todo_add', 'todo_remove', 'rule_forget'}
 
 def _isis_describe(intent):
     """Resumen de lo que Isis propone hacer, para pedir confirmación por voz.
@@ -4279,6 +4531,116 @@ def _isis_confirm_token(intent, delicate=False, stage=1):
 # repite los datos exactos y pregunta "¿Seguro, lo hago?", y solo el segundo
 # "sí" ejecuta. Cualquier "no" cancela. El token expira a los 2 minutos,
 # igual que el de confirmación normal.
+# --- v15: órdenes en cadena ("cobra la mesa 5 y abre la 6", "agrega dos
+# coronas a la mesa 5 y una coca a la 6"). Una frase, varias acciones en
+# orden. Las directas se ejecutan; al llegar a una que pide confirmación
+# (dinero, delicada, irreversible) se para y el resto queda guardado en
+# _ISIS_CHAIN para seguir tras el "sí". Si un paso falla, se para y se
+# reporta lo hecho y lo que falló, sin correr el resto a ciegas.
+_CHAIN_SPLIT = re.compile(r'\s+(?:y|luego)\s+|;\s*')
+
+
+def _isis_parse_chain(db, user, text, history=None):
+    """Parte una orden en cadena en intents, o None si no es cadena o
+    algún segmento no se entiende (entonces manda el parseo normal de
+    la frase entera). El segundo segmento puede venir sin verbo ('una
+    coca a la 6'): hereda el pedido anterior, con su propia mesa."""
+    parts = [p.strip() for p in _CHAIN_SPLIT.split(text) if p.strip()]
+    if len(parts) < 2:
+        return None
+    intents = []
+    last_action = None
+    for i, seg in enumerate(parts):
+        # El segmento anterior es el "hilo" del siguiente: "y una coca"
+        # se refiere a lo que se acaba de pedir en el mismo mensaje.
+        seg_history = list(history or [])
+        if i > 0:
+            seg_history = seg_history + [(parts[i - 1], '')]
+        intent = _isis_parse_local(db, user, seg, history=seg_history)
+        if intent is None and intents:
+            # Continuación sin verbo: mismo tipo de pedido, otro
+            # producto o mesa ("una coca a la 6", "la 6" tras preguntar
+            # un saldo).
+            prev = intents[-1]
+            if last_action == 'add_order':
+                acc = _isis_find_account(db, user, seg)
+                p = _isis_find_product(db, user, seg)
+                if acc is not None and p is not None:
+                    item = {'product_id': p.get('id'), 'product': p.get('name'),
+                            'qty': _isis_qty_for_product(seg, p)}
+                    note = _isis_parse_order_note(seg)
+                    if note:
+                        item['note'] = note
+                    intent = {'action': 'add_order', 'params': {
+                        'account_id': acc.get('id'), 'items': [item],
+                        'table_name': acc.get('table_name'),
+                        'client_name': _isis_client_name_of(acc)}}
+            elif last_action == 'account_detail':
+                acc = _isis_find_account(db, user, seg)
+                if acc is not None:
+                    intent = {'action': 'account_detail', 'params': {'account_id': acc.get('id')}}
+        if intent is None or intent.get('action') == 'unknown':
+            return None
+        if intent.get('action') in ('cash_cut_start', 'split_account_start'):
+            return None  # los flujos guiados no se encadenan
+        intents.append(intent)
+        last_action = intent.get('action')
+    if len(intents) < 2:
+        return None
+    return intents
+
+
+async def _isis_execute_chain(db, user, intents, done=None):
+    """Ejecuta una cadena en orden. Devuelve {'replies': [..], 'needs_confirmation',
+    'confirm_token', 'gate_reply', 'executed_any'}: replies trae lo hecho en
+    orden; gate_reply es la propuesta del paso que pide confirmación (si lo
+    hay), con el resto guardado en _ISIS_CHAIN."""
+    done = list(done or [])
+    executed_any = bool(done)
+    i = 0
+    while i < len(intents):
+        intent = intents[i]
+        a = intent.get('action')
+        if a in _WRITE_ACTIONS and a not in _ISIS_DIRECT_ACTIONS:
+            _ISIS_CHAIN[user.id] = {'steps': intents[i:], 'done': done}
+            token = _isis_confirm_token(intent, delicate=a in _DELICATE_ACTIONS)
+            summary = _isis_describe(intent)
+            audit(db, user, 'isis.voice_propose', actor=user.username, isis_action=a)
+            return {'replies': done, 'needs_confirmation': True, 'confirm_token': token,
+                    'gate_reply': _isis_warm() + ' ' + summary + ' ¿Confirmas?',
+                    'executed_any': executed_any}
+        try:
+            reply = await _isis_execute(db, user, intent)
+            if a in _WRITE_ACTIONS:
+                audit(db, user, 'isis.voice_execute', actor=user.username, isis_action=a)
+        except HTTPException as e:
+            _ISIS_CHAIN.pop(user.id, None)
+            return {'replies': done + [f"No pude con eso: {e.detail}"],
+                    'needs_confirmation': False, 'confirm_token': None, 'gate_reply': None,
+                    'executed_any': executed_any}
+        done.append(reply)
+        executed_any = True
+        i += 1
+    _ISIS_CHAIN.pop(user.id, None)
+    return {'replies': done, 'needs_confirmation': False, 'confirm_token': None,
+            'gate_reply': None, 'executed_any': executed_any}
+
+
+async def _isis_chain_resume(db, user, gate_reply):
+    """Tras confirmar un paso de una cadena, sigue con el resto.
+    Devuelve el dict de _isis_execute_chain o None si no hay cadena
+    pendiente. El paso confirmado ya se ejecutó: se quita y se sigue."""
+    saved = _ISIS_CHAIN.pop(user.id, None)
+    if not saved or not saved.get('steps'):
+        return None
+    steps = saved['steps'][1:]
+    done = (saved.get('done') or []) + [gate_reply]
+    if not steps:
+        return {'replies': done, 'needs_confirmation': False, 'confirm_token': None,
+                'gate_reply': None, 'executed_any': True}
+    return await _isis_execute_chain(db, user, steps, done=done)
+
+
 _DELICATE_ACTIONS = {'merge_accounts', 'split_account', 'reopen_closed', 'tip_payout'}
 
 async def _isis_execute(db, user, intent):
@@ -4416,6 +4778,9 @@ async def _isis_execute(db, user, intent):
         return "Movimiento de caja registrado."
     # --- v2: memoria ---
     if a == 'remember':
+        if str(p.get('key') or '').startswith('regla:'):
+            _isis_memory_set(db, p.get('key'), p.get('value'))
+            return _isis_say(f"Anotado: de ahora en adelante, {p.get('value')}. Así lo haré.", warm=True)
         if str(p.get('key') or '').startswith('cliente:'):
             _isis_memory_set(db, p.get('key'), p.get('value'))
             name = str(p.get('key'))[len('cliente:'):]
@@ -4446,6 +4811,24 @@ async def _isis_execute(db, user, intent):
         for k, _v in hits:
             _isis_memory_delete(db, k)
         return _isis_say(f"Ya olvidé lo de '{q}'.", warm=True)
+    # --- v15, ítem 6: reglas del dueño ---
+    if a == 'rules_list':
+        rules = _isis_rules_all(db)
+        if not rules:
+            return "No tienes reglas guardadas. Si quieres, dime 'de ahora en adelante' y lo que quieres que haga siempre, y te la guardo."
+        txt = _isis_short_list([v for _k, v in rules], len(rules))
+        return _isis_say(f"Tus reglas: {txt}", warm=True)
+    if a == 'rule_forget':
+        for k in (p.get('keys') or []):
+            _isis_memory_delete(db, k)
+        txt = _isis_short_list(p.get('texts') or [], len(p.get('texts') or []))
+        return _isis_say(f"Ya olvidé esa regla: {txt}.", warm=True)
+    # --- v15, ítem 1: qué pidió en la llamada anterior ---
+    if a == 'last_session':
+        val = _isis_memory_get(db, 'ultima-sesion')
+        if not val:
+            return "No tengo registro de la última llamada."
+        return _isis_say(f"La última vez: {val}", warm=True)
     # --- v11: quitar un producto de una cuenta. La app no tiene endpoint
     # directo: la cancelación es solicitud + decisión del propietario, y
     # eso es lo que se hace aquí (Isis actúa como propietaria, con su
@@ -4736,6 +5119,9 @@ async def _isis_execute(db, user, intent):
             start = end = today
             label, scope = 'Hoy', 'current'
         d = _isis_analytics_cached(db, user, start, end, scope)
+        # v15: regla 'reporte corto' — solo el titular, sin lo más vendido.
+        if _isis_rule_get(db, 'reporte') == 'corto':
+            return _isis_say(f"{label} llevamos {_isis_pesos(d.get('sales'))} en ventas, {_isis_n(d.get('paid_accounts'), 'cuenta pagada', 'cuentas pagadas')}.", warm=True)
         top = d.get('products') or []
         top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in top[:3])
         prep = d.get('prep_avg_minutes')
@@ -4788,17 +5174,29 @@ def isis_voice_status(db: Session = Depends(db_session), user: User = Depends(au
         morning_brief = _isis_morning_brief(db, user)
     except Exception:
         morning_brief = ''
+    # Pendientes y última sesión (v15): el panel los muestra escritos al
+    # entrar, sin esperar a la llamada. Nunca rompen el status.
+    try:
+        todos = [v for _k, v in _isis_todo_list(db)][:5]
+    except Exception:
+        todos = []
+    try:
+        last_session = _isis_memory_get(db, 'ultima-sesion') or ''
+    except Exception:
+        last_session = ''
     return {'ok': True, 'isis_user_exists': exists, 'fableai_configured': bool(FABLEAI_API_KEY),
             'openai_tts_configured': bool(OPENAI_API_KEY),
             'voice': 'kokoro-ef-dora', 'mode': 'solo-mitote', 'alerts': alerts,
-            'morning_brief': morning_brief}
+            'morning_brief': morning_brief, 'todos': todos, 'last_session': last_session}
 
 
 @app.post('/api/isis-voice/end-call')
-def isis_voice_end_call(user: User = Depends(auth)):
-    """Isis (o el propietario) cuelga: se borra el historial de la conversación (v4)."""
+def isis_voice_end_call(db: Session = Depends(db_session), user: User = Depends(auth)):
+    """Isis (o el propietario) cuelga: se guarda qué se pidió en la llamada
+    (v15, memoria larga) y se borra el historial de la conversación (v4)."""
     if user.username != 'isis' and user.role != 'owner':
         raise HTTPException(403, 'Este panel de voz es solo para Isis')
+    _isis_session_summary_save(db, user)
     _isis_history_clear(user.id)
     return {'ok': True}
 
@@ -5136,10 +5534,12 @@ async def _isis_chat_flow(db, user, data, emit=None):
     if data.confirm_token:
         entry = _ISIS_CONFIRM.pop(data.confirm_token, None)
         if not entry or entry['expires'] < time.time():
+            _ISIS_CHAIN.pop(user.id, None)  # v15: el token vencido cancela la cadena pendiente
             reply = 'Esa confirmación ya se venció, dime de nuevo qué quieres hacer.'
             _record(reply)
             return {'ok': True, 'reply': reply, 'executed': False}
         if any(w in _isis_norm(message) for w in ('no', 'cancela', 'olvida')):
+            _ISIS_CHAIN.pop(user.id, None)  # v15: el 'no' cancela también la cadena pendiente
             reply = 'Sale, cancelado. No hice nada.'
             _record(reply)
             return {'ok': True, 'reply': reply, 'executed': False}
@@ -5156,10 +5556,21 @@ async def _isis_chat_flow(db, user, data, emit=None):
         try:
             reply = await _isis_execute(db, user, entry['intent'])
         except HTTPException as e:
+            _ISIS_CHAIN.pop(user.id, None)  # v15: si el paso falla, la cadena no sigue
             reply = 'No se pudo: ' + str(e.detail)
             _record(reply)
             return {'ok': True, 'reply': reply, 'executed': False}
         audit(db, user, 'isis.voice_execute', actor=actor, isis_action=entry['intent'].get('action'))
+        # v15: si era un paso de una cadena, seguir con el resto.
+        resumed = await _isis_chain_resume(db, user, reply)
+        if resumed is not None:
+            full = ' '.join(resumed['replies'] + ([resumed['gate_reply']] if resumed.get('gate_reply') else []))
+            out = {'ok': True, 'reply': full, 'executed': True}
+            if resumed.get('needs_confirmation'):
+                out['needs_confirmation'] = True
+                out['confirm_token'] = resumed['confirm_token']
+            _record(full)
+            return out
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': True}
     # Corte guiado (v8): si hay un corte en curso, el mensaje es un paso del flujo.
@@ -5186,6 +5597,19 @@ async def _isis_chat_flow(db, user, data, emit=None):
                 out['needs_confirmation'] = True
                 out['confirm_token'] = res['confirm_token']
             return out
+    # v15: órdenes en cadena ("cobra la mesa 5 y abre la 6"): se intentan
+    # antes que el parseo de la frase entera; si no es cadena, manda el
+    # parseo normal.
+    chain = _isis_parse_chain(db, user, message, history=_isis_history_get(user.id))
+    if chain:
+        res = await _isis_execute_chain(db, user, chain)
+        reply = ' '.join(res['replies'] + ([res['gate_reply']] if res.get('gate_reply') else []))
+        _record(reply)
+        out = {'ok': True, 'reply': reply, 'executed': res.get('executed_any', False)}
+        if res.get('needs_confirmation'):
+            out['needs_confirmation'] = True
+            out['confirm_token'] = res['confirm_token']
+        return out
     # Nueva orden: interprete local primero, IA despues
     intent = _isis_parse_local(db, user, message, history=_isis_history_get(user.id))
     if intent is not None and intent.get('action') == 'unknown':
