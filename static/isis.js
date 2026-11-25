@@ -175,7 +175,7 @@
       const stateEl = $('#isis-voice-state');
       if (stateEl && !d.fableai_configured) stateEl.textContent = 'Sin clave de FableAI: Isis entiende órdenes directas en español. El propietario la configura en el servidor.';
     } catch (e) {}
-    const greet = 'Hola, soy Isis. ¿Qué necesitas?';
+    const greet = 'Hola, soy Isis, tu asistente de El Mitote. Te ayudo con todo lo del restaurante: puedo decirte qué mesas están libres, cuánto debe una mesa, cuánto queda en inventario, cómo va la caja, o hacer el corte. Dime, ¿qué necesitas?';
     const rep = $('#isis-reply');
     if (rep) rep.textContent = 'Isis: ' + greet;
     speak(greet);
