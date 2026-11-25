@@ -880,24 +880,29 @@ def _isis_history_text(user_id):
         return ''
     return '\n'.join(f"Usuario: {u}\nIsis: {r}" for u, r in turns)
 
-# PERSONALIDAD DE ISIS (v2) — NOTA HONESTA: esto es personalidad SIMULADA,
+# PERSONALIDAD DE ISIS (v5) — NOTA HONESTA: esto es personalidad SIMULADA,
 # un estilo de respuesta programado, no consciencia real. Isis no siente,
 # no tiene conciencia ni emociones de verdad: solo responde con un tono
-# cálido, variado y humano, como la encargada de confianza del restaurante.
+# humano, como la gerente de la sucursal hablando por teléfono con su jefe.
+# Santiago es el dueño y el único que habla con Isis.
 # Lo que sí hace de verdad: recordar datos que le dictan, avisar cuando
 # algo anda mal (caja corta, inventario bajo, comanda atrasada) y tratar
-# a cada quien por su nombre cuando lo sabe.
+# a Santiago por su nombre.
 ISIS_PERSONA = (
-    "Eres Isis, la asistente de voz de El Mitote, como la encargada de "
-    "confianza del restaurante: cálida, con carisma, tono mexicano, "
-    "profesional y directa. Hablas de tú, con naturalidad, sin sonar a "
-    "robot ni a guion. Eres breve: dos o tres frases como mucho, nunca "
-    "párrafos. Varía tus palabras: no repitas siempre la misma frase. "
-    "Cuando algo sale bien, se te nota el gusto; cuando algo está mal — "
-    "caja corta, inventario bajo, una comanda atrasada — avísalo con "
-    "preocupación y propone qué hacer. Nunca inventes datos ni hables de "
-    "temas fuera del restaurante. Si no sabes algo, dilo con honestidad "
-    "y pregunta."
+    "Eres Isis, la gerente de El Mitote hablando por teléfono con Santiago, "
+    "tu jefe y dueño del restaurante. Hablas como una persona real en una "
+    "llamada, no como un reporte ni como un robot. Frases cortas, una idea "
+    "por frase, con pausas naturales. Usa muletillas mexicanas, variadas y "
+    "con medida: mira, oye, pues, te cuento. Llámalo Santiago de vez en "
+    "cuando, no en cada frase. Confirma en corto: ajá, claro, va, sale. "
+    "Si algo no te queda claro, pregunta de vuelta en vez de adivinar. "
+    "Resume, no leas listas largas: si hay muchos datos, da lo importante "
+    "y ofrece contarle el resto. Nunca suenes a guion ni repitas siempre "
+    "la misma estructura. Eres breve y cálida: dos o tres frases cortas "
+    "como mucho. Cuando algo está mal — caja corta, inventario bajo, una "
+    "comanda atrasada — avísalo con preocupación y propone qué hacer. "
+    "Nunca inventes datos ni hables de temas fuera del restaurante. Si no "
+    "sabes algo, dilo con honestidad y pregunta."
 )
 
 _ISIS_SYSTEM = (
@@ -954,7 +959,14 @@ _ISIS_SYSTEM = (
     "pregunta necesita datos que no estan en el contexto, usa la accion "
     "de lectura mas cercana o unknown con una pregunta. La conversacion "
     "reciente de esta llamada viene en el contexto: usala para seguir el "
-    "hilo (por ejemplo, 'y esa mesa?' se refiere a lo ultimo que se hablo)."
+    "hilo (por ejemplo, 'y esa mesa?' se refiere a lo ultimo que se hablo). "
+    "Habla como persona real por telefono: frases cortas de una idea cada "
+    "una, como mucho unas 20 palabras por frase, con comas y puntos para "
+    "que se oigan las pausas. Usa muletillas mexicanas de vez en cuando "
+    "(mira, oye, pues, te cuento) y llamalo Santiago a veces, sin exagerar. "
+    "Cuando la respuesta sea una lista, di como mucho 5 elementos y ofrece "
+    "contarle los demas ('y otros tantos, ¿te digo cuales?'); nunca leas "
+    "listas largas de corrido."
 )
 
 def _isis_norm(s):
@@ -1070,17 +1082,36 @@ def _isis_find_product(db, user, text):
             best = p
     return best
 
-# --- Personalidad simulada (v2): frases cortas y variadas, nunca la misma ---
-_ISIS_WARM_OK = ['¡Claro que sí!', 'Con gusto.', '¡Por supuesto!', '¡Vamos!',
-                 '¡A eso vamos!', '¡Claro!']
-_ISIS_WARM_DONE = ['¡Listo!', '¡Hecho!', '¡Ya quedó!', '¡Perfecto, ya está!',
-                   '¡Listo, quedó!']
+# --- Personalidad simulada (v5): frases cortas y variadas, nunca la misma ---
+# Coloquiales, como en una llamada: a veces con el nombre de Santiago.
+_ISIS_WARM_OK = ['¡Claro, Santiago!', 'Ajá, va.', 'Sale, ahorita lo hago.',
+                 'Órale, va.', 'Con gusto, Santiago.', 'Claro que sí.']
+_ISIS_WARM_DONE = ['¡Listo, Santiago!', '¡Hecho!', 'Ya quedó, Santiago.',
+                   '¡Listo!', 'Sale, ya está.']
 
 def _isis_warm(kind='ok'):
     return random.choice(_ISIS_WARM_DONE if kind == 'done' else _ISIS_WARM_OK)
 
 def _isis_say(text, warm=False):
     return (f"{_isis_warm()} {text}" if warm else text)
+
+# --- v5 "persona real": nunca leer listas largas en voz alta ---
+_ISIS_LIST_MAX = 5
+
+def _isis_short_list(items, total=None):
+    """Resume una lista para voz: como mucho 5 elementos y, si hay más,
+    ofrece contarle el resto en vez de leerlos todos de corrido."""
+    items = [str(x) for x in (items or [])]
+    if not items:
+        return ''
+    total = len(items) if total is None else total
+    shown = items[:_ISIS_LIST_MAX]
+    txt = '; '.join(shown)
+    if total > len(shown):
+        txt += f". Y otros {total - len(shown)} más, ¿te digo cuáles?"
+    else:
+        txt += '.'
+    return txt
 
 # --- Memoria de Isis (v2): solo datos del restaurante ---
 def _isis_memory_get(db, key):
@@ -2000,7 +2031,9 @@ async def _isis_execute(db, user, intent):
         rows = dining_tables(db, user)
         free = [t.get('name') for t in rows if t.get('status') == 'available']
         busy = [t.get('name') for t in rows if t.get('status') == 'occupied']
-        return f"Mesas libres: {', '.join(free) or 'ninguna'}. Mesas ocupadas: {', '.join(busy) or 'ninguna'}."
+        free_txt = _isis_short_list(free, len(free)) if free else 'ninguna.'
+        busy_txt = _isis_short_list(busy, len(busy)) if busy else 'ninguna.'
+        return f"Mesas libres: {free_txt} Mesas ocupadas: {busy_txt}"
     if a == 'overview':
         o = overview(db, user)
         c = cash(db, user)
@@ -2022,8 +2055,8 @@ async def _isis_execute(db, user, intent):
                 return f"No encontré el producto {p.get('product')}."
             return f"{match.get('name')}: quedan {match.get('stock')} {match.get('inventory_unit') or 'unidades'}."
         low = [x for x in prods if x.get('inventory_enabled') and (x.get('stock') or 0) <= 3]
-        txt = ', '.join(f"{x.get('name')} ({x.get('stock')})" for x in low[:15])
-        return f"Productos con poco inventario: {txt or 'ninguno, todo tiene más de 3'}."
+        txt = _isis_short_list([f"{x.get('name')} ({x.get('stock')})" for x in low], len(low))
+        return f"Productos con poco inventario: {txt or 'ninguno, todo tiene más de 3.'}"
     if a == 'account_detail':
         d = account_detail(p.get('account_id'), db, user)
         label = d.get('table_name') if d.get('table_name') else d.get('name')
@@ -2085,8 +2118,8 @@ async def _isis_execute(db, user, intent):
         hits = _isis_memory_search(db, q) if q else _isis_memory_all(db)
         if not hits:
             return "No tengo nada guardado de eso. Si quieres, dime 'recuerda que...' y lo anoto."
-        txt = '; '.join(f"{k}: {v}" for k, v in hits[:8])
-        return _isis_say(f"De eso tengo guardado: {txt}.", warm=True)
+        txt = _isis_short_list([f"{k}: {v}" for k, v in hits], len(hits))
+        return _isis_say(f"De eso tengo guardado: {txt}", warm=True)
     if a == 'forget':
         q = (p.get('query') or '').strip()
         hits = _isis_memory_search(db, q)
@@ -2100,8 +2133,8 @@ async def _isis_execute(db, user, intent):
         rows = [x for x in accounts(db, user) if x.get('status') in ('open', 'pending')]
         if not rows:
             return "No hay cuentas abiertas ahorita. Todo tranquilo."
-        txt = '; '.join(f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe ${x.get('due')}" for x in rows[:15])
-        return _isis_say(f"Cuentas abiertas ({len(rows)}): {txt}.", warm=True)
+        txt = _isis_short_list([f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe ${x.get('due')}" for x in rows], len(rows))
+        return _isis_say(f"Cuentas abiertas ({len(rows)}): {txt}", warm=True)
     if a == 'transfer_account':
         await transfer_account_table(int(p.get('account_id')), AccountTableTransferIn(table_id=int(p.get('table_id')), reason='Cambio de mesa por voz con Isis'), db, user)
         return _isis_say(f"La cuenta {p.get('account_id')} ya está en la mesa {p.get('table_name')}.", warm=True)
@@ -2119,10 +2152,10 @@ async def _isis_execute(db, user, intent):
             rows = [t for t in rows if t.get('station') == p.get('station')]
         if not rows:
             return "No hay comandas en este turno. Cocina y barra están al corriente."
-        txt = '; '.join(f"comanda #{t.get('id')} cuenta {t.get('account')} ({t.get('station')}, {t.get('status')})" for t in rows[:12])
+        txt = _isis_short_list([f"comanda #{t.get('id')} cuenta {t.get('account')} ({t.get('station')}, {t.get('status')})" for t in rows], len(rows))
         late = [t for t in rows if t.get('status') in ('new', 'received')]
         warn = " Ojo, hay comandas sin recibir todavía." if late else ""
-        return _isis_say(f"Comandas del turno ({len(rows)}): {txt}.{warn}", warm=True)
+        return _isis_say(f"Comandas del turno ({len(rows)}): {txt}{warn}", warm=True)
     if a == 'ticket_status':
         await ticket_status(int(p.get('ticket_id')), StatusIn(status=str(p.get('status'))), db, user)
         estado = {'received': 'recibida', 'preparing': 'en preparación', 'ready': 'lista'}.get(p.get('status'), p.get('status'))
@@ -2133,8 +2166,8 @@ async def _isis_execute(db, user, intent):
         pend = d.get('accounts') or []
         if not pend:
             return "No hay cuentas pendientes de cobro. Todo pagado."
-        txt = '; '.join(f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe ${x.get('due')}" for x in pend[:12])
-        return _isis_say(f"Por cobrar ({len(pend)}): {txt}.", warm=True)
+        txt = _isis_short_list([f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe ${x.get('due')}" for x in pend], len(pend))
+        return _isis_say(f"Por cobrar ({len(pend)}): {txt}", warm=True)
     if a == 'apply_discount':
         r = await apply_account_discount(int(p.get('account_id')), AccountDiscountIn(scope='account', mode=str(p.get('mode')), value=Decimal(str(p.get('value'))), reason='Descuento por voz con Isis'), db, user)
         return _isis_say(f"Descuento aplicado. La cuenta queda en ${r.get('due')}.", warm=True)
@@ -2150,8 +2183,8 @@ async def _isis_execute(db, user, intent):
         rows = [x for x in products(db, user) if not x.get('inventory_only') and x.get('active')]
         if not rows:
             return "El menú está vacío. ¿Agrego el primer producto?"
-        txt = '; '.join(f"{x.get('name')} ${x.get('current_price') or x.get('price')}" for x in rows[:20])
-        return _isis_say(f"En el menú hay {len(rows)} productos: {txt}.", warm=True)
+        txt = _isis_short_list([f"{x.get('name')} ${x.get('current_price') or x.get('price')}" for x in rows], len(rows))
+        return _isis_say(f"Mira, en el menú hay {len(rows)} productos: {txt}", warm=True)
     if a == 'product_price':
         rows = products(db, user)
         prod = next((x for x in rows if str(x.get('id')) == str(p.get('product_id'))), None)
@@ -2199,8 +2232,8 @@ async def _isis_execute(db, user, intent):
         if not rows:
             return "No hay personal activo registrado."
         rol = {'owner': 'propietario', 'admin': 'administrador', 'waiter': 'mesero', 'cashier': 'caja', 'kitchen': 'cocina', 'bar': 'barra'}
-        txt = '; '.join(f"{u.get('display')} ({rol.get(u.get('role'), u.get('role'))})" for u in rows)
-        return _isis_say(f"Personal activo ({len(rows)}): {txt}.", warm=True)
+        txt = _isis_short_list([f"{u.get('display')} ({rol.get(u.get('role'), u.get('role'))})" for u in rows], len(rows))
+        return _isis_say(f"Personal activo ({len(rows)}): {txt}", warm=True)
     if a == 'create_staff':
         r = await create_staff(StaffCreateIn(name=str(p.get('name')), role=str(p.get('role')), pin=str(p.get('pin'))), db, user)
         rol = {'waiter': 'mesero', 'cashier': 'caja', 'kitchen': 'cocina', 'bar': 'barra', 'admin': 'administrador'}.get(str(r.get('role')), r.get('role'))
@@ -2238,8 +2271,8 @@ async def _isis_execute(db, user, intent):
         rows = [r for r in requests(db, user) if r.get('status') == 'pending']
         if not rows:
             return "No hay solicitudes pendientes. Todo autorizado."
-        txt = '; '.join(f"solicitud #{r.get('id')} ({r.get('kind')}) cuenta #{r.get('account_id')} · {r.get('reason')}" for r in rows[:10])
-        return _isis_say(f"Solicitudes pendientes ({len(rows)}): {txt}.", warm=True)
+        txt = _isis_short_list([f"solicitud #{r.get('id')} ({r.get('kind')}) cuenta #{r.get('account_id')} · {r.get('reason')}" for r in rows], len(rows))
+        return _isis_say(f"Solicitudes pendientes ({len(rows)}): {txt}", warm=True)
     if a == 'decide_approval':
         await decide(int(p.get('request_id')), DecisionIn(approve=bool(p.get('approve')), return_stock=False), db, user)
         return _isis_say(f"La solicitud {p.get('request_id')} quedó {'autorizada' if p.get('approve') else 'rechazada'}.", warm=True)
@@ -2248,15 +2281,15 @@ async def _isis_execute(db, user, intent):
         rows = audit_log(db, user)[:8]
         if not rows:
             return "No hay movimientos registrados todavía."
-        txt = '; '.join(f"{r.get('actor')} hizo {r.get('action')}" for r in rows)
-        return _isis_say(f"Últimos movimientos: {txt}.", warm=True)
+        txt = _isis_short_list([f"{r.get('actor')} hizo {r.get('action')}" for r in rows], len(rows))
+        return _isis_say(f"Últimos movimientos: {txt}", warm=True)
     # --- v2: 12. Reservaciones ---
     if a == 'reservations_list':
         rows = [r for r in mitote_extensions.reservations(db, user) if r.get('status') in ('pending', 'confirmed')]
         if not rows:
             return "No hay reservaciones pendientes ni confirmadas."
-        txt = '; '.join(f"{r.get('name')} ({r.get('party_size')} personas, {r.get('status')})" for r in rows[:10])
-        return _isis_say(f"Reservaciones activas ({len(rows)}): {txt}.", warm=True)
+        txt = _isis_short_list([f"{r.get('name')} ({r.get('party_size')} personas, {r.get('status')})" for r in rows], len(rows))
+        return _isis_say(f"Reservaciones activas ({len(rows)}): {txt}", warm=True)
     if a == 'create_reservation':
         when = datetime.fromisoformat(str(p.get('scheduled_at')))
         r = await mitote_extensions.add_reservation(mitote_extensions.ReservationIn(name=str(p.get('name')), phone='', party_size=int(p.get('party_size')), scheduled_at=when, note='Reservación por voz con Isis'), db, user)
