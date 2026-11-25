@@ -15,6 +15,10 @@
    Resumen al entrar (v8): después del saludo y las alertas, Isis dice sola
    cómo cerró el día anterior (ventas de ayer, lo más vendido, lo que se
    acabó), una sola vez por entrada al panel.
+   Fluidez (v9): Dora habla por frases (la siguiente se genera mientras suena
+   la actual), un poco más pausada, con respiros entre frases; la frase de
+   espera va con la voz del teléfono para que salga al instante; y el
+   servidor se despierta al entrar, no antes de cada mensaje.
    Reconocimiento: Web Speech API (es-MX). Voz: Kokoro ef_dora, que se
    descarga solo cuando el usuario toca "Descargar voz de Isis" (~88 MB,
    una sola vez); si no esta descargada, habla con la voz del telefono. */
@@ -51,6 +55,13 @@
   const saidAlerts = new Set(); // alertas ya dichas (entrada + media llamada)
   let lastMidCheck = 0; // último chequeo de avisos a media llamada
   const WAIT_PHRASES = ['Dame un segundo, estoy revisando.', 'A ver, déjame checar eso.'];
+  // Fluidez (v9): Dora habla un poco más pausada y por frases, para que no
+  // suene a robot ni se trabe generando respuestas largas.
+  const KOKORO_SPEED = 0.95; // kokoro-js: generate(text, { voice, speed })
+  const PART_PAUSE_MS = 200; // respiro entre frases
+  const WAIT_DELAY_MS = 1500; // la frase de espera sale antes de los 2 s
+  const CHAT_TIMEOUT_MS = 15000; // la petición de chat no cuelga la llamada
+  const kokoroUrls = new Set(); // audios de Dora generados, por reproducir
   // La voz descargada vive solo en la memoria de la página: al recargar se
   // perdía y había que descargarla de nuevo. Por eso se guarda una marca en
   // localStorage y al abrir el panel se vuelve a cargar sola desde la caché
@@ -126,7 +137,7 @@
     if (el) el.hidden = true;
   }
 
-  async function speak(text) {
+  async function speak(text, opts) {
     if (!text) return;
     stopSpeaking();
     const gen = ++speakGen;
@@ -136,7 +147,10 @@
     status('Hablando…', 'speaking');
     startInterruptListener();
     try {
-      if (kokoroTTS) await speakKokoro(text);
+      // La frase de espera siempre va con la voz del teléfono (opts.forcePhone):
+      // arranca al instante, sin esperar a que Dora genere el audio.
+      if (opts && opts.forcePhone) await speakPhone(text);
+      else if (kokoroTTS) await speakKokoro(text);
       else await speakPhone(text);
     } finally {
       // Solo apaga la escucha si este sigue siendo el speak en curso.
@@ -150,7 +164,45 @@
     // La voz de Kokoro no usa speechSynthesis sino un <audio>: hay que
     // pausarlo aparte o seguiría sonando al colgar.
     try { if (kokoroAudio) { kokoroAudio.pause(); kokoroAudio = null; } } catch (e) {}
+    // Los audios de Dora ya generados pero aún no sonados se liberan: si no,
+    // quedarían colgados en memoria tras una interrupción.
+    kokoroUrls.forEach((u) => { try { URL.revokeObjectURL(u); } catch (e) {} });
+    kokoroUrls.clear();
     speaking = false;
+  }
+
+  // Fluidez (v9): partir la respuesta en frases para que Dora empiece a
+  // hablar en cuanto esté lista la primera, sin esperar a generar todo.
+  // No se parte el punto entre dígitos ("Corona 1.2", "40.50 pesos") ni los
+  // montos: solo se parte en punto, ?, !, ; o … seguidos de espacio o fin.
+  function splitIntoSpeechParts(text) {
+    const clean = (text || '').replace(/\s+/g, ' ').trim();
+    if (!clean) return [];
+    const parts = [];
+    let start = 0;
+    const re = /[.?!;…](?=\s|$)/g;
+    let m;
+    while ((m = re.exec(clean)) !== null) {
+      const piece = clean.slice(start, m.index + 1).trim();
+      if (piece) parts.push(piece);
+      start = m.index + 1;
+    }
+    const tail = clean.slice(start).trim();
+    if (tail) parts.push(tail);
+    // Una frase muy larga también se parte por comas, para que respire y
+    // ninguna parte tarde demasiado en generarse.
+    const out = [];
+    for (const p of parts) {
+      if (p.length <= 120) { out.push(p); continue; }
+      let cur = '';
+      for (const seg of p.split(',')) {
+        const chunk = cur ? cur + ',' + seg : seg;
+        if (chunk.length > 120 && cur) { out.push(cur.trim()); cur = seg.trim(); }
+        else cur = chunk;
+      }
+      if (cur.trim()) out.push(cur.trim());
+    }
+    return out.filter(Boolean);
   }
 
   // Interrupción (v7): si Santiago habla mientras Isis habla, ella se calla
@@ -239,11 +291,13 @@
     } catch (e) {}
   }
 
-  function speakPhone(text) {
-    // La generación del speak en curso: el seguro de 30 s de un speak viejo
-    // no debe apagar el `speaking` de un speak nuevo en una llamada larga.
-    const gen = speakGen;
+  // Voz del teléfono (v9): también por frases, cada una con su propio seguro
+  // de 15 s: si una frase se atora, se cancela y se sigue con la siguiente,
+  // en vez de dejar la llamada colgada 30 s.
+  function speakPhonePart(text, gen) {
     return new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
       try {
         const u = new SpeechSynthesisUtterance(text);
         u.lang = 'es-MX';
@@ -253,12 +307,31 @@
         if (v) u.voice = v;
         // Al terminar de hablar no se pone estado aquí: quien llamó a
         // speak() decide qué sigue (en llamada, volver a escuchar).
-        u.onend = () => { speaking = false; resolve(); };
-        u.onerror = () => { speaking = false; resolve(); };
+        u.onend = finish;
+        u.onerror = finish;
         window.speechSynthesis.speak(u);
-        setTimeout(() => { if (speaking && gen === speakGen) { speaking = false; resolve(); } }, 30000);
-      } catch (e) { speaking = false; resolve(); }
+        setTimeout(() => {
+          if (!done && gen === speakGen) {
+            try { window.speechSynthesis.cancel(); } catch (e) {}
+            finish();
+          }
+        }, 15000);
+      } catch (e) { finish(); }
     });
+  }
+
+  async function speakPhone(text, keepSpeaking) {
+    const gen = speakGen;
+    const parts = splitIntoSpeechParts(text);
+    for (let i = 0; i < parts.length; i++) {
+      if (gen !== speakGen || !speaking) return;
+      await speakPhonePart(parts[i], gen);
+      if (gen !== speakGen || !speaking) return;
+      if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, PART_PAUSE_MS));
+    }
+    // keepSpeaking: se usa como respaldo de una parte de Dora; el `speaking`
+    // lo apaga el speak de Dora en curso, no esta parte.
+    if (!keepSpeaking) speaking = false;
   }
 
   async function loadKokoro(opts) {
@@ -298,36 +371,105 @@
     return kokoroPromise;
   }
 
-  async function speakKokoro(text) {
+  async function generateKokoroPart(text, gen) {
     try {
-      const audio = await kokoroTTS.generate(text, { voice: 'ef_dora' });
+      // speed 0.95 (kokoro-js: generate(text, { voice, speed }), default 1):
+      // Dora habla un poco más pausada, menos a robot. No hay control de
+      // tono ni de emoción en kokoro-js: la naturalidad sale de la velocidad
+      // y de las pausas entre frases, no de parámetros que no existen.
+      const audio = await kokoroTTS.generate(text, { voice: 'ef_dora', speed: KOKORO_SPEED });
+      if (gen !== speakGen || !speaking) return null;
       const blob = audio.toBlob ? audio.toBlob() : new Blob([audio], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
-      const el = new Audio(url);
-      kokoroAudio = el;
-      await el.play();
-      await new Promise((resolve) => { el.onended = resolve; el.onerror = resolve; el.onpause = resolve; });
-      kokoroAudio = null;
-      URL.revokeObjectURL(url);
+      kokoroUrls.add(url);
+      return url;
     } catch (e) {
-      kokoroAudio = null;
-      await speakPhone(text);
+      return null;
+    }
+  }
+
+  async function playKokoroPart(url) {
+    const el = new Audio(url);
+    kokoroAudio = el;
+    try { await el.play(); } catch (e) {
+      if (kokoroAudio === el) kokoroAudio = null;
+      kokoroUrls.delete(url);
+      try { URL.revokeObjectURL(url); } catch (e2) {}
       return;
+    }
+    await new Promise((resolve) => { el.onended = resolve; el.onerror = resolve; el.onpause = resolve; });
+    if (kokoroAudio === el) kokoroAudio = null;
+    kokoroUrls.delete(url);
+    try { URL.revokeObjectURL(url); } catch (e) {}
+  }
+
+  // Voz de Dora (v9): por frases, con la siguiente ya generándose mientras
+  // suena la actual. Antes esperaba a generar TODA la respuesta antes de
+  // sonar: en respuestas largas eso era la traba principal. Kokoro además
+  // corre mejor con frases cortas (100-200 tokens) que con textos largos.
+  async function speakKokoro(text) {
+    const gen = speakGen;
+    const parts = splitIntoSpeechParts(text);
+    let nextUrlPromise = null;
+    for (let i = 0; i < parts.length; i++) {
+      if (gen !== speakGen || !speaking) return;
+      let url;
+      if (nextUrlPromise) {
+        url = await nextUrlPromise;
+        nextUrlPromise = null;
+      } else {
+        url = await generateKokoroPart(parts[i], gen);
+      }
+      if (gen !== speakGen || !speaking) {
+        if (url) { kokoroUrls.delete(url); try { URL.revokeObjectURL(url); } catch (e) {} }
+        return;
+      }
+      if (url) {
+        // Generar la siguiente parte mientras suena esta.
+        if (i + 1 < parts.length) nextUrlPromise = generateKokoroPart(parts[i + 1], gen);
+        await playKokoroPart(url);
+      } else {
+        // Si Dora falló en esta parte, voz del teléfono para no trabarse.
+        await speakPhone(parts[i], true);
+      }
+      if (gen !== speakGen || !speaking) return;
+      // Pausa corta entre frases, para que respire.
+      if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, PART_PAUSE_MS));
     }
     speaking = false;
   }
 
   // El servidor gratis de Render se duerme si nadie lo usa y tarda en
   // despertar: la primera petición puede fallar aunque internet esté bien.
-  // Por eso, antes de hablar con Isis se despierta el servidor y, si la
-  // petición falla, se reintenta una vez sola.
-  async function wakeServer() {
+  // Por eso se despierta una sola vez al entrar a la llamada (en show(), sin
+  // esperar), y antes de cada mensaje solo un wake corto con tope: si tarda,
+  // no se bloquea la llamada, la frase de espera cubre el hueco.
+  async function wakeServer(timeoutMs) {
     try {
       const c = new AbortController();
-      const t = setTimeout(() => c.abort(), 8000);
+      const t = setTimeout(() => c.abort(), timeoutMs || 2000);
       await fetch('/api/health', { cache: 'no-store', signal: c.signal });
       clearTimeout(t);
     } catch (e) {}
+  }
+
+  // La petición de chat con tope: si el servidor se cuelga (no solo falla),
+  // no deja la llamada en silencio para siempre; el reintento es el que
+  // decide si fue un error o solo lentitud.
+  async function postChat(message) {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), CHAT_TIMEOUT_MS);
+    try {
+      return await fetch('/api/isis-voice/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+        body: JSON.stringify({ message, confirm_token: pendingToken || undefined }),
+        cache: 'no-store',
+        signal: c.signal,
+      });
+    } finally {
+      clearTimeout(t);
+    }
   }
 
   async function sendToIsis(message) {
@@ -335,39 +477,32 @@
     const heard = $('#isis-heard');
     if (heard) heard.textContent = 'Tú: ' + message;
     status('Pensando…', 'thinking');
-    // Duda natural (v7): si la respuesta tarda más de 2 segundos, Isis dice
-    // una sola frase corta de espera; cuando llega la respuesta real, la
-    // frase se corta sola porque speak() para la voz en curso.
+    // Duda natural (v7) con voz instantánea (v9): si la respuesta tarda,
+    // Isis dice una sola frase corta de espera CON LA VOZ DEL TELÉFONO, que
+    // arranca al instante; antes también se generaba con Dora y ella misma
+    // tardaba. Cuando llega la respuesta real, la frase se corta sola
+    // porque speak() para la voz en curso.
     let waitSaid = false;
     const waitTimer = setTimeout(async () => {
       if (!inCall || waitSaid) return;
       waitSaid = true;
       const phrase = WAIT_PHRASES[Math.floor(Math.random() * WAIT_PHRASES.length)];
-      try { await speak(phrase); } catch (e) {}
-    }, 2000);
-    await wakeServer();
+      try { await speak(phrase, { forcePhone: true }); } catch (e) {}
+    }, WAIT_DELAY_MS);
+    await wakeServer(2000);
     let data = {};
     let r = null;
     try {
-      r = await fetch('/api/isis-voice/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-        body: JSON.stringify({ message, confirm_token: pendingToken || undefined }),
-        cache: 'no-store',
-      });
+      r = await postChat(message);
       if (!r.ok) throw new Error('HTTP ' + r.status);
     } catch (e) {
-      // Un reintento solo, por si el servidor apenas estaba despertando.
+      // Un reintento solo, con espera corta: la frase de espera ya está
+      // sonando, así que no hace falta esperar 4 s en silencio.
       status('Estoy despertando el servidor, dame un momento…', 'thinking');
-      await new Promise((resolve) => setTimeout(resolve, 4000));
-      await wakeServer();
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await wakeServer(2000);
       try {
-        r = await fetch('/api/isis-voice/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-          body: JSON.stringify({ message, confirm_token: pendingToken || undefined }),
-          cache: 'no-store',
-        });
+        r = await postChat(message);
       } catch (e2) { r = null; }
     }
     clearTimeout(waitTimer);
@@ -407,7 +542,16 @@
     if (Date.now() - lastMidCheck < 75000) return;
     lastMidCheck = Date.now();
     try {
-      const r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
+      // Con tope: si el servidor está dormido, este chequeo no cuelga la
+      // llamada esperando; simplemente no hay aviso en este turno.
+      const alertCtl = new AbortController();
+      const alertTimer = setTimeout(() => alertCtl.abort(), 8000);
+      let r;
+      try {
+        r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store', signal: alertCtl.signal });
+      } finally {
+        clearTimeout(alertTimer);
+      }
       const d = await r.json().catch(() => ({}));
       if (!inCall || !Array.isArray(d.alerts)) return;
       const fresh = d.alerts.filter((a) => typeof a === 'string' && a.trim() && !saidAlerts.has(a.trim())).slice(0, 3);
@@ -547,6 +691,10 @@
     const micBtn = $('#isis-mic');
     if (micBtn) micBtn.disabled = true;
     status('Conectando…', '');
+    // Despertar del servidor (v9): se dispara al entrar, sin esperar, para
+    // que esté despierto cuando Santiago hable; antes cada mensaje pagaba
+    // el despertar completo antes de contestar.
+    wakeServer(8000);
     // Alertas proactivas (v4): hasta 3 frases cortas de lo que necesita
     // atención ahora (caja sin abrir, cuenta vieja, stock bajo,
     // autorización pendiente). Se piden solo aquí, una vez por entrada al
@@ -555,7 +703,16 @@
     let entryAlerts = [];
     let morningBrief = '';
     try {
-      const r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
+      // Con tope: si el servidor está dormido, la entrada no se queda
+      // colgada esperando el status; la llamada sigue con el saludo.
+      const entryCtl = new AbortController();
+      const entryTimer = setTimeout(() => entryCtl.abort(), 10000);
+      let r;
+      try {
+        r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store', signal: entryCtl.signal });
+      } finally {
+        clearTimeout(entryTimer);
+      }
       const d = await r.json().catch(() => ({}));
       const stateEl = $('#isis-voice-state');
       if (stateEl && !d.fableai_configured) stateEl.textContent = 'Sin clave de FableAI, solo entiendo órdenes directas en español. La clave se pone en el servidor.';
@@ -568,8 +725,9 @@
     entryAlerts.forEach((a) => saidAlerts.add(a.trim()));
     // Si la voz ya se descargó una vez, cargarla sola al entrar (desde la
     // caché del navegador, sin descargar de nuevo) para que el saludo y las
-    // respuestas ya suenen con la voz de Dora. Si tarda más de 25 s, seguir
-    // con la voz del teléfono para no dejarte esperando.
+    // respuestas ya suenen con la voz de Dora. Si tarda más de 10 s, seguir
+    // con la voz del teléfono para no dejarte esperando: la carga sigue en
+    // segundo plano y Dora se activa sola en cuanto esté lista.
     let kokoroReady = false;
     try {
       if (localStorage.getItem(KOKORO_FLAG) === '1') {
@@ -577,7 +735,7 @@
         if (stateEl) stateEl.textContent = 'Cargando la voz de Isis…';
         kokoroReady = !!(await Promise.race([
           loadKokoro(),
-          new Promise((resolve) => setTimeout(() => resolve(null), 25000)),
+          new Promise((resolve) => setTimeout(() => resolve(null), 10000)),
         ]));
       }
     } catch (e) {}
