@@ -1,6 +1,10 @@
 'use strict';
-/* Isis embebida en El Mitote: panel SOLO por voz.
-   No hay botones para operar el restaurante: todo se pide hablando.
+/* Isis embebida en El Mitote: panel SOLO por voz, en modo llamada.
+   Al entrar con el PIN la llamada arranca sola: Isis saluda y empieza a
+   escuchar sin tocar nada. Se habla de corrido, como por teléfono:
+   cuando Isis termina de responder, vuelve a escuchar sola; mientras
+   ella habla no escucha (para no oírse a sí misma). Colgar termina la
+   llamada y deja el botón "Llamar a Isis" para volver a empezar.
    Reconocimiento: Web Speech API (es-MX). Voz: Kokoro ef_dora, que se
    descarga solo cuando el usuario toca "Descargar voz de Isis" (~88 MB,
    una sola vez); si no esta descargada, habla con la voz del telefono. */
@@ -15,6 +19,17 @@
   let kokoroTTS = null;
   let kokoroPromise = null;
   let speaking = false;
+  let kokoroAudio = null; // el <audio> de la respuesta actual de Dora
+  // Modo llamada: inCall = la llamada está activa; muted = micrófono
+  // silenciado (la llamada sigue, Isis deja de oírte); busy = Isis está
+  // pensando o contestando, así que todavía no se debe escuchar.
+  let inCall = false;
+  let muted = false;
+  let busy = false;
+  let listenTimer = null;
+  let listenErrors = 0; // errores seguidos de reconocimiento (sin contar no-speech)
+  let callStart = 0;
+  let callTimerId = null;
   // La voz descargada vive solo en la memoria de la página: al recargar se
   // perdía y había que descargarla de nuevo. Por eso se guarda una marca en
   // localStorage y al abrir el panel se vuelve a cargar sola desde la caché
@@ -26,11 +41,51 @@
     if (el) el.textContent = text || '';
     const orb = $('#isis-orb');
     if (orb) orb.className = 'isis-orb' + (mode ? ' ' + mode : '');
+  }
+
+  // El botón grande es el control de la llamada (Llamar / Colgar) y el
+  // botón chico es el silencio. El estado de los botones lo manda inCall.
+  function updateCallUI() {
     const mic = $('#isis-mic');
     if (mic) {
-      mic.textContent = listening ? '■ Parar de escuchar' : '🎙 Hablar con Isis';
-      mic.classList.toggle('stop', listening);
+      mic.textContent = inCall ? 'Colgar' : 'Llamar a Isis';
+      mic.classList.toggle('stop', inCall);
+      // Sin reconocimiento de voz (p. ej. WebView de la app instalada) no
+      // se puede llamar: el botón queda deshabilitado.
+      mic.disabled = !SpeechRecognition;
     }
+    const mute = $('#isis-mute');
+    if (mute) {
+      mute.hidden = !inCall;
+      mute.textContent = muted ? 'Quitar silencio' : 'Silenciar micrófono';
+      mute.classList.toggle('muted', muted);
+    }
+  }
+
+  function fmtTime(ms) {
+    const s = Math.floor(ms / 1000);
+    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  function updateTimer() {
+    const el = $('#isis-call-timer');
+    if (el) el.textContent = 'En llamada con Isis · ' + fmtTime(Date.now() - callStart);
+  }
+
+  function startCallTimer() {
+    callStart = Date.now();
+    const el = $('#isis-call-timer');
+    if (el) el.hidden = false;
+    updateTimer();
+    clearInterval(callTimerId);
+    callTimerId = setInterval(updateTimer, 1000);
+  }
+
+  function stopCallTimer() {
+    clearInterval(callTimerId);
+    callTimerId = null;
+    const el = $('#isis-call-timer');
+    if (el) el.hidden = true;
   }
 
   function speak(text) {
@@ -44,6 +99,9 @@
 
   function stopSpeaking() {
     try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) {}
+    // La voz de Kokoro no usa speechSynthesis sino un <audio>: hay que
+    // pausarlo aparte o seguiría sonando al colgar.
+    try { if (kokoroAudio) { kokoroAudio.pause(); kokoroAudio = null; } } catch (e) {}
     speaking = false;
   }
 
@@ -56,11 +114,13 @@
         const voices = window.speechSynthesis.getVoices();
         const v = voices.find((x) => /es[-_]MX/i.test(x.lang)) || voices.find((x) => /^es/i.test(x.lang));
         if (v) u.voice = v;
-        u.onend = () => { speaking = false; status('Toca el micrófono y habla.', ''); resolve(); };
-        u.onerror = () => { speaking = false; status('Toca el micrófono y habla.', ''); resolve(); };
+        // Al terminar de hablar no se pone estado aquí: quien llamó a
+        // speak() decide qué sigue (en llamada, volver a escuchar).
+        u.onend = () => { speaking = false; resolve(); };
+        u.onerror = () => { speaking = false; resolve(); };
         window.speechSynthesis.speak(u);
-        setTimeout(() => { if (speaking) { speaking = false; status('Toca el micrófono y habla.', ''); resolve(); } }, 30000);
-      } catch (e) { speaking = false; status('Toca el micrófono y habla.', ''); resolve(); }
+        setTimeout(() => { if (speaking) { speaking = false; resolve(); } }, 30000);
+      } catch (e) { speaking = false; resolve(); }
     });
   }
 
@@ -83,7 +143,10 @@
         const btn = $('#isis-download-voice');
         if (btn) btn.textContent = 'Voz de Isis lista ✓';
         // Que se escuche el cambio de inmediato con la voz nueva.
-        if (opts && opts.announce) await speak('Hola, soy Isis. Ya tengo mi voz lista.');
+        if (opts && opts.announce) {
+          await speak('Hola, soy Isis. Ya tengo mi voz lista.');
+          if (inCall) maybeListen();
+        }
         return tts;
       } catch (e) {
         try { console.error('Kokoro:', e); } catch (_) {}
@@ -104,15 +167,17 @@
       const blob = audio.toBlob ? audio.toBlob() : new Blob([audio], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       const el = new Audio(url);
+      kokoroAudio = el;
       await el.play();
-      await new Promise((resolve) => { el.onended = resolve; el.onerror = resolve; });
+      await new Promise((resolve) => { el.onended = resolve; el.onerror = resolve; el.onpause = resolve; });
+      kokoroAudio = null;
       URL.revokeObjectURL(url);
     } catch (e) {
+      kokoroAudio = null;
       await speakPhone(text);
       return;
     }
     speaking = false;
-    status('Toca el micrófono y habla.', '');
   }
 
   // El servidor gratis de Render se duerme si nadie lo usa y tarda en
@@ -129,6 +194,7 @@
   }
 
   async function sendToIsis(message) {
+    busy = true;
     const heard = $('#isis-heard');
     if (heard) heard.textContent = 'Tú: ' + message;
     status('Isis pensando…', 'thinking');
@@ -163,7 +229,10 @@
         : 'No pude conectar con el restaurante, parece que el servidor está dormido o sin internet. Espera un momento e inténtalo de nuevo.';
       const rep = $('#isis-reply');
       if (rep) rep.textContent = 'Isis: ' + reply;
-      await speak(reply);
+      // Si el usuario colgó mientras llegaba la respuesta, ya no se habla.
+      if (inCall) await speak(reply);
+      busy = false;
+      maybeListen();
       return;
     }
     try {
@@ -175,7 +244,18 @@
     const reply = data.reply || 'Listo.';
     const rep = $('#isis-reply');
     if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di “sí, confirma” o “no”.)' : '');
-    await speak(reply);
+    if (inCall) await speak(reply);
+    busy = false;
+    maybeListen();
+  }
+
+  // Vuelve a escuchar solo si la llamada sigue activa, el micrófono no
+  // está silenciado y Isis no está pensando ni hablando.
+  function maybeListen() {
+    if (!inCall || muted || listening || speaking || busy) return;
+    if (!SpeechRecognition) return;
+    clearTimeout(listenTimer);
+    listenTimer = setTimeout(startListening, 700);
   }
 
   function startListening() {
@@ -192,13 +272,39 @@
       recognizer.onresult = (e) => {
         const text = e.results[0][0].transcript || '';
         listening = false;
+        listenErrors = 0;
         if (text.trim()) sendToIsis(text.trim());
-        else status('No te escuché. Toca el micrófono y habla.', '');
+        else maybeListen();
       };
-      recognizer.onerror = () => { listening = false; status('No te escuché. Toca el micrófono y habla.', ''); };
-      recognizer.onend = () => { if (listening) { listening = false; status('Toca el micrófono y habla.', ''); } };
+      recognizer.onerror = (e) => {
+        listening = false;
+        const err = (e && e.error) || '';
+        if (err === 'not-allowed' || err === 'service-not-allowed') {
+          // Sin permiso de micrófono no tiene caso reintentar en bucle.
+          endCall('No pude usar el micrófono. Revisa el permiso y vuelve a llamar.');
+          return;
+        }
+        if (err && err !== 'no-speech') {
+          listenErrors += 1;
+          if (listenErrors >= 5) {
+            status('El reconocimiento de voz falló varias veces. Cuelga y vuelve a llamar.', '');
+            return;
+          }
+        }
+        // 'no-speech' (silencio) y demás errores: volver a escuchar en
+        // silencio, sin spamear mensajes de error.
+        maybeListen();
+      };
+      recognizer.onend = () => {
+        // El reconocimiento se corta solo por silencio: si la llamada
+        // sigue, volver a escuchar. Si Isis está contestando (busy) o
+        // hablando, no: sendToIsis vuelve a escuchar al terminar.
+        listening = false;
+        maybeListen();
+      };
       recognizer.start();
       listening = true;
+      listenErrors = 0; // arrancó bien: los errores de antes no cuentan
       status('Escuchando… habla ahora.', 'listening');
     } catch (e) {
       listening = false;
@@ -208,15 +314,57 @@
 
   function stopListening() {
     listening = false;
+    clearTimeout(listenTimer);
     try { recognizer && recognizer.stop(); } catch (e) {}
-    status('Toca el micrófono y habla.', '');
+  }
+
+  // La llamada arranca sola al entrar: temporizador desde el inicio,
+  // saludo de Isis y, al terminar de hablarlo, a escuchar.
+  function startCall() {
+    if (!SpeechRecognition) {
+      status('Este navegador no tiene reconocimiento de voz. Usa Chrome en Android.', '');
+      return;
+    }
+    inCall = true;
+    muted = false;
+    busy = false;
+    updateCallUI();
+    startCallTimer();
+    maybeListen();
+  }
+
+  function endCall(message) {
+    inCall = false;
+    muted = false;
+    busy = false;
+    stopListening();
+    stopSpeaking();
+    stopCallTimer();
+    updateCallUI();
+    status(message || 'Llamada terminada. Toca "Llamar a Isis" para volver a empezar.', '');
+  }
+
+  function toggleMute() {
+    if (!inCall) return;
+    muted = !muted;
+    if (muted) {
+      stopListening();
+      status('Micrófono silenciado. Isis no te escucha.', '');
+    } else {
+      maybeListen();
+    }
+    updateCallUI();
   }
 
   async function show(state) {
     token = (state && state.token) || localStorage.getItem('mitote-token') || '';
     const panel = $('#isis-panel');
     if (panel) panel.hidden = false;
-    status('Toca el micrófono y habla.', '');
+    // El botón de llamar queda bloqueado hasta que el saludo empiece: si
+    // no, se podría llamar antes de tiempo e Isis se escucharía a sí misma.
+    const micBtn = $('#isis-mic');
+    if (micBtn) micBtn.disabled = true;
+    status('Conectando con Isis…', '');
     try {
       const r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
       const d = await r.json().catch(() => ({}));
@@ -238,15 +386,30 @@
         ]));
       }
     } catch (e) {}
+    // Sin reconocimiento de voz no se puede llamar: se avisa, el botón de
+    // llamar queda deshabilitado y no arranca el temporizador.
+    if (!SpeechRecognition) {
+      updateCallUI();
+      status('Este navegador no tiene reconocimiento de voz. Usa Chrome en Android.', '');
+      return;
+    }
     const greet = 'Hola, soy Isis, tu asistente de El Mitote. Te ayudo con todo lo del restaurante: puedo decirte qué mesas están libres, cuánto debe una mesa, cuánto queda en inventario, cómo va la caja, o hacer el corte. Dime, ¿qué necesitas?';
     const rep = $('#isis-reply');
     if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (Voz de Dora aún no cargada: toca "Descargar voz de Isis".)');
-    speak(greet);
+    inCall = true;
+    muted = false;
+    busy = false;
+    updateCallUI();
+    startCallTimer();
+    await speak(greet);
+    maybeListen();
   }
 
   function exit() {
+    inCall = false;
     stopListening();
     stopSpeaking();
+    stopCallTimer();
     localStorage.removeItem('mitote-token');
     sessionStorage.removeItem('mitote-token');
     location.reload();
@@ -254,7 +417,9 @@
 
   document.addEventListener('DOMContentLoaded', () => {
     const mic = $('#isis-mic');
-    if (mic) mic.addEventListener('click', () => (listening ? stopListening() : startListening()));
+    if (mic) mic.addEventListener('click', () => (inCall ? endCall() : startCall()));
+    const mute = $('#isis-mute');
+    if (mute) mute.addEventListener('click', toggleMute);
     const dl = $('#isis-download-voice');
     if (dl) dl.addEventListener('click', () => loadKokoro({ announce: true }));
     const ex = $('#isis-exit');
@@ -268,5 +433,5 @@
     });
   });
 
-  window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit };
+  window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit, startCall, endCall, toggleMute };
 })();
