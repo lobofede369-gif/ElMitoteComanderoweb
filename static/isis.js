@@ -112,7 +112,7 @@
     if (!text) return Promise.resolve();
     stopSpeaking();
     speaking = true;
-    status('Isis hablando…', 'speaking');
+    status('Hablando…', 'speaking');
     if (kokoroTTS) return speakKokoro(text);
     return speakPhone(text);
   }
@@ -174,7 +174,7 @@
         kokoroState = 'idle'; // permite reintentar tocando de nuevo
         kokoroPromise = null;
         try { localStorage.removeItem(KOKORO_FLAG); } catch (_) {}
-        if (stateEl) stateEl.textContent = 'No se pudo descargar la voz; toca de nuevo para reintentar. Mientras tanto, Isis hablará con la voz del teléfono.';
+        if (stateEl) stateEl.textContent = 'No se pudo descargar la voz, toca de nuevo para reintentarlo. Mientras, hablo con la voz del teléfono.';
         return null;
       }
     })();
@@ -217,7 +217,7 @@
     busy = true;
     const heard = $('#isis-heard');
     if (heard) heard.textContent = 'Tú: ' + message;
-    status('Isis pensando…', 'thinking');
+    status('Pensando…', 'thinking');
     await wakeServer();
     let data = {};
     let r = null;
@@ -231,7 +231,7 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
     } catch (e) {
       // Un reintento solo, por si el servidor apenas estaba despertando.
-      status('El servidor se está despertando, reintentando…', 'thinking');
+      status('Estoy despertando el servidor, dame un momento…', 'thinking');
       await new Promise((resolve) => setTimeout(resolve, 4000));
       await wakeServer();
       try {
@@ -245,8 +245,8 @@
     }
     if (!r || !r.ok) {
       const reply = (r && (r.status === 401 || r.status === 403))
-        ? 'Tu sesión expiró. Sal y vuelve a entrar con el PIN de Isis.'
-        : 'No pude conectar con el restaurante, parece que el servidor está dormido o sin internet. Espera un momento e inténtalo de nuevo.';
+        ? 'Tu sesión se venció. Sal y vuelve a entrar con el PIN de Isis.'
+        : 'No me pude conectar al restaurante, parece que el servidor está dormido o no hay internet. Espérame tantito e inténtalo de nuevo.';
       const rep = $('#isis-reply');
       if (rep) rep.textContent = 'Isis: ' + reply;
       // Si el usuario colgó mientras llegaba la respuesta, ya no se habla.
@@ -263,7 +263,7 @@
     pendingToken = data.needs_confirmation ? data.confirm_token : null;
     const reply = data.reply || 'Listo.';
     const rep = $('#isis-reply');
-    if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di “sí, confirma” o “no”.)' : '');
+    if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di "sí" para confirmar o "no" para cancelar.)' : '');
     if (inCall) await speak(reply);
     busy = false;
     maybeListen();
@@ -301,13 +301,13 @@
         const err = (e && e.error) || '';
         if (err === 'not-allowed' || err === 'service-not-allowed') {
           // Sin permiso de micrófono no tiene caso reintentar en bucle.
-          endCall('No pude usar el micrófono. Revisa el permiso y vuelve a llamar.');
+          endCall('No pude usar el micrófono. Revisa el permiso y vuelve a llamarme.');
           return;
         }
         if (err && err !== 'no-speech') {
           listenErrors += 1;
           if (listenErrors >= 5) {
-            status('El reconocimiento de voz falló varias veces. Cuelga y vuelve a llamar.', '');
+            status('El micrófono me falló varias veces. Mejor cuelga y vuelve a llamar.', '');
             return;
           }
         }
@@ -325,10 +325,10 @@
       recognizer.start();
       listening = true;
       listenErrors = 0; // arrancó bien: los errores de antes no cuentan
-      status('Escuchando… habla ahora.', 'listening');
+      status('Te escucho, dime.', 'listening');
     } catch (e) {
       listening = false;
-      status('No pude abrir el micrófono.', '');
+      status('No pude abrir el micrófono. Revisa el permiso.', '');
     }
   }
 
@@ -371,7 +371,7 @@
         cache: 'no-store',
       }).catch(() => {});
     } catch (e) {}
-    status(message || 'Llamada terminada. Toca "Llamar a Isis" para volver a empezar.', '');
+    status(message || 'Llamada terminada. Toca "Llamar a Isis" si quieres volver a empezar.', '');
   }
 
   function toggleMute() {
@@ -379,7 +379,7 @@
     muted = !muted;
     if (muted) {
       stopListening();
-      status('Micrófono silenciado. Isis no te escucha.', '');
+      status('Micrófono en silencio, no te escucho.', '');
     } else {
       maybeListen();
     }
@@ -394,7 +394,7 @@
     // no, se podría llamar antes de tiempo e Isis se escucharía a sí misma.
     const micBtn = $('#isis-mic');
     if (micBtn) micBtn.disabled = true;
-    status('Conectando con Isis…', '');
+    status('Conectando…', '');
     // Alertas proactivas (v4): hasta 3 frases cortas de lo que necesita
     // atención ahora (caja sin abrir, cuenta vieja, stock bajo,
     // autorización pendiente). Se piden solo aquí, una vez por entrada al
@@ -405,7 +405,7 @@
       const r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
       const d = await r.json().catch(() => ({}));
       const stateEl = $('#isis-voice-state');
-      if (stateEl && !d.fableai_configured) stateEl.textContent = 'Sin clave de FableAI: Isis entiende órdenes directas en español. El propietario la configura en el servidor.';
+      if (stateEl && !d.fableai_configured) stateEl.textContent = 'Sin clave de FableAI, solo entiendo órdenes directas en español. La clave se pone en el servidor.';
       if (Array.isArray(d.alerts)) entryAlerts = d.alerts.filter((a) => typeof a === 'string' && a.trim()).slice(0, 3);
     } catch (e) {}
     // Si la voz ya se descargó una vez, cargarla sola al entrar (desde la
@@ -433,7 +433,7 @@
     // Saludo corto y distinto cada vez (v5), según la hora del teléfono.
     const greet = isisGreeting(new Date().getHours());
     const rep = $('#isis-reply');
-    if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (Voz de Dora aún no cargada: toca "Descargar voz de Isis".)');
+    if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (La voz de Dora todavía no está lista, toca "Descargar voz de Isis".)');
     inCall = true;
     muted = false;
     busy = false;
@@ -445,7 +445,7 @@
     // Solo si la llamada sigue activa (no colgó durante el saludo).
     if (entryAlerts.length && inCall) {
       const alertsText = (entryAlerts.length > 1 ? 'Ojo: ' : '') + entryAlerts.join(' ');
-      if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (Voz de Dora aún no cargada: toca "Descargar voz de Isis".)') + ' ' + alertsText;
+      if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (La voz de Dora todavía no está lista, toca "Descargar voz de Isis".)') + ' ' + alertsText;
       await speak(alertsText);
     }
     maybeListen();
