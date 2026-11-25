@@ -8,6 +8,10 @@
    Al entrar, Isis avisa por voz lo que necesita atención ahora
    (alertas del servidor, una sola vez por entrada) y al colgar le pide
    al servidor que borre el historial de la llamada.
+   Realismo (v7): timbre de teléfono al entrar; si Santiago habla mientras
+   Isis habla, ella se calla y lo escucha (interrupción); si la respuesta
+   tarda, Isis dice una frase corta de espera; y cada ~75 segundos, entre
+   turnos, avisa sola si apareció algo nuevo que necesita atención.
    Reconocimiento: Web Speech API (es-MX). Voz: Kokoro ef_dora, que se
    descarga solo cuando el usuario toca "Descargar voz de Isis" (~88 MB,
    una sola vez); si no esta descargada, habla con la voz del telefono. */
@@ -33,6 +37,17 @@
   let listenErrors = 0; // errores seguidos de reconocimiento (sin contar no-speech)
   let callStart = 0;
   let callTimerId = null;
+  // Realismo (v7): interrupción, avisos a media llamada y timbre.
+  let interruptRecognizer = null; // escucha de interrupción mientras Isis habla
+  let interruptOff = false; // true al detenerla a propósito (no rearmar)
+  let interruptRestarts = 0; // rearmes por respuesta hablada (tope anti-bucle)
+  let speakStartedAt = 0;
+  let speakGen = 0; // generación del speak en curso: el finally de un speak
+  // viejo (p. ej. la frase de espera cortada por la respuesta real) no
+  // debe apagar la escucha de interrupción del speak nuevo.
+  const saidAlerts = new Set(); // alertas ya dichas (entrada + media llamada)
+  let lastMidCheck = 0; // último chequeo de avisos a media llamada
+  const WAIT_PHRASES = ['Dame un segundo, estoy revisando.', 'A ver, déjame checar eso.'];
   // La voz descargada vive solo en la memoria de la página: al recargar se
   // perdía y había que descargarla de nuevo. Por eso se guarda una marca en
   // localStorage y al abrir el panel se vuelve a cargar sola desde la caché
@@ -108,16 +123,26 @@
     if (el) el.hidden = true;
   }
 
-  function speak(text) {
-    if (!text) return Promise.resolve();
+  async function speak(text) {
+    if (!text) return;
     stopSpeaking();
+    const gen = ++speakGen;
     speaking = true;
+    speakStartedAt = Date.now();
+    interruptRestarts = 0;
     status('Hablando…', 'speaking');
-    if (kokoroTTS) return speakKokoro(text);
-    return speakPhone(text);
+    startInterruptListener();
+    try {
+      if (kokoroTTS) await speakKokoro(text);
+      else await speakPhone(text);
+    } finally {
+      // Solo apaga la escucha si este sigue siendo el speak en curso.
+      if (gen === speakGen) stopInterruptListener();
+    }
   }
 
   function stopSpeaking() {
+    stopInterruptListener();
     try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) {}
     // La voz de Kokoro no usa speechSynthesis sino un <audio>: hay que
     // pausarlo aparte o seguiría sonando al colgar.
@@ -125,7 +150,96 @@
     speaking = false;
   }
 
+  // Interrupción (v7): si Santiago habla mientras Isis habla, ella se calla
+  // y lo escucha. Un reconocedor aparte escucha solo interrupciones mientras
+  // suena la voz; el eco del arranque se ignora (primer segundo) y solo
+  // valen resultados finales, no parciales. El botón de micrófono no se usa
+  // para esto porque en llamada ese botón es "Colgar".
+  function startInterruptListener() {
+    if (!SpeechRecognition || !inCall || muted || interruptRecognizer) return;
+    interruptOff = false;
+    try {
+      const r = new SpeechRecognition();
+      r.lang = 'es-MX';
+      r.interimResults = true;
+      r.continuous = true;
+      r.maxAlternatives = 1;
+      r.onresult = (e) => {
+        if (!speaking || !inCall || muted) return;
+        if (Date.now() - speakStartedAt < 1000) return;
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const res = e.results[i];
+          if (res.isFinal && res[0] && res[0].transcript && res[0].transcript.trim()) {
+            handleInterrupt(res[0].transcript.trim());
+            return;
+          }
+        }
+      };
+      r.onerror = () => {};
+      r.onend = () => {
+        interruptRecognizer = null;
+        // Se cortó solo (silencio): si Isis sigue hablando, rearmar en
+        // silencio, con tope para no girar en bucle si el servicio falla.
+        if (!interruptOff && speaking && inCall && !muted && interruptRestarts < 5) {
+          interruptRestarts += 1;
+          startInterruptListener();
+        }
+      };
+      r.start();
+      interruptRecognizer = r;
+    } catch (e) { interruptRecognizer = null; }
+  }
+
+  function stopInterruptListener() {
+    interruptOff = true;
+    try { if (interruptRecognizer) interruptRecognizer.abort(); } catch (e) {}
+    interruptRecognizer = null;
+  }
+
+  function handleInterrupt(text) {
+    if (!inCall || !speaking) return;
+    stopInterruptListener();
+    stopListening();
+    stopSpeaking();
+    status('Te escucho, dime.', 'listening');
+    sendToIsis(text);
+  }
+
+  // Timbre de llamada (v7): dos tonos de teléfono generados con WebAudio,
+  // sin archivos externos. Suena solo al entrar al panel, antes del saludo
+  // (no al volver a llamar con "Llamar a Isis"). Si el audio no está
+  // permitido, no rompe nada: la llamada sigue con el saludo normal.
+  async function playRingtone() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const ctx = new Ctx();
+      if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
+      const ring = (t0, dur) => {
+        const o1 = ctx.createOscillator();
+        const o2 = ctx.createOscillator();
+        const g = ctx.createGain();
+        o1.frequency.value = 440;
+        o2.frequency.value = 480;
+        o1.connect(g); o2.connect(g); g.connect(ctx.destination);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.12, t0 + 0.05);
+        g.gain.setValueAtTime(0.12, t0 + dur - 0.05);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        o1.start(t0); o2.start(t0); o1.stop(t0 + dur); o2.stop(t0 + dur);
+      };
+      const t = ctx.currentTime + 0.05;
+      ring(t, 0.4);
+      ring(t + 0.6, 0.4);
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      try { await ctx.close(); } catch (e) {}
+    } catch (e) {}
+  }
+
   function speakPhone(text) {
+    // La generación del speak en curso: el seguro de 30 s de un speak viejo
+    // no debe apagar el `speaking` de un speak nuevo en una llamada larga.
+    const gen = speakGen;
     return new Promise((resolve) => {
       try {
         const u = new SpeechSynthesisUtterance(text);
@@ -139,7 +253,7 @@
         u.onend = () => { speaking = false; resolve(); };
         u.onerror = () => { speaking = false; resolve(); };
         window.speechSynthesis.speak(u);
-        setTimeout(() => { if (speaking) { speaking = false; resolve(); } }, 30000);
+        setTimeout(() => { if (speaking && gen === speakGen) { speaking = false; resolve(); } }, 30000);
       } catch (e) { speaking = false; resolve(); }
     });
   }
@@ -218,6 +332,16 @@
     const heard = $('#isis-heard');
     if (heard) heard.textContent = 'Tú: ' + message;
     status('Pensando…', 'thinking');
+    // Duda natural (v7): si la respuesta tarda más de 2 segundos, Isis dice
+    // una sola frase corta de espera; cuando llega la respuesta real, la
+    // frase se corta sola porque speak() para la voz en curso.
+    let waitSaid = false;
+    const waitTimer = setTimeout(async () => {
+      if (!inCall || waitSaid) return;
+      waitSaid = true;
+      const phrase = WAIT_PHRASES[Math.floor(Math.random() * WAIT_PHRASES.length)];
+      try { await speak(phrase); } catch (e) {}
+    }, 2000);
     await wakeServer();
     let data = {};
     let r = null;
@@ -243,6 +367,7 @@
         });
       } catch (e2) { r = null; }
     }
+    clearTimeout(waitTimer);
     if (!r || !r.ok) {
       const reply = (r && (r.status === 401 || r.status === 403))
         ? 'Tu sesión se venció. Sal y vuelve a entrar con el PIN de Isis.'
@@ -266,7 +391,30 @@
     if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di "sí" para confirmar o "no" para cancelar.)' : '');
     if (inCall) await speak(reply);
     busy = false;
+    await maybeMidCallAlert();
     maybeListen();
+  }
+
+  // Avisos a media llamada (v7): cada ~75 segundos, entre turnos, Isis
+  // revisa si apareció algo nuevo que necesita atención y lo dice en corto.
+  // Nunca interrumpe a Santiago a media frase (solo corre después de que
+  // Isis termina de hablar) y nunca repite una alerta ya dicha.
+  async function maybeMidCallAlert() {
+    if (!inCall || muted) return;
+    if (Date.now() - lastMidCheck < 75000) return;
+    lastMidCheck = Date.now();
+    try {
+      const r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
+      const d = await r.json().catch(() => ({}));
+      if (!inCall || !Array.isArray(d.alerts)) return;
+      const fresh = d.alerts.filter((a) => typeof a === 'string' && a.trim() && !saidAlerts.has(a.trim())).slice(0, 3);
+      if (!fresh.length) return;
+      fresh.forEach((a) => saidAlerts.add(a.trim()));
+      const text = 'Oye, Santiago, te aviso que ' + fresh.join(' ');
+      const rep = $('#isis-reply');
+      if (rep) rep.textContent = 'Isis: ' + text;
+      await speak(text);
+    } catch (e) {}
   }
 
   // Vuelve a escuchar solo si la llamada sigue activa, el micrófono no
@@ -350,6 +498,7 @@
     busy = false;
     updateCallUI();
     startCallTimer();
+    lastMidCheck = Date.now();
     maybeListen();
   }
 
@@ -408,6 +557,9 @@
       if (stateEl && !d.fableai_configured) stateEl.textContent = 'Sin clave de FableAI, solo entiendo órdenes directas en español. La clave se pone en el servidor.';
       if (Array.isArray(d.alerts)) entryAlerts = d.alerts.filter((a) => typeof a === 'string' && a.trim()).slice(0, 3);
     } catch (e) {}
+    // Las alertas de entrada ya quedan marcadas como dichas, para que los
+    // avisos de media llamada no las repitan.
+    entryAlerts.forEach((a) => saidAlerts.add(a.trim()));
     // Si la voz ya se descargó una vez, cargarla sola al entrar (desde la
     // caché del navegador, sin descargar de nuevo) para que el saludo y las
     // respuestas ya suenen con la voz de Dora. Si tarda más de 25 s, seguir
@@ -430,6 +582,9 @@
       status('Este navegador no tiene reconocimiento de voz. Usa Chrome en Android.', '');
       return;
     }
+    // Timbre corto de teléfono antes del saludo (v7), como cuando te
+    // contestan. Solo al entrar; al volver a llamar no vuelve a sonar.
+    await playRingtone();
     // Saludo corto y distinto cada vez (v5), según la hora del teléfono.
     const greet = isisGreeting(new Date().getHours());
     const rep = $('#isis-reply');
@@ -439,6 +594,7 @@
     busy = false;
     updateCallUI();
     startCallTimer();
+    lastMidCheck = Date.now();
     await speak(greet);
     // Después del saludo, Isis avisa lo que necesita atención ahora, en
     // corto (una frase por alerta, "Ojo:" al inicio si hay más de una).
