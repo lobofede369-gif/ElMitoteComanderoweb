@@ -354,6 +354,131 @@
     return out.filter(Boolean);
   }
 
+  // Números a palabras en la voz (v10.4): espejo en JS del normalizador
+  // del servidor (_isis_tts_text en app.py). Dora y la voz del teléfono
+  // leen el texto CRUDO de la respuesta — sin esto, Dora decía los números
+  // dígito por dígito ("1 0 0 pesos") porque nunca pasaban por el servidor.
+  // Se aplica SOLO a Dora y a la voz del teléfono (generateKokoroPart y
+  // speakPhonePart): la ruta de OpenAI ya se normaliza en el servidor y no
+  // debe normalizarse dos veces. El texto que se muestra en pantalla NO
+  // cambia: solo cambia la copia que se habla. Los códigos (6+ dígitos
+  // seguidos que no son dinero) se dejan en dígitos: Isis nunca dice PINs
+  // ni claves. Port fiel de la lógica de Python, no un diseño nuevo.
+  const ISIS_UNITS_ES = ['cero', 'uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete',
+    'ocho', 'nueve', 'diez', 'once', 'doce', 'trece', 'catorce', 'quince',
+    'dieciséis', 'diecisiete', 'dieciocho', 'diecinueve'];
+  const ISIS_VEINTI_ES = { 21: 'veintiuno', 22: 'veintidós', 23: 'veintitrés', 24: 'veinticuatro',
+    25: 'veinticinco', 26: 'veintiséis', 27: 'veintisiete', 28: 'veintiocho', 29: 'veintinueve' };
+  const ISIS_TENS_ES = { 30: 'treinta', 40: 'cuarenta', 50: 'cincuenta', 60: 'sesenta',
+    70: 'setenta', 80: 'ochenta', 90: 'noventa' };
+  const ISIS_HUNDREDS_ES = { 100: 'ciento', 200: 'doscientos', 300: 'trescientos', 400: 'cuatrocientos',
+    500: 'quinientos', 600: 'seiscientos', 700: 'setecientos', 800: 'ochocientos', 900: 'novecientos' };
+
+  function isisNumPalabras(n) {
+    n = parseInt(n, 10);
+    if (Number.isNaN(n) || n < 0 || n > 999999999) return null;
+    if (n < 20) return ISIS_UNITS_ES[n];
+    if (n === 20) return 'veinte';
+    if (n < 30) return ISIS_VEINTI_ES[n];
+    if (n < 100) {
+      const d = Math.floor(n / 10), r = n % 10;
+      const w = ISIS_TENS_ES[d * 10];
+      return r === 0 ? w : w + ' y ' + ISIS_UNITS_ES[r];
+    }
+    if (n < 1000) {
+      if (n === 100) return 'cien';
+      const d = Math.floor(n / 100), r = n % 100;
+      const w = ISIS_HUNDREDS_ES[d * 100];
+      return r === 0 ? w : w + ' ' + isisNumPalabras(r);
+    }
+    if (n < 1000000) {
+      const d = Math.floor(n / 1000), r = n % 1000;
+      const w = d === 1 ? 'mil' : isisNumPalabras(d) + ' mil';
+      return r === 0 ? w : w + ' ' + isisNumPalabras(r);
+    }
+    const d = Math.floor(n / 1000000), r = n % 1000000;
+    const w = d === 1 ? 'un millón' : isisNumPalabras(d) + ' millones';
+    return r === 0 ? w : w + ' ' + isisNumPalabras(r);
+  }
+
+  function isisNumPalabrasM(n) {
+    // Como isisNumPalabras, pero apocopado antes de un sustantivo masculino
+    // ('uno' -> 'un'): 1 -> 'un', 21 -> 'veintiún', 31 -> 'treinta y un'.
+    const w = isisNumPalabras(n);
+    if (w === null) return null;
+    if (w === 'veintiuno') return 'veintiún';
+    if (w.endsWith('uno')) return w.slice(0, -3) + 'un';
+    return w;
+  }
+
+  function isisTtsText(text) {
+    let t = String(text || '').replace(/\s+/g, ' ').trim();
+    t = t.replace(/\$(\d+)/g, '$1 pesos'); // "$40" -> "40 pesos"
+    t = t.replace(/&/g, ' y ').replace(/\+/g, ' más ').replace(/°/g, ' grados ');
+    t = t.replace(/#/g, ' número ').replace(/@/g, ' arroba ');
+    t = t.replace(/\.\.\./g, '…');
+
+    t = t.replace(/(\d[\d,]*)(?:\.(\d{1,2}))?\s*pesos?\b/g, (m, g1, g2) => {
+      const entero = parseInt(g1.replace(/,/g, ''), 10);
+      const c = g2 ? parseInt(g2.padEnd(2, '0'), 10) : 0;
+      const w = isisNumPalabrasM(entero);
+      if (w === null) return m;
+      let noun;
+      if (entero >= 1000000) noun = 'de pesos';
+      else if (entero === 1 && c === 0) noun = 'peso';
+      else noun = 'pesos';
+      if (c === 0) return w + ' ' + noun;
+      const cw = isisNumPalabrasM(c);
+      if (cw === null) return m;
+      const cnoun = c === 1 ? 'centavo' : 'centavos';
+      return w + ' ' + noun + ' con ' + cw + ' ' + cnoun;
+    });
+
+    t = t.replace(/(\d+(?:\.\d+)?)\s*%/g, (m, num) => {
+      if (num.indexOf('.') !== -1) {
+        const parts = num.split('.', 2);
+        const iw = isisNumPalabras(parseInt(parts[0], 10));
+        if (iw === null) return m;
+        const fw = parts[1].split('').map((d) => ISIS_UNITS_ES[parseInt(d, 10)]).join(' ');
+        return iw + ' punto ' + fw + ' por ciento';
+      }
+      const w = isisNumPalabras(parseInt(num, 10));
+      return w === null ? m : w + ' por ciento';
+    });
+
+    t = t.replace(/\b(\d{1,2}):(\d{2})\b/g, (m, h, mm) => {
+      const hh = parseInt(h, 10), m2 = parseInt(mm, 10);
+      if (hh > 23 || m2 > 59) return m;
+      const hw = isisNumPalabras(hh);
+      if (m2 === 0) return hw + ' en punto';
+      if (m2 === 15) return hw + ' y cuarto';
+      if (m2 === 30) return hw + ' y media';
+      if (m2 < 30) return hw + ' y ' + isisNumPalabras(m2);
+      return hw + ' ' + isisNumPalabras(m2);
+    });
+
+    t = t.replace(/(\d[\d,]*(?:\.\d+)?)/g, (m, raw) => {
+      const digits = raw.replace(/,/g, '');
+      if (digits.indexOf('.') !== -1) {
+        const parts = digits.split('.', 2);
+        const iw = parts[0] ? isisNumPalabras(parseInt(parts[0], 10)) : null;
+        if (iw === null) return m;
+        const fw = parts[1].split('').map((d) => ISIS_UNITS_ES[parseInt(d, 10)]).join(' ');
+        return iw + ' punto ' + fw;
+      }
+      if (digits.length >= 6) return m; // código/ID: se deja en dígitos
+      const w = isisNumPalabras(parseInt(digits, 10));
+      return w === null ? m : w;
+    });
+
+    // Espacio tras el punto si falta ("Hola.Santiago" -> "Hola. Santiago");
+    // el punto entre dígitos ("1.2", "40.50") ya no existe aquí: se volvió palabras.
+    t = t.replace(/([.!?…])(?=[A-Za-zÁÉÍÓÚÜÑáéíóúüñ])/g, '$1 ');
+    t = t.replace(/\s+/g, ' ').trim();
+    if (t && !/[.?!…]$/.test(t)) t += '.';
+    return t;
+  }
+
   // Interrupción (v7): si Santiago habla mientras Isis habla, ella se calla
   // y lo escucha. Un reconocedor aparte escucha solo interrupciones mientras
   // suena la voz; el eco del arranque se ignora (primer segundo) y solo
@@ -448,7 +573,9 @@
       let done = false;
       const finish = () => { if (!done) { done = true; resolve(); } };
       try {
-        const u = new SpeechSynthesisUtterance(text);
+        // Solo la copia para la voz pasa por el normalizador (v10.4):
+        // la voz del teléfono leería "1 0 0" dígito por dígito si no.
+        const u = new SpeechSynthesisUtterance(isisTtsText(text));
         u.lang = 'es-MX';
         u.rate = 1;
         const voices = window.speechSynthesis.getVoices();
@@ -526,7 +653,9 @@
       // Dora habla un poco más pausada, menos a robot. No hay control de
       // tono ni de emoción en kokoro-js: la naturalidad sale de la velocidad
       // y de las pausas entre frases, no de parámetros que no existen.
-      const audio = await kokoroTTS.generate(text, { voice: 'ef_dora', speed: KOKORO_SPEED });
+      // Solo la copia para la voz pasa por el normalizador (v10.4):
+      // Dora leería "1 0 0" dígito por dígito si no.
+      const audio = await kokoroTTS.generate(isisTtsText(text), { voice: 'ef_dora', speed: KOKORO_SPEED });
       if (gen !== speakGen || !speaking) return null;
       const blob = audio.toBlob ? audio.toBlob() : new Blob([audio], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
@@ -1250,7 +1379,7 @@
   // llama nunca al endpoint de OpenAI.
   window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit, startCall, endCall, toggleMute,
     _test: { resolveVoiceEngine, getVoiceEngine: () => voiceEngine, setVoiceEngine,
-      resolveOpenAIVoice, getOpenAIVoice, setOpenAIVoice, playVoiceSample,
+      resolveOpenAIVoice, getOpenAIVoice, setOpenAIVoice, playVoiceSample, isisTtsText,
       requestOpenAIPart, makeOpenAIVoicePlayer: makeOpenAIPlayer,
       setOpenaiAvailable: (v) => { openaiTTS = !!v; applyVoiceEngine(); }, speak } };
 })();
