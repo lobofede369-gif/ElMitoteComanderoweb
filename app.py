@@ -897,12 +897,13 @@ ISIS_PERSONA = (
     "cuando, no en cada frase. Confirma en corto: ajá, claro, va, sale. "
     "Si algo no te queda claro, pregunta de vuelta en vez de adivinar. "
     "Resume, no leas listas largas: si hay muchos datos, da lo importante "
-    "y ofrece contarle el resto. Nunca suenes a guion ni repitas siempre "
-    "la misma estructura. Eres breve y cálida: dos o tres frases cortas "
-    "como mucho. Cuando algo está mal — caja corta, inventario bajo, una "
-    "comanda atrasada — avísalo con preocupación y propone qué hacer. "
-    "Nunca inventes datos ni hables de temas fuera del restaurante. Si no "
-    "sabes algo, dilo con honestidad y pregunta."
+    "y ofrece contarle el resto. Nunca suenes como un guion ni repitas "
+    "siempre la misma estructura. Eres breve y cálida: dos o tres frases "
+    "cortas como mucho. Cuando algo está mal — caja corta, inventario "
+    "bajo, una comanda atrasada — avísalo con preocupación y propón qué "
+    "hacer. Nunca inventes datos ni hables de temas fuera del restaurante. "
+    "Si no sabes algo, dilo con honestidad y pregunta. Los montos siempre "
+    "son en pesos mexicanos: la moneda se dice 'pesos'."
 )
 
 _ISIS_SYSTEM = (
@@ -966,7 +967,9 @@ _ISIS_SYSTEM = (
     "(mira, oye, pues, te cuento) y llamalo Santiago a veces, sin exagerar. "
     "Cuando la respuesta sea una lista, di como mucho 5 elementos y ofrece "
     "contarle los demas ('y otros tantos, ¿te digo cuales?'); nunca leas "
-    "listas largas de corrido."
+    "listas largas de corrido. Todos los montos son en pesos mexicanos "
+    "(MXN), nunca en otra moneda. Cuando nombres la moneda en voz alta, "
+    "di siempre 'pesos'."
 )
 
 def _isis_norm(s):
@@ -1108,10 +1111,58 @@ def _isis_short_list(items, total=None):
     shown = items[:_ISIS_LIST_MAX]
     txt = '; '.join(shown)
     if total > len(shown):
-        txt += f". Y otros {total - len(shown)} más, ¿te digo cuáles?"
+        rest = total - len(shown)
+        if rest == 1:
+            txt += ". Y otro más, ¿te digo cuál?"
+        else:
+            txt += f". Y otros {rest} más, ¿te digo cuáles?"
     else:
         txt += '.'
     return txt
+
+def _isis_pesos(value):
+    """Monto en pesos para voz: '40 pesos' o '40.50 pesos' (sin '.00').
+    Trabajamos en pesos mexicanos: al oirse, el '$' se puede confundir con
+    otra moneda, asi que el monto siempre se dice con 'pesos'."""
+    try:
+        v = float(value)
+    except Exception:
+        return f"{value} pesos"
+    if v == int(v):
+        return f"{int(v)} pesos"
+    return f"{v:.2f} pesos"
+
+
+def _isis_n(n, singular, plural):
+    """Concordancia para voz: '1 cuenta' / '3 cuentas', '1 producto' / '8 productos'."""
+    try:
+        num = int(n or 0)
+    except Exception:
+        num = 0
+    return f"{n} {singular if num == 1 else plural}"
+
+
+_MESES_ES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio',
+             'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre']
+
+
+def _isis_fecha_natural(value):
+    """Fecha ISO a frase para voz: 'el 24 de noviembre a las 8 de la noche'.
+    La fecha ISO cruda ('2026-11-24 20:00') suena a robot al leerse."""
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except Exception:
+        return str(value)
+    h = dt.hour
+    h12 = h % 12 or 12
+    parte = 'de la mañana' if h < 12 else 'de la tarde' if h < 19 else 'de la noche'
+    return f"el {dt.day} de {_MESES_ES[dt.month - 1]} a las {h12} {parte}"
+
+
+def _isis_mesa_txt(name):
+    """'Mesa 1' o 'mesa Terraza': evita el redundante 'la mesa Mesa 1'."""
+    n = str(name or '').strip()
+    return n if n.lower().startswith('mesa') else 'mesa ' + n
 
 # --- Memoria de Isis (v2): solo datos del restaurante ---
 def _isis_memory_get(db, key):
@@ -1155,12 +1206,12 @@ def _isis_day_summary(db, user):
         o = overview(db, user)
         c = cash(db, user)
         if not c.get('open'):
-            return (f"Hoy: {o.get('active_accounts', 0)} cuentas activas, "
-                    f"{o.get('products', 0)} productos en el menú. No hay turno de caja abierto.")
-        return (f"Hoy: {o.get('active_accounts', 0)} cuentas activas. Ventas del turno: "
-                f"efectivo ${c.get('cash')}, tarjeta ${c.get('card')}, transferencia "
-                f"${c.get('transfer')}. Efectivo esperado en caja: ${c.get('expected')}. "
-                f"Propinas: ${c.get('tips')}.")
+            return (f"Hoy: {_isis_n(o.get('active_accounts', 0), 'cuenta activa', 'cuentas activas')}, "
+                    f"{_isis_n(o.get('products', 0), 'producto', 'productos')} en el menú. No hay turno de caja abierto.")
+        return (f"Hoy: {_isis_n(o.get('active_accounts', 0), 'cuenta activa', 'cuentas activas')}. Ventas del turno: "
+                f"efectivo {c.get('cash')} pesos, tarjeta {c.get('card')} pesos, transferencia "
+                f"{c.get('transfer')} pesos. Efectivo esperado en caja: {c.get('expected')} pesos. "
+                f"Propinas: {c.get('tips')} pesos.")
     except Exception:
         return 'Resumen del día no disponible.'
 
@@ -1322,7 +1373,7 @@ def _isis_parse_local(db, user, raw, history=None):
     if 'recuerda que' in text:
         body = text.split('recuerda que', 1)[1].strip()
         if not body:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Qué quieres que recuerde? Dímelo después de "recuerda que".'}
+            return {'action': 'unknown', 'params': {}, 'question': '¿Qué quieres que recuerde? Dime "recuerda que" y lo anoto.'}
         if ' es ' in body:
             key = body.split(' es ', 1)[0].strip()
         elif ' son ' in body:
@@ -1356,21 +1407,21 @@ def _isis_parse_local(db, user, raw, history=None):
         if 'confirma' in text:
             r = _isis_find_reservation(db, user, text)
             if not r:
-                return {'action': 'unknown', 'params': {}, 'question': '¿De quién es la reservación que confirmo? Dime el nombre.'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿De quién es la reservación? Dime el nombre.'}
             return {'action': 'confirm_reservation', 'params': {'reservation_id': r.get('id')}}
         if 'llego' in text or 'llegada' in text:
             r = _isis_find_reservation(db, user, text)
             if not r:
-                return {'action': 'unknown', 'params': {}, 'question': '¿De quién es la reservación que llegó? Dime el nombre.'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿A nombre de quién está la reservación que llegó?'}
             nums = _isis_table_numbers(text)
             if not nums:
-                return {'action': 'unknown', 'params': {}, 'question': '¿En qué mesa siento a la reservación? Dime el número de mesa.'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿En qué mesa la siento? Dime el número.'}
             t = _isis_find_table(db, user, 'mesa ' + nums[-1])
             if not t:
-                return {'action': 'unknown', 'params': {}, 'question': 'No encontré esa mesa. ¿En qué mesa siento a la reservación?'}
+                return {'action': 'unknown', 'params': {}, 'question': 'No encontré esa mesa. ¿En cuál la siento?'}
             w = _isis_find_user(db, user, text, role='waiter')
             if not w:
-                return {'action': 'unknown', 'params': {}, 'question': '¿Qué mesero atiende la reservación? Dime su nombre.'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿Qué mesero la atiende? Dime su nombre.'}
             return {'action': 'reservation_arrive', 'params': {'reservation_id': r.get('id'), 'table_id': t.get('id'), 'waiter_id': w.get('id')}}
         if 'crea' in text or 'nueva' in text or 'haz' in text or 'anota' in text or 'para' in text:
             m = re.search(r'para\s+([a-z ]+?)\s+de\s+\d+', text)
@@ -1395,17 +1446,17 @@ def _isis_parse_local(db, user, raw, history=None):
         if 'lista' in text or 'listo' in text:
             t = _isis_find_ticket(db, user, text, station)
             if not t:
-                return {'action': 'unknown', 'params': {}, 'question': '¿Qué comanda marco como lista? Dime el número.'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿Qué comanda marco lista? Dime el número.'}
             return {'action': 'ticket_status', 'params': {'ticket_id': t.get('id'), 'status': 'ready'}}
         if 'preparando' in text or 'a preparar' in text or 'empieza' in text:
             t = _isis_find_ticket(db, user, text, station)
             if not t:
-                return {'action': 'unknown', 'params': {}, 'question': '¿Qué comanda pasa a preparación? Dime el número.'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿Qué comanda pongo en preparación? Dime el número.'}
             return {'action': 'ticket_status', 'params': {'ticket_id': t.get('id'), 'status': 'preparing'}}
         if 'recibe' in text or 'recibida' in text or 'recepcion' in text:
             t = _isis_find_ticket(db, user, text, station)
             if not t:
-                return {'action': 'unknown', 'params': {}, 'question': '¿Qué comanda confirmo como recibida? Dime el número.'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿Qué comanda marco como recibida? Dime el número.'}
             return {'action': 'ticket_status', 'params': {'ticket_id': t.get('id'), 'status': 'received'}}
         return {'action': 'tickets_list', 'params': {'station': station}}
     # --- 4. Cobros ---
@@ -1452,7 +1503,7 @@ def _isis_parse_local(db, user, raw, history=None):
         if 'archiva' in text or 'elimina del menu' in text or 'quita del menu' in text:
             p = _isis_find_product(db, user, text)
             if not p:
-                return {'action': 'unknown', 'params': {}, 'question': '¿Qué producto archivo del menú?'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿Qué producto saco del menú?'}
             return {'action': 'archive_product', 'params': {'product_id': p.get('id')}}
         # Pregunta por el precio de UN producto: responde solo ese precio,
         # nunca la lista completa del menú. Va antes de "cambia el precio"
@@ -1472,7 +1523,7 @@ def _isis_parse_local(db, user, raw, history=None):
                 return {'action': 'unknown', 'params': {}, 'question': '¿A qué producto le cambio el precio?'}
             nums = _isis_numbers(text)
             if not nums:
-                return {'action': 'unknown', 'params': {}, 'question': '¿A cuánto le pongo el precio?'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿En cuánto lo dejo?'}
             return {'action': 'edit_product_price', 'params': {'product_id': p.get('id'), 'price': nums[-1]}}
         if any(k in text for k in ('agrega', 'anade', 'crea', 'nuevo producto')):
             price = _isis_money(text)
@@ -1496,7 +1547,7 @@ def _isis_parse_local(db, user, raw, history=None):
         m = re.search(r'insumo\s+([a-z ]+?)\s+con\s+', text)
         name = m.group(1).strip().title() if m else None
         if not name:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Cómo se llama el insumo que registro?'}
+            return {'action': 'unknown', 'params': {}, 'question': '¿Cómo se llama el insumo?'}
         qty = _isis_qty(re.sub(r'insumo\s+[a-z ]+?\s+con\s+', '', text))
         return {'action': 'create_inventory_item', 'params': {'name': name, 'qty': qty, 'unit': _isis_unit_word(text)}}
     # --- 8. Personal ---
@@ -1512,7 +1563,7 @@ def _isis_parse_local(db, user, raw, history=None):
         m = re.search(r'registra a\s+([a-z ]+?)\s+como\s+', text) or re.search(r'registra\s+([a-z ]+?)\s+como\s+', text)
         name = m.group(1).strip().title() if m else None
         if not name:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Cómo se llama la persona que registro?'}
+            return {'action': 'unknown', 'params': {}, 'question': '¿Cómo se llama la persona?'}
         role = _isis_role_word(text)
         if not role:
             return {'action': 'unknown', 'params': {}, 'question': f'¿Qué perfil le doy a {name}: mesero, caja, cocina, barra o administrador?'}
@@ -1550,7 +1601,7 @@ def _isis_parse_local(db, user, raw, history=None):
         if any(k in text for k in ('pon', 'cambia', 'ajusta')):
             mm = re.search(r'(\d+)\s*min', text)
             if not mm:
-                return {'action': 'unknown', 'params': {}, 'question': '¿De cuántos minutos pongo el tiempo?'}
+                return {'action': 'unknown', 'params': {}, 'question': '¿De cuántos minutos lo pongo?'}
             p = _isis_find_product(db, user, text)
             if p:
                 return {'action': 'product_prep_set', 'params': {'product_id': p.get('id'), 'product': p.get('name'), 'minutes': int(mm.group(1))}}
@@ -1565,10 +1616,10 @@ def _isis_parse_local(db, user, raw, history=None):
             return {'action': 'unknown', 'params': {}, 'question': '¿Qué cuenta cambio de mesa? Dime la mesa de origen.'}
         nums = _isis_table_numbers(text)
         if len(nums) < 2:
-            return {'action': 'unknown', 'params': {}, 'question': '¿A qué mesa muevo la cuenta? Dime la mesa destino.'}
+            return {'action': 'unknown', 'params': {}, 'question': '¿A qué mesa la muevo? Dime la mesa destino.'}
         t = _isis_find_table(db, user, 'mesa ' + nums[-1])
         if not t:
-            return {'action': 'unknown', 'params': {}, 'question': 'No encontré la mesa destino. ¿A qué mesa muevo la cuenta?'}
+            return {'action': 'unknown', 'params': {}, 'question': 'No encontré esa mesa. ¿A cuál la muevo?'}
         return {'action': 'transfer_account', 'params': {'account_id': a.get('id'), 'table_id': t.get('id'), 'table_name': t.get('name')}}
     # --- 2. Mesas: cambiar capacidad ---
     if 'capacidad' in text and 'mesa' in text:
@@ -1577,7 +1628,7 @@ def _isis_parse_local(db, user, raw, history=None):
             return {'action': 'unknown', 'params': {}, 'question': '¿De qué mesa cambio la capacidad?'}
         mm = re.search(r'capacidad\s+(?:de\s+)?(\d+)', text) or re.search(r'a\s+(\d+)\s*(?:personas)?\s*$', text)
         if not mm:
-            return {'action': 'unknown', 'params': {}, 'question': '¿A cuántas personas le pongo la capacidad?'}
+            return {'action': 'unknown', 'params': {}, 'question': '¿Para cuántas personas la dejo?'}
         return {'action': 'update_table', 'params': {'table_id': t.get('id'), 'table_name': t.get('name'), 'capacity': int(mm.group(1))}}
     # --- 5. Caja: historial de cortes ---
     if 'historial de caja' in text or 'cortes anteriores' in text or 'cortes pasados' in text:
@@ -1595,7 +1646,7 @@ def _isis_parse_local(db, user, raw, history=None):
     if 'cuanto debe' in text or 'cuanto es' in text or 'saldo' in text or 'detalle de la cuenta' in text:
         a = _isis_find_account(db, user, text)
         if not a:
-            return {'action': 'unknown', 'params': {}, 'question': '¿De qué mesa quieres saber el saldo? Dime el nombre o el número de la mesa.'}
+            return {'action': 'unknown', 'params': {}, 'question': '¿De qué mesa quieres saber el saldo? Dime el nombre o el número.'}
         return {'action': 'account_detail', 'params': {'account_id': a.get('id')}}
     # Escrituras (todas con confirmacion)
     if 'abre el turno' in text or 'abrir turno' in text or 'abre caja' in text:
@@ -1635,7 +1686,7 @@ def _isis_parse_local(db, user, raw, history=None):
         all_flag = 'todo' in text or 'completo' in text or 'total' in text
         amt = None if all_flag else _isis_money(re.sub(r'mesa\s+\d+', '', text))
         if not all_flag and amt is None:
-            return {'action': 'unknown', 'params': {}, 'question': '¿Cuánto cobro en esa mesa, o cobro todo el saldo?'}
+            return {'action': 'unknown', 'params': {}, 'question': '¿Cuánto cobro, o todo el saldo?'}
         if not method:
             return {'action': 'unknown', 'params': {}, 'question': '¿En efectivo, con tarjeta o por transferencia?'}
         return {'action': 'pay_account', 'params': {'account_id': a.get('id'), 'amount': amt, 'method': method, 'all': all_flag}}
@@ -1650,7 +1701,7 @@ def _isis_parse_local(db, user, raw, history=None):
             return {'action': 'unknown', 'params': {}, 'question': '¿De qué producto ajusto el inventario?'}
         amt = _isis_money(text)
         if amt is None:
-            return {'action': 'unknown', 'params': {}, 'question': '¿A cuánto dejo las existencias de ese producto?'}
+            return {'action': 'unknown', 'params': {}, 'question': '¿En cuánto dejo ese producto?'}
         return {'action': 'inventory_adjust', 'params': {'product_id': p.get('id'), 'product': p.get('name'), 'qty': int(amt), 'mode': 'count', 'reason': 'Ajuste por voz con Isis'}}
     if ('agrega' in text or 'anade' in text or 'pon' in text or 'pide' in text) and 'mesa' in text:
         a = _isis_find_account(db, user, text)
@@ -1713,15 +1764,15 @@ def _isis_sales_context(db, user):
         d = mitote_extensions.owner_analytics(start=today, end=today, scope='current', db=db, user=user)
         top = d.get('products') or []
         top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in top[:3]) or 'nada todavía'
-        parts.append(f"Ventas de hoy: ${d.get('sales')} en {d.get('paid_accounts')} cuentas pagadas, "
-                     f"ticket promedio ${d.get('average_ticket')}. Lo más vendido hoy: {top_txt}.")
+        parts.append(f"Ventas de hoy: {d.get('sales')} pesos en {_isis_n(d.get('paid_accounts'), 'cuenta pagada', 'cuentas pagadas')}, "
+                     f"ticket promedio {d.get('average_ticket')} pesos. Lo más vendido hoy: {top_txt}.")
     except Exception:
         parts.append('Ventas de hoy: no disponible.')
     try:
         c = cash(db, user)
         if c.get('open'):
-            parts.append(f"Caja abierta, efectivo esperado ${c.get('expected')} (efectivo ${c.get('cash')}, "
-                         f"tarjeta ${c.get('card')}, transferencia ${c.get('transfer')}).")
+            parts.append(f"Caja abierta, efectivo esperado {c.get('expected')} pesos (efectivo {c.get('cash')} pesos, "
+                         f"tarjeta {c.get('card')} pesos, transferencia {c.get('transfer')} pesos).")
         else:
             parts.append('Caja cerrada, no hay turno abierto.')
     except Exception:
@@ -1730,7 +1781,7 @@ def _isis_sales_context(db, user):
         accs = accounts(db, user)
         pend = [x for x in accs if x.get('status') in ('open', 'pending')]
         total = sum(float(x.get('due') or 0) for x in pend)
-        parts.append(f"Cuentas pendientes de cobro: {len(pend)}, total por cobrar ${total:.2f}.")
+        parts.append(f"Cuentas pendientes de cobro: {len(pend)}, total por cobrar {total:.2f} pesos.")
     except Exception:
         parts.append('Cuentas pendientes: no disponible.')
     return ' '.join(parts)
@@ -1779,12 +1830,12 @@ def _isis_decision_context(db, user):
         s_y = float(d_yday.get('sales') or 0)
         diff = s_t - s_y
         if diff > 0:
-            comp = f"${diff:.2f} más que ayer"
+            comp = f"{diff:.2f} pesos más que ayer"
         elif diff < 0:
-            comp = f"${abs(diff):.2f} menos que ayer"
+            comp = f"{abs(diff):.2f} pesos menos que ayer"
         else:
             comp = 'igual que ayer'
-        parts.append(f"Ventas: hoy ${s_t:.2f} en {d_today.get('paid_accounts')} cuentas pagadas, ayer ${s_y:.2f}. Hoy va {comp}.")
+        parts.append(f"Ventas: hoy {s_t:.2f} pesos en {_isis_n(d_today.get('paid_accounts'), 'cuenta pagada', 'cuentas pagadas')}, ayer {s_y:.2f} pesos. Hoy va {comp}.")
     except Exception:
         parts.append('Ventas hoy vs ayer: no disponible.')
     try:
@@ -1822,7 +1873,7 @@ def _isis_decision_context(db, user):
                 continue
             hours = (now - created).total_seconds() / 3600
             if hours > 2:
-                old.append(f"{a.get('table_name') or a.get('name')} debe ${a.get('due')}, abierta hace {hours:.1f} h")
+                old.append(f"{a.get('table_name') or a.get('name')} debe {a.get('due')} pesos, abierta hace {hours:.1f} h")
         parts.append('Cuentas abiertas hace más de 2 horas: ' + ('; '.join(old) if old else 'ninguna') + '.')
     except Exception:
         parts.append('Cuentas viejas: no disponible.')
@@ -1877,7 +1928,7 @@ def _isis_alerts(db, user):
                 continue
             hours = int((now - created).total_seconds() // 3600)
             if hours > 2:
-                alerts.append(f"La {a.get('table_name') or a.get('name')} lleva {hours} horas abierta y debe ${a.get('due')}.")
+                alerts.append(f"La {a.get('table_name') or a.get('name')} lleva {hours} {'hora' if hours == 1 else 'horas'} abierta y debe {_isis_pesos(a.get('due'))}.")
     except Exception:
         pass
     try:
@@ -1892,7 +1943,7 @@ def _isis_alerts(db, user):
     try:
         pend = db.scalars(select(Approval).where(Approval.status == 'pending')).all()
         if pend:
-            alerts.append(f"Hay {len(pend)} {'autorización' if len(pend) == 1 else 'autorizaciones'} pendientes de decidir.")
+            alerts.append(f"Hay {len(pend)} {'autorización' if len(pend) == 1 else 'autorizaciones'} pendientes.")
     except Exception:
         pass
     return alerts[:3]
@@ -1911,7 +1962,7 @@ def _isis_context(db, user):
         p_txt = 'no disponible'
     try:
         accs = accounts(db, user)
-        a_txt = ', '.join(f"#{a.get('id')} {a.get('name')} mesa {a.get('table_name')} debe ${a.get('due')}" for a in accs if a.get('status') in ('open', 'pending'))[:1500]
+        a_txt = ', '.join(f"#{a.get('id')} {a.get('name')} mesa {a.get('table_name')} debe {a.get('due')} pesos" for a in accs if a.get('status') in ('open', 'pending'))[:1500]
     except Exception:
         a_txt = 'no disponible'
     # Memoria que le dictaron + resumen del día, para que responda con contexto (v2).
@@ -1928,7 +1979,8 @@ def _isis_context(db, user):
         d_txt = _isis_decision_context(db, user)
     except Exception:
         d_txt = 'Para decidir: no disponible.'
-    return (f"Mesas: {t_txt}\nProductos con inventario: {p_txt}\nCuentas abiertas: {a_txt}\n"
+    return (f"Moneda: todos los montos son en pesos mexicanos (MXN).\n"
+            f"Mesas: {t_txt}\nProductos con inventario: {p_txt}\nCuentas abiertas: {a_txt}\n"
             f"Memoria de Isis: {m_txt}\nResumen del día: {_isis_day_summary(db, user)}\n"
             f"Ventas y caja: {s_txt}\nPara decidir: {d_txt}")
 
@@ -1947,77 +1999,85 @@ _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'ne
                   'product_prep_set', 'remember', 'forget'}
 
 def _isis_describe(intent):
+    """Resumen de lo que Isis propone hacer, para pedir confirmación por voz.
+    En primera persona y en pesos: antes decía 'Cobrar $200 con cash' y
+    'Agregar al menú X a $50 (kitchen)', con el método y la estación en
+    inglés y el '$' que al oírse se puede confundir con otra moneda."""
     a, p = intent.get('action'), intent.get('params') or {}
+    mesa = lambda n: 'la ' + _isis_mesa_txt(n)
     if a == 'open_cash':
-        return f"Abrir el turno con ${p.get('opening')} de fondo."
+        return f"Abro el turno con {_isis_pesos(p.get('opening'))} de fondo."
     if a == 'close_cash':
-        return f"Cerrar el turno con ${p.get('counted')} contados."
+        return f"Cierro el turno con {_isis_pesos(p.get('counted'))} contados."
     if a == 'create_table':
-        return f"Crear la mesa {p.get('name')}."
+        return f"Creo {mesa(p.get('name'))}."
     if a == 'new_account':
-        return f"Abrir una cuenta en la mesa {p.get('table_name')}."
+        return f"Abro una cuenta en {mesa(p.get('table_name'))}."
     if a == 'add_order':
         items = ', '.join(f"{i.get('qty')} {i.get('product')}" for i in p.get('items') or [])
-        return f"Agregar a la cuenta {p.get('account_id')}: {items}."
+        return f"A la cuenta {p.get('account_id')} le agrego: {items}."
     if a == 'pay_account':
-        amt = 'todo el saldo' if p.get('all') else f"${p.get('amount')}"
-        return f"Cobrar {amt} en la cuenta {p.get('account_id')} con {p.get('method')}."
+        amt = 'todo el saldo' if p.get('all') else _isis_pesos(p.get('amount'))
+        metodo = {'cash': 'en efectivo', 'card': 'con tarjeta',
+                  'transfer': 'por transferencia'}.get(p.get('method'))
+        return f"Cobro {amt} de la cuenta {p.get('account_id')}" + (f" {metodo}." if metodo else '.')
     if a == 'close_account':
-        return f"Cerrar la cuenta {p.get('account_id')}."
+        return f"Cierro la cuenta {p.get('account_id')}."
     if a == 'restock':
-        return f"Reponer {p.get('qty')} de {p.get('product')}."
+        return f"Repongo {p.get('qty')} de {p.get('product')}."
     if a == 'inventory_adjust':
-        return f"Dejar el inventario de {p.get('product')} en {p.get('qty')}."
+        return f"Dejo el inventario de {p.get('product')} en {p.get('qty')}."
     if a == 'void_account':
-        return f"Anular la cuenta {p.get('account_id')}."
+        return f"Anulo la cuenta {p.get('account_id')}."
     if a == 'cash_movement':
-        return f"Registrar una {'salida' if p.get('kind') == 'out' else 'entrada'} de ${p.get('amount')} en caja."
+        return f"Registro una {'salida' if p.get('kind') == 'out' else 'entrada'} de {_isis_pesos(p.get('amount'))} en caja."
     if a == 'remember':
-        return f"Guardar en mi memoria: {p.get('key')} — {p.get('value')}."
+        return f"Anoto en mi memoria: {p.get('key')}, {p.get('value')}."
     if a == 'forget':
-        return f"Olvidar de mi memoria lo de '{p.get('query')}'."
+        return f"Olvido lo de '{p.get('query')}'."
     if a == 'update_table':
-        return f"Cambiar la capacidad de la mesa {p.get('table_name')} a {p.get('capacity')} personas."
+        return f"Dejo {mesa(p.get('table_name'))} para {_isis_n(p.get('capacity'), 'persona', 'personas')}."
     if a == 'transfer_account':
-        return f"Mover la cuenta {p.get('account_id')} a la mesa {p.get('table_name')}."
+        return f"Muevo la cuenta {p.get('account_id')} a {mesa(p.get('table_name'))}."
     if a == 'ticket_status':
         estado = {'received': 'recibida', 'preparing': 'en preparación', 'ready': 'lista'}.get(p.get('status'), p.get('status'))
-        return f"Marcar la comanda {p.get('ticket_id')} como {estado}."
+        return f"Marco la comanda {p.get('ticket_id')} como {estado}."
     if a == 'apply_discount':
-        v = f"{p.get('value')}%" if p.get('mode') == 'percent' else f"${p.get('value')}"
-        return f"Aplicar un descuento de {v} a la cuenta {p.get('account_id')}."
+        v = f"del {p.get('value')}%" if p.get('mode') == 'percent' else f"de {_isis_pesos(p.get('value'))}"
+        return f"Aplico un descuento {v} a la cuenta {p.get('account_id')}."
     if a == 'create_product':
-        return f"Agregar al menú {p.get('name')} a ${p.get('price')} ({p.get('station')})."
+        estacion = {'kitchen': 'en cocina', 'bar': 'en barra'}.get(p.get('station'), '')
+        return f"Agrego al menú {p.get('name')} a {_isis_pesos(p.get('price'))}" + (f", {estacion}." if estacion else '.')
     if a == 'archive_product':
-        return f"Archivar del menú el producto {p.get('product_id')}."
+        return f"Saco el producto {p.get('product_id')} del menú."
     if a == 'add_variant':
-        return f"Agregar la presentación {p.get('name')} de ${p.get('price')} al producto {p.get('product_id')}."
+        return f"Agrego la presentación {p.get('name')}, de {_isis_pesos(p.get('price'))}, al producto {p.get('product_id')}."
     if a == 'add_promotion':
-        return f"Poner en promoción el producto {p.get('product_id')} con {p.get('percent')}% de descuento."
+        return f"Pongo en promoción el producto {p.get('product_id')} con {p.get('percent')}% de descuento."
     if a == 'edit_product_price':
-        return f"Cambiar el precio del producto {p.get('product_id')} a ${p.get('price')}."
+        return f"Cambio el precio del producto {p.get('product_id')} a {_isis_pesos(p.get('price'))}."
     if a == 'create_inventory_item':
-        return f"Registrar el insumo {p.get('name')} con {p.get('qty')} {p.get('unit')}."
+        return f"Registro el insumo {p.get('name')} con {p.get('qty')} {p.get('unit')}."
     if a == 'create_staff':
         rol = {'waiter': 'mesero', 'cashier': 'caja', 'kitchen': 'cocina', 'bar': 'barra', 'admin': 'administrador'}.get(p.get('role'), p.get('role'))
-        return f"Registrar a {p.get('name')} como {rol}."
+        return f"Registro a {p.get('name')} como {rol}."
     if a == 'staff_pin':
-        return f"Cambiar el PIN del empleado {p.get('user_id')}."
+        return f"Cambio el PIN del empleado {p.get('user_id')}."
     if a == 'tips_distribute':
-        return "Repartir el fondo común de propinas entre todos los empleados activos."
+        return "Reparto el fondo de propinas entre todos los empleados activos."
     if a == 'decide_approval':
-        return f"{'Autorizar' if p.get('approve') else 'Rechazar'} la solicitud {p.get('request_id')}."
+        return f"{'Autorizo' if p.get('approve') else 'Rechazo'} la solicitud {p.get('request_id')}."
     if a == 'create_reservation':
-        return f"Reservar para {p.get('name')}, {p.get('party_size')} personas, el {p.get('scheduled_at')}."
+        return f"Reservo para {p.get('name')}, {_isis_n(p.get('party_size'), 'persona', 'personas')}, {_isis_fecha_natural(p.get('scheduled_at'))}."
     if a == 'confirm_reservation':
-        return f"Confirmar la reservación {p.get('reservation_id')}."
+        return f"Confirmo la reservación {p.get('reservation_id')}."
     if a == 'reservation_arrive':
-        return f"Recibir la reservación {p.get('reservation_id')} y abrir su cuenta."
+        return f"Recibo la reservación {p.get('reservation_id')} y le abro su cuenta."
     if a == 'prep_config_set':
-        return f"Poner el tiempo límite de preparación en {p.get('batch_minutes')} minutos por comanda."
+        return f"Pongo el límite de preparación en {p.get('batch_minutes')} minutos por comanda."
     if a == 'product_prep_set':
-        return f"Poner el tiempo de preparación de {p.get('product')} en {p.get('minutes')} minutos."
-    return f"Ejecutar {a}."
+        return f"Pongo el tiempo de preparación de {p.get('product')} en {p.get('minutes')} minutos."
+    return "Hago eso."
 
 def _isis_confirm_token(intent):
     token = secrets.token_urlsafe(24)
@@ -2033,51 +2093,53 @@ async def _isis_execute(db, user, intent):
         busy = [t.get('name') for t in rows if t.get('status') == 'occupied']
         free_txt = _isis_short_list(free, len(free)) if free else 'ninguna.'
         busy_txt = _isis_short_list(busy, len(busy)) if busy else 'ninguna.'
-        return f"Mesas libres: {free_txt} Mesas ocupadas: {busy_txt}"
+        return f"Mira, libres: {free_txt} Ocupadas: {busy_txt}"
     if a == 'overview':
         o = overview(db, user)
         c = cash(db, user)
         if not c.get('open'):
-            return f"Hay {o.get('active_accounts', 0)} cuentas activas y {o.get('products', 0)} productos en el menú. No hay turno de caja abierto."
-        return (f"Hay {o.get('active_accounts', 0)} cuentas activas. Ventas del turno: efectivo ${c.get('cash')}, "
-                f"tarjeta ${c.get('card')}, transferencia ${c.get('transfer')}. Efectivo esperado en caja: ${c.get('expected')}.")
+            return f"Hay {_isis_n(o.get('active_accounts', 0), 'cuenta activa', 'cuentas activas')} y {_isis_n(o.get('products', 0), 'producto', 'productos')} en el menú. La caja todavía no está abierta."
+        return (f"Hay {_isis_n(o.get('active_accounts', 0), 'cuenta activa', 'cuentas activas')}. Del turno: {_isis_pesos(c.get('cash'))} en efectivo, "
+                f"{_isis_pesos(c.get('card'))} con tarjeta y {_isis_pesos(c.get('transfer'))} por transferencia. "
+                f"En caja deberían haber {_isis_pesos(c.get('expected'))}.")
     if a == 'cash':
         c = cash(db, user)
         if not c.get('open'):
-            return "No hay turno de caja abierto."
-        return (f"Caja abierta. Efectivo ${c.get('cash')}, tarjeta ${c.get('card')}, transferencia ${c.get('transfer')}, "
-                f"propinas ${c.get('tips')}, efectivo esperado ${c.get('expected')}.")
+            return "La caja todavía no está abierta."
+        return (f"La caja está abierta. Llevamos {_isis_pesos(c.get('cash'))} en efectivo, {_isis_pesos(c.get('card'))} con tarjeta, "
+                f"{_isis_pesos(c.get('transfer'))} por transferencia y {_isis_pesos(c.get('tips'))} de propinas. "
+                f"En caja deberían haber {_isis_pesos(c.get('expected'))}.")
     if a == 'inventory':
         prods = products(db, user)
         if p.get('product'):
             match = next((x for x in prods if _isis_norm(x.get('name', '')) == _isis_norm(p.get('product'))), None)
             if not match:
-                return f"No encontré el producto {p.get('product')}."
-            return f"{match.get('name')}: quedan {match.get('stock')} {match.get('inventory_unit') or 'unidades'}."
+                return f"No encontré {p.get('product')} en el inventario."
+            return f"De {match.get('name')} quedan {match.get('stock')} {match.get('inventory_unit') or 'unidades'}."
         low = [x for x in prods if x.get('inventory_enabled') and (x.get('stock') or 0) <= 3]
         txt = _isis_short_list([f"{x.get('name')} ({x.get('stock')})" for x in low], len(low))
-        return f"Productos con poco inventario: {txt or 'ninguno, todo tiene más de 3.'}"
+        return f"Ojo, andan bajos: {txt}" if low else "Nada, todo tiene más de 3 en existencia."
     if a == 'account_detail':
         d = account_detail(p.get('account_id'), db, user)
         label = d.get('table_name') if d.get('table_name') else d.get('name')
-        return (f"Cuenta #{d.get('id')}, mesa {label}: "
-                f"total ${d.get('total')}, pagado ${d.get('paid')}, saldo ${d.get('due')}.")
+        return (f"La cuenta {d.get('id')}, {label}: en total son {_isis_pesos(d.get('total'))}, "
+                f"ya pagaron {_isis_pesos(d.get('paid'))} y faltan {_isis_pesos(d.get('due'))}.")
     if a == 'open_cash':
         r = await open_cash(OpenPeriodIn(opening=Decimal(str(p.get('opening')))), db, user)
-        return f"Turno abierto, folio {r.get('id')}, con ${p.get('opening')} de fondo."
+        return f"Turno abierto, folio {r.get('id')}, con {_isis_pesos(p.get('opening'))} de fondo."
     if a == 'close_cash':
         r = await close_cash(ClosePeriodIn(counted=Decimal(str(p.get('counted'))), note=str(p.get('note') or '')), db, user)
-        return f"Corte cerrado, folio {r.get('id')} y archivado con su PDF."
+        return f"Corte cerrado, folio {r.get('id')}, y ya quedó guardado con su PDF."
     if a == 'create_table':
         r = await create_dining_table(DiningTableIn(name=str(p.get('name')), area=str(p.get('area') or 'Salon'), capacity=int(p.get('capacity') or 4)), db, user)
-        return f"Mesa {p.get('name')} creada."
+        return f"La {p.get('name')} ya está creada."
     if a == 'new_account':
         r = await new_account(AccountIn(name=None, table_id=int(p.get('table_id')) if p.get('table_id') else None, client_key=secrets.token_urlsafe(16)), db, user)
-        return f"Cuenta abierta en la mesa {p.get('table_name')}, folio {r.get('id')}."
+        return f"Cuenta abierta en la {_isis_mesa_txt(p.get('table_name'))}, folio {r.get('id')}."
     if a == 'add_order':
         items = [OrderLine(product_id=int(i.get('product_id')), qty=int(i.get('qty') or 1)) for i in p.get('items') or []]
         r = await send_order(int(p.get('account_id')), OrderIn(items=items, client_key=secrets.token_urlsafe(16)), db, user)
-        return f"Comanda enviada, folio {r.get('batch_id')}."
+        return f"Ya mandé la comanda, folio {r.get('batch_id')}."
     if a == 'pay_account':
         acc = account_detail(int(p.get('account_id')), db, user)
         # Cobrar exige cuenta en estado pendiente: si sigue abierta, se pide
@@ -2091,28 +2153,31 @@ async def _isis_execute(db, user, intent):
             raise HTTPException(409, 'El importe no coincide con el saldo de la cuenta.')
         lines = [PaymentLine(method=p.get('method'), amount=amt, tip=Decimal('0'))]
         r = await pay(int(p.get('account_id')), PaymentIn(client_key=secrets.token_urlsafe(16), lines=lines), db, user)
-        return f"Pago registrado. Saldo restante: ${r.get('due')}."
+        due_rest = float(r.get('due') or 0)
+        if due_rest <= 0:
+            return "Pago registrado. Ya quedó pagada por completo."
+        return f"Pago registrado. Faltan {_isis_pesos(due_rest)} por pagar."
     if a == 'close_account':
         await close_account(int(p.get('account_id')), db, user)
-        return f"Cuenta {p.get('account_id')} cerrada y pagada."
+        return f"La cuenta {p.get('account_id')} ya quedó cerrada y pagada."
     if a == 'restock':
         prod = db.get(Product, int(p.get('product_id')))
         r = await restock(int(p.get('product_id')), RestockIn(delta=int(p.get('qty')), reason=str(p.get('reason') or 'Reposicion por voz'), expected_version=int(prod.version)), db, user)
-        return f"Repuesto. Ahora quedan {r.get('stock')} de {p.get('product')}."
+        return f"Ya repuse, ahora quedan {r.get('stock')} de {p.get('product')}."
     if a == 'inventory_adjust':
         prod = db.get(Product, int(p.get('product_id')))
         r = await inventory_adjustment(int(p.get('product_id')), InventoryAdjustmentIn(mode=str(p.get('mode') or 'count'), quantity=int(p.get('qty')), reason=str(p.get('reason') or 'Ajuste por voz'), expected_version=int(prod.version)), db, user)
-        return f"Inventario de {p.get('product')} ahora en {r.get('stock')}."
+        return f"El inventario de {p.get('product')} ahora está en {r.get('stock')}."
     if a == 'void_account':
         await void_account(int(p.get('account_id')), VoidAccountIn(reason=str(p.get('reason') or 'Anulacion por voz')), db, user)
-        return f"Cuenta {p.get('account_id')} anulada."
+        return f"La cuenta {p.get('account_id')} quedó anulada."
     if a == 'cash_movement':
         r = await movement(MovementIn(kind=str(p.get('kind')), amount=Decimal(str(p.get('amount'))), reason=str(p.get('reason') or 'Movimiento por voz'), client_key=secrets.token_urlsafe(16)), db, user)
-        return f"Movimiento de caja registrado, estado {r.get('status')}."
+        return "Movimiento de caja registrado."
     # --- v2: memoria ---
     if a == 'remember':
         _isis_memory_set(db, p.get('key'), p.get('value'))
-        return _isis_say(f"Anotado: {p.get('key')} — {p.get('value')}. No se me olvida.", warm=True)
+        return _isis_say(f"Anotado: {p.get('key')}, {p.get('value')}. No se me olvida.", warm=True)
     if a == 'recall':
         q = (p.get('query') or '').strip()
         hits = _isis_memory_search(db, q) if q else _isis_memory_all(db)
@@ -2124,7 +2189,7 @@ async def _isis_execute(db, user, intent):
         q = (p.get('query') or '').strip()
         hits = _isis_memory_search(db, q)
         if not hits:
-            return f"No encontré nada guardado de '{q}' para olvidar."
+            return f"No encontré nada guardado de '{q}'."
         for k, _v in hits:
             _isis_memory_delete(db, k)
         return _isis_say(f"Ya olvidé lo de '{q}'.", warm=True)
@@ -2133,18 +2198,18 @@ async def _isis_execute(db, user, intent):
         rows = [x for x in accounts(db, user) if x.get('status') in ('open', 'pending')]
         if not rows:
             return "No hay cuentas abiertas ahorita. Todo tranquilo."
-        txt = _isis_short_list([f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe ${x.get('due')}" for x in rows], len(rows))
-        return _isis_say(f"Cuentas abiertas ({len(rows)}): {txt}", warm=True)
+        txt = _isis_short_list([f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe {_isis_pesos(x.get('due'))}" for x in rows], len(rows))
+        return _isis_say(f"Hay {_isis_n(len(rows), 'cuenta abierta', 'cuentas abiertas')}: {txt}", warm=True)
     if a == 'transfer_account':
         await transfer_account_table(int(p.get('account_id')), AccountTableTransferIn(table_id=int(p.get('table_id')), reason='Cambio de mesa por voz con Isis'), db, user)
-        return _isis_say(f"La cuenta {p.get('account_id')} ya está en la mesa {p.get('table_name')}.", warm=True)
+        return _isis_say(f"La cuenta {p.get('account_id')} ya está en la {_isis_mesa_txt(p.get('table_name'))}.", warm=True)
     # --- v2: 2. Mesas ---
     if a == 'update_table':
         cur = next((t for t in dining_tables(db, user) if t.get('id') == int(p.get('table_id'))), None)
         if not cur:
             raise HTTPException(404, 'Mesa no encontrada')
         await update_dining_table(int(p.get('table_id')), DiningTableIn(name=cur.get('name'), area=cur.get('area') or 'Salón', capacity=int(p.get('capacity')), active=True, sort_order=int(cur.get('sort_order') or 0)), db, user)
-        return _isis_say(f"La mesa {p.get('table_name')} ahora es para {p.get('capacity')} personas.", warm=True)
+        return _isis_say(f"La {_isis_mesa_txt(p.get('table_name'))} ahora es para {p.get('capacity')} personas.", warm=True)
     # --- v2: 3. Estaciones ---
     if a == 'tickets_list':
         rows = tickets(db, user)
@@ -2155,7 +2220,7 @@ async def _isis_execute(db, user, intent):
         txt = _isis_short_list([f"comanda #{t.get('id')} cuenta {t.get('account')} ({t.get('station')}, {t.get('status')})" for t in rows], len(rows))
         late = [t for t in rows if t.get('status') in ('new', 'received')]
         warn = " Ojo, hay comandas sin recibir todavía." if late else ""
-        return _isis_say(f"Comandas del turno ({len(rows)}): {txt}{warn}", warm=True)
+        return _isis_say(f"Hay {_isis_n(len(rows), 'comanda', 'comandas')} en este turno: {txt}{warn}", warm=True)
     if a == 'ticket_status':
         await ticket_status(int(p.get('ticket_id')), StatusIn(status=str(p.get('status'))), db, user)
         estado = {'received': 'recibida', 'preparing': 'en preparación', 'ready': 'lista'}.get(p.get('status'), p.get('status'))
@@ -2166,25 +2231,25 @@ async def _isis_execute(db, user, intent):
         pend = d.get('accounts') or []
         if not pend:
             return "No hay cuentas pendientes de cobro. Todo pagado."
-        txt = _isis_short_list([f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe ${x.get('due')}" for x in pend], len(pend))
-        return _isis_say(f"Por cobrar ({len(pend)}): {txt}", warm=True)
+        txt = _isis_short_list([f"#{x.get('id')} mesa {x.get('table_name') or '?'} debe {_isis_pesos(x.get('due'))}" for x in pend], len(pend))
+        return _isis_say(f"Por cobrar: {_isis_n(len(pend), 'cuenta', 'cuentas')}: {txt}", warm=True)
     if a == 'apply_discount':
         r = await apply_account_discount(int(p.get('account_id')), AccountDiscountIn(scope='account', mode=str(p.get('mode')), value=Decimal(str(p.get('value'))), reason='Descuento por voz con Isis'), db, user)
-        return _isis_say(f"Descuento aplicado. La cuenta queda en ${r.get('due')}.", warm=True)
+        return _isis_say(f"Descuento aplicado. La cuenta queda en {_isis_pesos(r.get('due'))}.", warm=True)
     # --- v2: 5. Caja: historial ---
     if a == 'cash_history':
         rows = cash_history(db, user)
         if not rows:
-            return "Todavía no hay cortes cerrados para mostrar."
-        txt = '; '.join(f"corte #{r.get('id')}: ventas ${r.get('sales')}, diferencia ${r.get('difference')}" for r in rows[:3])
-        return _isis_say(f"Últimos cortes: {txt}.", warm=True)
+            return "Todavía no hay cortes cerrados."
+        txt = '; '.join(f"el corte {r.get('id')} vendió {_isis_pesos(r.get('sales'))}, diferencia de {_isis_pesos(r.get('difference'))}" for r in rows[:3])
+        return _isis_say(f"Los últimos cortes: {txt}.", warm=True)
     # --- v2: 6. Menú ---
     if a == 'menu_list':
         rows = [x for x in products(db, user) if not x.get('inventory_only') and x.get('active')]
         if not rows:
             return "El menú está vacío. ¿Agrego el primer producto?"
-        txt = _isis_short_list([f"{x.get('name')} ${x.get('current_price') or x.get('price')}" for x in rows], len(rows))
-        return _isis_say(f"Mira, en el menú hay {len(rows)} productos: {txt}", warm=True)
+        txt = _isis_short_list([f"{x.get('name')}, {_isis_pesos(x.get('current_price') or x.get('price'))}" for x in rows], len(rows))
+        return _isis_say(f"Mira, en el menú hay {_isis_n(len(rows), 'producto', 'productos')}: {txt}", warm=True)
     if a == 'product_price':
         rows = products(db, user)
         prod = next((x for x in rows if str(x.get('id')) == str(p.get('product_id'))), None)
@@ -2193,10 +2258,10 @@ async def _isis_execute(db, user, intent):
         if not prod:
             return "No encontré ese producto en el menú."
         price = prod.get('current_price') or prod.get('price')
-        return _isis_say(f"La {prod.get('name')} cuesta ${price}.", warm=True)
+        return _isis_say(f"La {prod.get('name')} cuesta {_isis_pesos(price)}.", warm=True)
     if a == 'create_product':
         r = await add_product(ProductIn(name=str(p.get('name')), category='General', station=str(p.get('station') or 'kitchen'), price=Decimal(str(p.get('price'))), active=True, blocked=False, inventory_enabled=False, stock=0), db, user)
-        return _isis_say(f"Ya está {p.get('name')} en el menú a ${p.get('price')}.", warm=True)
+        return _isis_say(f"Ya está {p.get('name')} en el menú, a {_isis_pesos(p.get('price'))}.", warm=True)
     if a == 'archive_product':
         prod = db.get(Product, int(p.get('product_id')))
         if not prod:
@@ -2205,39 +2270,41 @@ async def _isis_execute(db, user, intent):
         return _isis_say(f"El producto {prod.name} ya no está en el menú.", warm=True)
     if a == 'add_variant':
         r = await add_product_variant(int(p.get('product_id')), ProductVariantIn(name=str(p.get('name')), price=Decimal(str(p.get('price')))), db, user)
-        return _isis_say(f"Presentación {p.get('name')} de ${p.get('price')} agregada.", warm=True)
+        return _isis_say(f"La presentación {p.get('name')}, de {_isis_pesos(p.get('price'))}, ya quedó agregada.", warm=True)
     if a == 'add_promotion':
         await add_product_promotion(int(p.get('product_id')), PromotionIn(name='Promo por voz', discount_percent=int(p.get('percent'))), db, user)
-        return _isis_say(f"Promoción del {p.get('percent')}% puesta. ¡A vender!", warm=True)
+        return _isis_say(f"Ya le puse el {p.get('percent')}% de descuento. ¡A vender!", warm=True)
     if a == 'edit_product_price':
         prod = db.get(Product, int(p.get('product_id')))
         if not prod:
             raise HTTPException(404, 'Producto no encontrado')
         await edit_product(int(p.get('product_id')), ProductIn(name=prod.name, category=prod.category or 'General', station=prod.station, price=Decimal(str(p.get('price'))), active=prod.active, blocked=prod.blocked, inventory_enabled=prod.inventory_enabled, stock=prod.stock, expected_version=int(prod.version)), db, user)
-        return _isis_say(f"El precio de {prod.name} ahora es ${p.get('price')}.", warm=True)
+        return _isis_say(f"El precio de {prod.name} ahora es {_isis_pesos(p.get('price'))}.", warm=True)
     # --- v2: 7. Inventario: movimientos e insumos ---
     if a == 'inventory_movements':
         d = inventory_movements(product_id=p.get('product_id'), db=db, user=user)
         rows = (d.get('movements') or [])[:5]
         if not rows:
             return "No hay movimientos de inventario registrados."
-        txt = '; '.join(f"{r.get('kind')}: {r.get('quantity_change')} {r.get('product_name')} ({r.get('before_stock')} a {r.get('after_stock')})" for r in rows)
+        kind_es = {'in': 'entrada', 'out': 'salida', 'restock': 'reposición',
+                   'adjustment': 'ajuste', 'sale': 'venta', 'waste': 'merma'}
+        txt = '; '.join(f"{kind_es.get(str(r.get('kind')), r.get('kind'))} de {r.get('quantity_change')} {r.get('product_name')}, de {r.get('before_stock')} a {r.get('after_stock')}" for r in rows)
         return _isis_say(f"Últimos movimientos: {txt}.", warm=True)
     if a == 'create_inventory_item':
         r = await create_inventory_item(InventoryItemIn(name=str(p.get('name')), stock=int(p.get('qty') or 0), unit=str(p.get('unit') or 'botellas')), db, user)
-        return _isis_say(f"Insumo {p.get('name')} registrado con {p.get('qty')} {p.get('unit')}.", warm=True)
+        return _isis_say(f"El insumo {p.get('name')} ya quedó registrado con {p.get('qty')} {p.get('unit')}.", warm=True)
     # --- v2: 8. Personal ---
     if a == 'staff_list':
         rows = [u for u in users(db, user) if u.get('active') and u.get('username') != 'isis']
         if not rows:
-            return "No hay personal activo registrado."
+            return "No hay personal activo ahorita."
         rol = {'owner': 'propietario', 'admin': 'administrador', 'waiter': 'mesero', 'cashier': 'caja', 'kitchen': 'cocina', 'bar': 'barra'}
         txt = _isis_short_list([f"{u.get('display')} ({rol.get(u.get('role'), u.get('role'))})" for u in rows], len(rows))
-        return _isis_say(f"Personal activo ({len(rows)}): {txt}", warm=True)
+        return _isis_say(f"Hay {_isis_n(len(rows), 'persona activa', 'personas activas')}: {txt}", warm=True)
     if a == 'create_staff':
         r = await create_staff(StaffCreateIn(name=str(p.get('name')), role=str(p.get('role')), pin=str(p.get('pin'))), db, user)
         rol = {'waiter': 'mesero', 'cashier': 'caja', 'kitchen': 'cocina', 'bar': 'barra', 'admin': 'administrador'}.get(str(r.get('role')), r.get('role'))
-        return _isis_say(f"{p.get('name')} ya está registrado como {rol} y puede entrar con su PIN.", warm=True)
+        return _isis_say(f"{p.get('name')} ya tiene su registro como {rol} y puede entrar con su PIN.", warm=True)
     if a == 'staff_pin':
         target = db.get(User, int(p.get('user_id')))
         if not target:
@@ -2245,15 +2312,15 @@ async def _isis_execute(db, user, intent):
         if target.username == 'isis':
             raise HTTPException(403, 'Isis no puede cambiar su propio PIN por voz; que el propietario lo haga en Personal')
         await assign_staff_pin(int(p.get('user_id')), StaffPinIn(pin=str(p.get('pin'))), db, user)
-        return _isis_say(f"PIN de {target.display} actualizado.", warm=True)
+        return _isis_say(f"El PIN de {target.display} ya quedó actualizado.", warm=True)
     # --- v2: 9. Propinas ---
     if a == 'tips_pool':
         d = tips_pool_current(db, user)
         if not d.get('open'):
             return "No hay turno abierto, así que no hay fondo de propinas ahorita."
         dist = d.get('distribution')
-        extra = f" Ya hay reparto de ${dist.get('total')} entre {dist.get('participant_count')} personas." if dist else " Todavía no hay reparto generado."
-        return _isis_say(f"Fondo de propinas: ${d.get('tips_total')}.{extra}", warm=True)
+        extra = f" Ya hay reparto de {_isis_pesos(dist.get('total'))} entre {_isis_n(dist.get('participant_count'), 'persona', 'personas')}." if dist else " Todavía no hay reparto."
+        return _isis_say(f"El fondo de propinas lleva {_isis_pesos(d.get('tips_total'))}.{extra}", warm=True)
     if a == 'tips_distribute':
         d = tips_pool_current(db, user)
         ids = [e.get('id') for e in (d.get('employees') or []) if e.get('id')]
@@ -2265,14 +2332,14 @@ async def _isis_execute(db, user, intent):
             raise HTTPException(409, 'No hay empleados activos para repartir las propinas')
         r = await create_tip_distribution(TipDistributionIn(user_ids=ids, note='Reparto por voz con Isis'), db, user)
         dist = r.get('distribution') or {}
-        return _isis_say(f"Reparto hecho: ${dist.get('total')} entre {dist.get('participant_count')} personas, ${dist.get('base_share')} para cada quien.", warm=True)
+        return _isis_say(f"Reparto hecho: {_isis_pesos(dist.get('total'))} entre {_isis_n(dist.get('participant_count'), 'persona', 'personas')}, {_isis_pesos(dist.get('base_share'))} para cada quien.", warm=True)
     # --- v2: 10. Autorizaciones ---
     if a == 'approvals_list':
         rows = [r for r in requests(db, user) if r.get('status') == 'pending']
         if not rows:
             return "No hay solicitudes pendientes. Todo autorizado."
         txt = _isis_short_list([f"solicitud #{r.get('id')} ({r.get('kind')}) cuenta #{r.get('account_id')} · {r.get('reason')}" for r in rows], len(rows))
-        return _isis_say(f"Solicitudes pendientes ({len(rows)}): {txt}", warm=True)
+        return _isis_say(f"Hay {_isis_n(len(rows), 'solicitud pendiente', 'solicitudes pendientes')}: {txt}", warm=True)
     if a == 'decide_approval':
         await decide(int(p.get('request_id')), DecisionIn(approve=bool(p.get('approve')), return_stock=False), db, user)
         return _isis_say(f"La solicitud {p.get('request_id')} quedó {'autorizada' if p.get('approve') else 'rechazada'}.", warm=True)
@@ -2288,26 +2355,26 @@ async def _isis_execute(db, user, intent):
         rows = [r for r in mitote_extensions.reservations(db, user) if r.get('status') in ('pending', 'confirmed')]
         if not rows:
             return "No hay reservaciones pendientes ni confirmadas."
-        txt = _isis_short_list([f"{r.get('name')} ({r.get('party_size')} personas, {r.get('status')})" for r in rows], len(rows))
-        return _isis_say(f"Reservaciones activas ({len(rows)}): {txt}", warm=True)
+        txt = _isis_short_list([f"{r.get('name')} ({_isis_n(r.get('party_size'), 'persona', 'personas')}, {r.get('status')})" for r in rows], len(rows))
+        return _isis_say(f"Hay {_isis_n(len(rows), 'reservación activa', 'reservaciones activas')}: {txt}", warm=True)
     if a == 'create_reservation':
         when = datetime.fromisoformat(str(p.get('scheduled_at')))
         r = await mitote_extensions.add_reservation(mitote_extensions.ReservationIn(name=str(p.get('name')), phone='', party_size=int(p.get('party_size')), scheduled_at=when, note='Reservación por voz con Isis'), db, user)
-        return _isis_say(f"Reservación para {p.get('name')} anotada, folio {r.get('id')}.", warm=True)
+        return _isis_say(f"La reservación para {p.get('name')} ya quedó anotada, folio {r.get('id')}.", warm=True)
     if a == 'confirm_reservation':
         await mitote_extensions.change_reservation_status(int(p.get('reservation_id')), mitote_extensions.ReservationStatusIn(status='confirmed'), db, user)
-        return _isis_say(f"Reservación {p.get('reservation_id')} confirmada.", warm=True)
+        return _isis_say(f"La reservación {p.get('reservation_id')} quedó confirmada.", warm=True)
     if a == 'reservation_arrive':
         r = await mitote_extensions.reservation_arrival(int(p.get('reservation_id')), mitote_extensions.ReservationArrivalIn(table_id=int(p.get('table_id')), waiter_id=int(p.get('waiter_id'))), db, user)
-        return _isis_say(f"¡Bienvenidos! Cuenta #{r.get('account_id')} abierta.", warm=True)
+        return _isis_say(f"¡Bienvenidos! Ya les abrí la cuenta {r.get('account_id')}.", warm=True)
     # --- v2: 13. Tiempos ---
     if a == 'prep_config':
         d = mitote_extensions.prep_config(db, user)
-        return _isis_say(f"El tiempo límite por comanda es de {d.get('batch_minutes')} minutos, con aviso al {d.get('warning_percent')}% del tiempo.", warm=True)
+        return _isis_say(f"El límite por comanda es de {d.get('batch_minutes')} minutos, y te aviso cuando lleve el {d.get('warning_percent')}% del tiempo.", warm=True)
     if a == 'prep_config_set':
         cur = mitote_extensions.prep_config(db, user)
         await mitote_extensions.put_prep_config(mitote_extensions.PrepPolicyIn(batch_minutes=int(p.get('batch_minutes')), warning_percent=int(cur.get('warning_percent') or 80)), db, user)
-        return _isis_say(f"Tiempo límite de preparación ahora en {p.get('batch_minutes')} minutos por comanda.", warm=True)
+        return _isis_say(f"El límite de preparación ahora es de {p.get('batch_minutes')} minutos por comanda.", warm=True)
     if a == 'product_prep_set':
         await mitote_extensions.put_product_prep(int(p.get('product_id')), mitote_extensions.ProductPrepIn(minutes=int(p.get('minutes'))), db, user)
         return _isis_say(f"El tiempo de preparación de {p.get('product')} ahora es de {p.get('minutes')} minutos.", warm=True)
@@ -2332,8 +2399,8 @@ async def _isis_execute(db, user, intent):
         top = d.get('products') or []
         top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in top[:3])
         prep = d.get('prep_avg_minutes')
-        prep_txt = f" Preparación promedio: {prep} minutos." if prep else ""
-        return _isis_say(f"{label} llevamos ${d.get('sales')} en ventas, {d.get('paid_accounts')} cuentas pagadas, ticket promedio ${d.get('average_ticket')}. Lo más vendido: {top_txt or 'nada todavía'}.{prep_txt}", warm=True)
+        prep_txt = f" La preparación promedio es de {prep} minutos." if prep else ""
+        return _isis_say(f"{label} llevamos {_isis_pesos(d.get('sales'))} en ventas, {_isis_n(d.get('paid_accounts'), 'cuenta pagada', 'cuentas pagadas')}, y el ticket promedio es de {_isis_pesos(d.get('average_ticket'))}. Lo más vendido: {top_txt or 'nada todavía'}.{prep_txt}", warm=True)
     raise HTTPException(400, 'No sé cómo hacer eso en El Mitote.')
 
 class IsisSetupIn(BaseModel):
@@ -2402,11 +2469,11 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
     if data.confirm_token:
         entry = _ISIS_CONFIRM.pop(data.confirm_token, None)
         if not entry or entry['expires'] < time.time():
-            reply = 'Esa confirmación ya venció. Dime de nuevo qué quieres hacer.'
+            reply = 'Esa confirmación ya se venció, dime de nuevo qué quieres hacer.'
             _record(reply)
             return {'ok': True, 'reply': reply, 'executed': False}
         if any(w in _isis_norm(data.message) for w in ('no', 'cancela', 'olvida')):
-            reply = 'Cancelado, no hice nada.'
+            reply = 'Sale, cancelado. No hice nada.'
             _record(reply)
             return {'ok': True, 'reply': reply, 'executed': False}
         try:
@@ -2429,7 +2496,7 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         if ai_intent:
             intent = ai_intent
     if intent is None:
-        reply = 'No te entendí, ¿me lo repites? Te ayudo con mesas, cuentas, comandas, cobros, caja, menú, inventario, personal, propinas, autorizaciones, auditoría, reservaciones, tiempos y estadísticas.'
+        reply = 'No te entendí, ¿me lo repites? Te ayudo con todo lo del restaurante: mesas, cuentas, caja, menú, inventario y ventas.'
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
     if intent.get('action') == 'unknown':
@@ -2437,7 +2504,7 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         _record(q)
         return {'ok': True, 'reply': q, 'executed': False}
     if intent.get('action') not in _WRITE_ACTIONS and intent.get('action') not in _READ_ACTIONS:
-        reply = 'Eso no lo hago en El Mitote. Te ayudo con mesas, cuentas, comandas, cobros, caja, menú, inventario, personal, propinas, autorizaciones, auditoría, reservaciones, tiempos y estadísticas.'
+        reply = 'Eso no lo puedo hacer en El Mitote. Te ayudo con mesas, cuentas, caja, menú, inventario y ventas.'
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
     if intent.get('action') in _WRITE_ACTIONS:
