@@ -15,6 +15,11 @@
   let kokoroTTS = null;
   let kokoroPromise = null;
   let speaking = false;
+  // La voz descargada vive solo en la memoria de la página: al recargar se
+  // perdía y había que descargarla de nuevo. Por eso se guarda una marca en
+  // localStorage y al abrir el panel se vuelve a cargar sola desde la caché
+  // del navegador (los archivos del modelo ya están guardados ahí).
+  const KOKORO_FLAG = 'isis-kokoro-ready';
 
   function status(text, mode) {
     const el = $('#isis-status');
@@ -59,7 +64,7 @@
     });
   }
 
-  async function loadKokoro() {
+  async function loadKokoro(opts) {
     if (kokoroState === 'ready') return kokoroTTS;
     if (kokoroState === 'loading') return kokoroPromise;
     kokoroState = 'loading';
@@ -73,15 +78,19 @@
         const tts = await mod.KokoroTTS.from_pretrained('onnx-community/Kokoro-82M-v1.0-ONNX', { dtype: 'q8', device: 'wasm' });
         kokoroTTS = tts;
         kokoroState = 'ready';
+        try { localStorage.setItem(KOKORO_FLAG, '1'); } catch (_) {}
         if (stateEl) stateEl.textContent = 'Voz de Isis lista (Dora).';
         const btn = $('#isis-download-voice');
         if (btn) btn.textContent = 'Voz de Isis lista ✓';
+        // Que se escuche el cambio de inmediato con la voz nueva.
+        if (opts && opts.announce) await speak('Hola, soy Isis. Ya tengo mi voz lista.');
         return tts;
       } catch (e) {
         try { console.error('Kokoro:', e); } catch (_) {}
         kokoroTTS = null;
         kokoroState = 'idle'; // permite reintentar tocando de nuevo
         kokoroPromise = null;
+        try { localStorage.removeItem(KOKORO_FLAG); } catch (_) {}
         if (stateEl) stateEl.textContent = 'No se pudo descargar la voz; toca de nuevo para reintentar. Mientras tanto, Isis hablará con la voz del teléfono.';
         return null;
       }
@@ -179,9 +188,24 @@
       const stateEl = $('#isis-voice-state');
       if (stateEl && !d.fableai_configured) stateEl.textContent = 'Sin clave de FableAI: Isis entiende órdenes directas en español. El propietario la configura en el servidor.';
     } catch (e) {}
+    // Si la voz ya se descargó una vez, cargarla sola al entrar (desde la
+    // caché del navegador, sin descargar de nuevo) para que el saludo y las
+    // respuestas ya suenen con la voz de Dora. Si tarda más de 25 s, seguir
+    // con la voz del teléfono para no dejarte esperando.
+    let kokoroReady = false;
+    try {
+      if (localStorage.getItem(KOKORO_FLAG) === '1') {
+        const stateEl = $('#isis-voice-state');
+        if (stateEl) stateEl.textContent = 'Cargando la voz de Isis…';
+        kokoroReady = !!(await Promise.race([
+          loadKokoro(),
+          new Promise((resolve) => setTimeout(() => resolve(null), 25000)),
+        ]));
+      }
+    } catch (e) {}
     const greet = 'Hola, soy Isis, tu asistente de El Mitote. Te ayudo con todo lo del restaurante: puedo decirte qué mesas están libres, cuánto debe una mesa, cuánto queda en inventario, cómo va la caja, o hacer el corte. Dime, ¿qué necesitas?';
     const rep = $('#isis-reply');
-    if (rep) rep.textContent = 'Isis: ' + greet;
+    if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (Voz de Dora aún no cargada: toca "Descargar voz de Isis".)');
     speak(greet);
   }
 
@@ -197,7 +221,7 @@
     const mic = $('#isis-mic');
     if (mic) mic.addEventListener('click', () => (listening ? stopListening() : startListening()));
     const dl = $('#isis-download-voice');
-    if (dl) dl.addEventListener('click', () => loadKokoro());
+    if (dl) dl.addEventListener('click', () => loadKokoro({ announce: true }));
     const ex = $('#isis-exit');
     if (ex) ex.addEventListener('click', exit);
     const tg = $('#isis-toggle-chat');
