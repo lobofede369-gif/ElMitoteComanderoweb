@@ -23,6 +23,30 @@
    la respuesta entera; si el stream falla antes del primer evento, va
    por el chat normal. La espera ya no se habla (tono suave) y la
    respuesta real ya no espera a que termine ninguna espera.
+   Música del restaurante (v14, gratis): el micrófono oye todo junto y
+   el reconocedor del navegador no distingue la voz de Santiago de la
+   música (las letras de las canciones le sonaban como órdenes y la
+   música la cortaba a media frase). REDIRECCIÓN 11:05 (prueba en vivo
+   de Santiago: "Ni se frena cuando le estoy hablando y se sigue de
+   filo, no sirve para hacer nada de lo que le pido y sigue siendo
+   lenta" + "Da muchas vueltas cuando le pido algo"): la v14 ya no es
+   solo el filtro de música, es que Isis trabaje como Muse — entiende
+   a la primera, actúa directo, confirma lo que hizo, pregunta preciso
+   solo cuando algo no está claro, y rápida. (1) Barge-in rehecho: el
+   interruptor solo valía resultados FINALES y con música casi nunca
+   llega un final, así que nunca se callaba; ahora valen también los
+   parciales (con "Isis" corta al instante; con voz clara, tras 700 ms),
+   rearma hasta 20 veces y reintenta el arranque; el botón de silenciar
+   la calla al instante sin depender del reconocimiento. (2) La puerta
+   bloquea la MÚSICA, no a Santiago: falla abierta cuando el medidor no
+   tiene datos; "Isis" es el comodín que siempre funciona. (3) Lo
+   rutinario y reversible se ejecuta directo y se confirma DESPUÉS
+   (abrir mesa, reponer, cambiar estado de comanda, anotar pendientes);
+   solo dinero, lo delicado y lo que no se puede deshacer preguntan
+   antes. (4) Chat escrito en el panel: mismo camino que la voz, sin
+   micrófono ni permisos, funciona también en la app instalada.
+   (5) Velocidad gratis: el despertar del servidor ya no se espera en
+   serie antes de pedir, y el hueco entre turnos bajó de 700 a 400 ms.
    Resumen al entrar (v8): después del saludo y las alertas, Isis dice sola
    cómo cerró el día anterior (ventas de ayer, lo más vendido, lo que se
    acabó), una sola vez por entrada al panel.
@@ -78,6 +102,14 @@
   // debe apagar la escucha de interrupción del speak nuevo.
   const saidAlerts = new Set(); // alertas ya dichas (entrada + media llamada)
   let lastMidCheck = 0; // último chequeo de avisos a media llamada
+  // Puerta "Isis" (v14, gratis): en llamada, lo que se escucha solo se
+  // procesa si trae la palabra "Isis" o si es la respuesta directa a
+  // algo que ella preguntó. followUpOpen = el último turno de Isis fue
+  // una pregunta (o confirmación pendiente) y el siguiente turno entra
+  // sin "Isis". ignoredHeard = resultados ignorados seguidos (música):
+  // al tercero se muestra la pista en pantalla, sin voz.
+  let followUpOpen = false;
+  let ignoredHeard = 0;
   // Fluidez (v9, ritmo despierto en v10.5): por frases, para que no suene
   // a robot ni se trabe generando respuestas largas. La velocidad subió
   // (Dora 1.05, pausa 100 ms) porque a 0.95 con pausas de 200 ms la voz
@@ -269,6 +301,220 @@
   }
   // ISIS_DETAIL_END
 
+  // Puerta "Isis" + medidor de banda de voz (v14, gratis, solo cliente).
+  // REGLA (documentada, para no redescubrirla): la puerta bloquea la
+  // MÚSICA, no a Santiago. Lo que el reconocedor escucha llega al
+  // servidor si (a) es la respuesta directa a algo que Isis preguntó
+  // — confirmación pendiente o su última respuesta terminó en "?" —,
+  // o (b) empieza con la palabra "Isis" (tras quitar muletillas), o
+  // (c) el medidor NO dice que es música. El medidor es la puerta de
+  // todos los días: si hay voz real en la banda 300-3400 Hz, pasa; si
+  // el medidor no tiene datos (sin permiso, sin arrancar), TAMBIÉN pasa
+  // — no se puede probar que es música, así que no se bloquea a
+  // Santiago por una sospecha. Solo se ignora cuando el medidor dice
+  // con datos que es música (audio fuerte fuera de la banda de voz).
+  // "Isis" es el comodín que siempre funciona, también para arrancar
+  // después de un silencio. La puerta fuerte contra la música es el
+  // medidor; la palabra "Isis" es el seguro cuando la música está tan
+  // fuerte que el medidor duda. Para la INTERRUPCIÓN la regla es más
+  // estricta (gateInterrupt): la música no debe cortarla, así que ahí
+  // no hay "pasa si no sé": solo "Isis" o voz presente clara.
+  // ISIS_WAKE_GATE_BEGIN
+  const VOICE_BAND_MIN_HZ = 300; // la voz humana vive ~300-3400 Hz
+  const VOICE_BAND_MAX_HZ = 3400;
+  const VOICE_BAND_RATIO_MIN = 0.45; // energía en banda / energía total
+  const VOICE_BAND_LEVEL_MIN = 8; // nivel medio total (0-255) para no medir silencio
+  const VOICE_BAND_INBAND_MIN = 20; // nivel medio EN LA BANDA: voz cerca del mic
+  const VOICE_BAND_WINDOW = 20; // muestras de 100 ms = 2 s de escucha
+  const WAKE_FILLERS = /^(?:oye|eh|mira|a ver|por favor|disculpa|perdón|hola|bueno|este|pues|digo)[\s,]+/i;
+
+  // Función pura (probable sin navegador): ¿empieza con "Isis" tras
+  // quitar muletillas? Devuelve el texto sin el "Isis" inicial, para
+  // que al servidor llegue la orden limpia ("agrega dos coronas...").
+  // "Isis" sola devuelve cleaned vacío: solo abre el turno.
+  function isisWakeCheck(text) {
+    const raw = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return { wake: false, cleaned: '' };
+    let t = raw;
+    let prev;
+    do {
+      prev = t;
+      t = t.replace(WAKE_FILLERS, '').trim();
+    } while (t !== prev);
+    const m = t.match(/^isis(?:[\s,]+(.*))?$/i);
+    if (!m) return { wake: false, cleaned: raw };
+    return { wake: true, cleaned: (m[1] || '').trim() };
+  }
+
+  // Función pura: energía en la banda de voz / energía total, de un
+  // espectro de getByteFrequencyData (0-255 por bin). fftSize 2048 y
+  // 48 kHz dan bins de ~23.4 Hz: la banda 300-3400 Hz son los bins
+  // ~13-145 de 1024. Sin datos o en silencio, 0.
+  function isisVoiceBandRatio(data, sampleRate, fftSize) {
+    if (!data || !data.length || !sampleRate || !fftSize) return 0;
+    const binWidth = sampleRate / fftSize;
+    const lo = Math.max(0, Math.ceil(VOICE_BAND_MIN_HZ / binWidth));
+    const hi = Math.min(data.length - 1, Math.floor(VOICE_BAND_MAX_HZ / binWidth));
+    let band = 0, total = 0;
+    for (let i = 0; i < data.length; i++) {
+      const e = data[i] * data[i];
+      total += e;
+      if (i >= lo && i <= hi) band += e;
+    }
+    return total > 0 ? band / total : 0;
+  }
+
+  function isisMeanLevel(data) {
+    if (!data || !data.length) return 0;
+    let s = 0;
+    for (let i = 0; i < data.length; i++) s += data[i];
+    return s / data.length;
+  }
+
+  // Función pura: nivel medio en la banda de voz (0-255 por bin). Junto
+  // con el ratio dice si hay una voz real sonando: voz cerca del mic
+  // tiene la banda ALTA, aunque la música meta energía fuera de banda.
+  function isisBandLevel(data, sampleRate, fftSize) {
+    if (!data || !data.length || !sampleRate || !fftSize) return 0;
+    const binWidth = sampleRate / fftSize;
+    const lo = Math.max(0, Math.ceil(VOICE_BAND_MIN_HZ / binWidth));
+    const hi = Math.min(data.length - 1, Math.floor(VOICE_BAND_MAX_HZ / binWidth));
+    if (hi < lo) return 0;
+    let s = 0;
+    for (let i = lo; i <= hi; i++) s += data[i];
+    return s / (hi - lo + 1);
+  }
+
+  // Función pura: la decisión de la puerta. opts: { followUpOpen,
+  // voicePresent, musicLikely }. reason: 'followup' | 'wake' |
+  // 'voice' | 'open' (sin datos del medidor: no se puede probar que es
+  // música, así que pasa — fallar abierto, nunca bloquear a Santiago
+  // por una sospecha) | 'attention' (solo dijo "Isis": abre el turno
+  // sin mandar nada) | 'ignored' (el medidor dice con datos que es música).
+  function gateHeard(text, opts) {
+    const o = opts || {};
+    const raw = String(text || '').trim();
+    if (o.followUpOpen) {
+      const w = isisWakeCheck(raw);
+      return { accept: true, cleaned: w.wake ? w.cleaned : raw, reason: 'followup' };
+    }
+    const w = isisWakeCheck(raw);
+    if (w.wake) {
+      if (!w.cleaned) return { accept: true, cleaned: '', reason: 'attention' };
+      return { accept: true, cleaned: w.cleaned, reason: 'wake' };
+    }
+    if (o.musicLikely) return { accept: false, cleaned: '', reason: 'ignored' };
+    return { accept: true, cleaned: raw, reason: o.voicePresent ? 'voice' : 'open' };
+  }
+
+  // Función pura: la decisión de la INTERRUPCIÓN, más estricta que la
+  // puerta principal: la música no debe cortarla a media frase, así
+  // que aquí no hay "pasa si no sé". opts: { voicePresent, elapsedMs }
+  // (tiempo desde que Isis empezó a hablar). Con "Isis" interrumpe de
+  // inmediato, sin esperar al segundo de eco; con voz presente clara
+  // espera 700 ms (que pase el eco del arranque) y exige al menos 2
+  // palabras, para no cortarse sola con un ruido suelto.
+  function gateInterrupt(text, opts) {
+    const o = opts || {};
+    const raw = String(text || '').trim();
+    const w = isisWakeCheck(raw);
+    if (w.wake) {
+      if (!w.cleaned) return { interrupt: true, cleaned: '', reason: 'attention' };
+      return { interrupt: true, cleaned: w.cleaned, reason: 'wake' };
+    }
+    if (o.voicePresent && (o.elapsedMs || 0) > 700 && raw.split(/\s+/).filter(Boolean).length >= 2) {
+      return { interrupt: true, cleaned: raw, reason: 'voice' };
+    }
+    return { interrupt: false, cleaned: '', reason: 'ignored' };
+  }
+
+  // Medidor de banda de voz (v14): un stream paralelo con getUserMedia
+  // + AnalyserNode. NO toca el audio que entra al reconocedor (el
+  // navegador no deja filtrarlo): solo mide, y su veredicto se usa como
+  // puerta sobre los RESULTADOS del reconocedor. Muestrea cada 100 ms y
+  // guarda 2 s; voiceDominant() es la mediana de la ventana. Si no
+  // arranca (sin permiso, sin AudioContext), queda deshabilitado y la
+  // puerta sigue solo con la palabra "Isis": nunca tira la llamada.
+  function createVoiceBandMeter() {
+    let ctx = null, stream = null, analyser = null, timer = null;
+    let samples = [];
+    let available = false;
+    async function start() {
+      try {
+        const nav = (typeof navigator !== 'undefined') ? navigator : null;
+        if (!nav || !nav.mediaDevices || typeof nav.mediaDevices.getUserMedia !== 'function') return false;
+        const Ctx = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+        if (!Ctx) return false;
+        stream = await nav.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        ctx = new Ctx();
+        if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
+        const src = ctx.createMediaStreamSource(stream);
+        analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        src.connect(analyser);
+        available = true;
+        timer = setInterval(sample, 100);
+        return true;
+      } catch (e) {
+        available = false;
+        return false;
+      }
+    }
+    function sample() {
+      try {
+        if (!analyser || !ctx) return;
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(data);
+        let max = 0;
+        for (let i = 0; i < data.length; i++) if (data[i] > max) max = data[i];
+        samples.push({ ratio: isisVoiceBandRatio(data, ctx.sampleRate, analyser.fftSize),
+                       level: isisMeanLevel(data),
+                       bandLevel: isisBandLevel(data, ctx.sampleRate, analyser.fftSize),
+                       max });
+        if (samples.length > VOICE_BAND_WINDOW) samples.shift();
+      } catch (e) {}
+    }
+    // Voz presente: la banda suena fuerte y con buena parte de la
+    // energía total. Es la señal para dejar pasar lo escuchado (y para
+    // interrumpir con voz clara). La mediana de 2 s aguanta picos.
+    function voicePresent() {
+      if (!available || samples.length < 5) return false;
+      const med = (arr) => arr.slice().sort((a, b) => a - b)[Math.floor(arr.length / 2)];
+      return med(samples.map((s) => s.bandLevel)) >= VOICE_BAND_INBAND_MIN
+        && med(samples.map((s) => s.ratio)) >= VOICE_BAND_RATIO_MIN;
+    }
+    // Música probable: hay audio fuerte pero la energía está REPARTIDA
+    // (ratio bajo) — banda ancha o bajos, que suenan en pocos bins y por
+    // eso su media es baja pero su pico no. El volumen se mide por media
+    // o por pico, NUNCA por el nivel en banda: la música de banda ancha
+    // también suena dentro de la banda. Solo con datos y en este caso se
+    // ignora lo escuchado; en cualquier otro caso la puerta falla
+    // ABIERTA para no bloquear a Santiago.
+    function musicLikely() {
+      if (!available || samples.length < 5) return false;
+      const med = (arr) => arr.slice().sort((a, b) => a - b)[Math.floor(arr.length / 2)];
+      return med(samples.map((s) => s.ratio)) < VOICE_BAND_RATIO_MIN
+        && (med(samples.map((s) => s.level)) >= VOICE_BAND_LEVEL_MIN
+          || med(samples.map((s) => s.max)) >= 100);
+    }
+    function stop() {
+      try { if (timer) clearInterval(timer); } catch (e) {}
+      timer = null;
+      try { if (stream) stream.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} }); } catch (e) {}
+      stream = null;
+      try { if (ctx) ctx.close(); } catch (e) {}
+      ctx = null;
+      analyser = null;
+      samples = [];
+      available = false;
+    }
+    return { start, stop, sample, voicePresent, musicLikely,
+      testHooks: { setAnalyser: (a, sampleRate) => { analyser = a; ctx = { sampleRate: sampleRate || 48000 }; available = true; },
+               samples: () => samples, isAvailable: () => available } };
+  }
+  const voiceBandMeter = createVoiceBandMeter();
+  // ISIS_WAKE_GATE_END
+
   // El botón grande es el control de la llamada (Llamar / Colgar) y el
   // botón chico es el silencio. El estado de los botones lo manda inCall.
   function updateCallUI() {
@@ -321,6 +567,7 @@
     speaking = true;
     speakStartedAt = Date.now();
     interruptRestarts = 0;
+    interruptStartTries = 0;
     status('Hablando…', 'speaking');
     startInterruptListener();
     try {
@@ -535,14 +782,29 @@
     return t;
   }
 
-  // Interrupción (v7): si Santiago habla mientras Isis habla, ella se calla
-  // y lo escucha. Un reconocedor aparte escucha solo interrupciones mientras
-  // suena la voz; el eco del arranque se ignora (primer segundo) y solo
-  // valen resultados finales, no parciales. El botón de micrófono no se usa
-  // para esto porque en llamada ese botón es "Colgar".
+  // Interrupción (v7, rehecha en v14): si Santiago habla mientras Isis
+  // habla, ella se calla y lo escucha. POR QUÉ FALLABA EN VIVO (11:05):
+  // el reconocedor solo valía resultados FINALES, y con música el
+  // servicio casi nunca cierra una frase (todo queda en parciales), así
+  // que handleInterrupt nunca se llamaba y ella se seguía de filo.
+  // Además, si el arranque del reconocedor fallaba (en Android solo
+  // puede haber UN reconocimiento activo y el principal puede seguir
+  // cerrándose), el catch lo dejaba en null en silencio para toda la
+  // respuesta; y el tope de 5 rearmes lo dejaba muerto en respuestas
+  // largas con ruido. CORRECCIÓN v14: valen también los PARCIALES
+  // (gateInterrupt: con "Isis" corta al instante, sin esperar; con voz
+  // presente clara corta tras 700 ms y con 2+ palabras); se rearma
+  // hasta 20 veces por respuesta, también en onerror, y si el arranque
+  // falla se reintenta a los 500 ms (3 intentos). El botón de silenciar
+  // es el freno seguro: si se toca mientras habla, la calla al instante
+  // sin depender del reconocimiento.
+  let interruptStartTries = 0; // intentos de arranque por respuesta hablada
   function startInterruptListener() {
     if (!SpeechRecognition || !inCall || muted || interruptRecognizer) return;
     interruptOff = false;
+    // El reconocedor principal puede seguir cerrándose: matarlo antes
+    // quita la contienda por el único reconocimiento de Android.
+    stopListening();
     try {
       const r = new SpeechRecognition();
       r.lang = 'es-MX';
@@ -551,28 +813,40 @@
       r.maxAlternatives = 1;
       r.onresult = (e) => {
         if (!speaking || !inCall || muted) return;
-        if (Date.now() - speakStartedAt < 1000) return;
         for (let i = e.resultIndex; i < e.results.length; i++) {
           const res = e.results[i];
-          if (res.isFinal && res[0] && res[0].transcript && res[0].transcript.trim()) {
+          if (res[0] && res[0].transcript && res[0].transcript.trim()) {
+            // Parciales también valen (v14): con música casi nunca llega
+            // un final; la puerta decide si es Santiago o la música.
             handleInterrupt(res[0].transcript.trim());
             return;
           }
         }
       };
-      r.onerror = () => {};
-      r.onend = () => {
+      const rearm = () => {
         interruptRecognizer = null;
-        // Se cortó solo (silencio): si Isis sigue hablando, rearmar en
-        // silencio, con tope para no girar en bucle si el servicio falla.
-        if (!interruptOff && speaking && inCall && !muted && interruptRestarts < 5) {
+        // Se cortó solo (silencio, ruido, error): si Isis sigue
+        // hablando, rearmar con pausa, con tope para no girar en bucle
+        // si el servicio falla de plano.
+        if (!interruptOff && speaking && inCall && !muted && interruptRestarts < 20) {
           interruptRestarts += 1;
-          startInterruptListener();
+          setTimeout(() => { if (!interruptOff && speaking && inCall && !muted) startInterruptListener(); }, 300);
         }
       };
+      r.onerror = () => { rearm(); };
+      r.onend = () => { rearm(); };
       r.start();
       interruptRecognizer = r;
-    } catch (e) { interruptRecognizer = null; }
+      interruptStartTries = 0;
+    } catch (e) {
+      interruptRecognizer = null;
+      // El arranque falló (contienda con el principal): reintentar en
+      // 500 ms, no dejarla sorda para toda la respuesta.
+      if (!interruptOff && speaking && inCall && !muted && interruptStartTries < 3) {
+        interruptStartTries += 1;
+        setTimeout(() => { if (!interruptOff && speaking && inCall && !muted) startInterruptListener(); }, 500);
+      }
+    }
   }
 
   function stopInterruptListener() {
@@ -583,11 +857,21 @@
 
   function handleInterrupt(text) {
     if (!inCall || !speaking) return;
+    // Puerta de interrupción (v14, estricta): solo "Isis" o voz presente
+    // clara. La música sola no la corta; Santiago sí, al instante.
+    const gate = gateInterrupt(text, { voicePresent: voiceBandMeter.voicePresent(),
+                                       elapsedMs: Date.now() - speakStartedAt });
+    if (!gate.interrupt) return;
     stopInterruptListener();
     stopListening();
     stopSpeaking();
     status('Te escucho, dime.', 'listening');
-    sendToIsis(text);
+    if (gate.reason === 'attention') {
+      followUpOpen = true;
+      maybeListen();
+      return;
+    }
+    sendToIsis(gate.cleaned);
   }
 
   // Timbre de llamada (v7): dos tonos de teléfono generados con WebAudio,
@@ -1222,7 +1506,14 @@
     }
   }
 
-  async function sendToIsis(message) {
+  // sendToIsis(message, opts): el mismo camino para voz y texto (v14).
+  // opts.via === 'text' (chat escrito): sin tono de espera (el tono es
+  // solo para voz) y sin depender del micrófono. La respuesta se habla
+  // si hay llamada y no está silenciada; si no, solo se muestra el
+  // texto (así el chat escrito funciona también en la app instalada,
+  // donde no hay reconocimiento de voz).
+  async function sendToIsis(message, opts) {
+    const viaText = !!(opts && opts.via === 'text');
     // Si había un stream anterior en curso (interrupción), se aborta: la
     // petición nueva lo sustituye. El cliente genera una llave única por
     // frase (v13): el reintento repite la misma llave y el servidor no
@@ -1238,14 +1529,18 @@
     status('Pensando…', 'thinking');
     // Espera (v13): tono suave + texto, nunca voz del teléfono. La
     // respuesta real se habla en cuanto llega, sin esperar a nada.
+    // En texto no hay tono: el estado ya dice que está revisando.
     let waitTonel = false;
-    const waitTimer = setTimeout(async () => {
+    const waitTimer = viaText ? null : setTimeout(async () => {
       if (!inCall || waitTonel) return;
       waitTonel = true;
       status('Estoy revisando…', 'thinking');
       await playWaitTone();
     }, WAIT_DELAY_MS);
-    await wakeServer(2000);
+    // Despertar en paralelo (v14): antes se esperaba hasta 2 s en serie
+    // antes de pedir; el chat mismo despierta al servidor si hace falta,
+    // y si falla tiene su reintento. Cero segundos regalados por turno.
+    wakeServer(2000);
     // Cola de frases del stream + hablador que arranca con la primera.
     const queue = { parts: [], done: false };
     let spokeStream = false;
@@ -1257,6 +1552,7 @@
       speaking = true;
       speakStartedAt = Date.now();
       interruptRestarts = 0;
+      interruptStartTries = 0;
       status('Hablando…', 'speaking');
       startInterruptListener();
       speakerPromise = (async () => {
@@ -1267,6 +1563,10 @@
     const applyDone = (data) => {
       pendingToken = data.needs_confirmation ? data.confirm_token : null;
       const reply = data.reply || 'Listo.';
+      // Puerta "Isis" (v14): si Isis preguntó algo o pide confirmación,
+      // la respuesta directa entra sin "Isis"; si no, el siguiente turno
+      // necesita la palabra (o voz dominante).
+      followUpOpen = !!(data.needs_confirmation || /\?\s*$/.test(reply));
       const rep = $('#isis-reply');
       if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di "sí" para confirmar o "no" para cancelar.)' : '');
       // v12: el detalle escrito se muestra sin hablarse; sin detalle, se limpia.
@@ -1355,6 +1655,28 @@
     maybeListen();
   }
 
+  // Chat escrito (v14): campo de texto + Enviar en el panel. Es el mismo
+  // camino que la voz (sendToIsis): mismo parser, mismo Claude, mismas
+  // confirmaciones y ejecución directa. Sin micrófono no hay música que
+  // interfiera ni reconocimiento que falle: es la salida fiable cuando
+  // la voz no se entiende. Funciona también en la app instalada
+  // (WebView), donde SpeechRecognition es undefined: no toca el
+  // reconocimiento ni getUserMedia. Escribir corta la respuesta hablada
+  // en curso, como interrumpir por voz; la respuesta nueva se habla si
+  // hay llamada y no está silenciada, si no solo se muestra el texto.
+  // ISIS_TEXT_CHAT_BEGIN
+  function sendIsisText() {
+    const input = $('#isis-text-input');
+    if (!input) return;
+    const text = (input.value || '').trim();
+    if (!text) return;
+    input.value = '';
+    // Cortar la respuesta hablada en curso, como al interrumpirla.
+    stopSpeaking();
+    sendToIsis(text, { via: 'text' });
+  }
+  // ISIS_TEXT_CHAT_END
+
   // Avisos a media llamada (v7): cada ~75 segundos, entre turnos, Isis
   // revisa si apareció algo nuevo que necesita atención y lo dice en corto.
   // Nunca interrumpe a Santiago a media frase (solo corre después de que
@@ -1389,6 +1711,9 @@
       if (rep) rep.textContent = 'Isis: ' + text;
       setDetail('');
       await speak(text);
+      // El aviso es una afirmación, no una pregunta: el siguiente turno
+      // necesita la palabra "Isis" (v14).
+      followUpOpen = false;
     } catch (e) {}
   }
 
@@ -1398,7 +1723,7 @@
     if (!inCall || muted || listening || speaking || busy) return;
     if (!SpeechRecognition) return;
     clearTimeout(listenTimer);
-    listenTimer = setTimeout(startListening, 700);
+    listenTimer = setTimeout(startListening, 400);
   }
 
   function startListening() {
@@ -1416,8 +1741,35 @@
         const text = e.results[0][0].transcript || '';
         listening = false;
         listenErrors = 0;
-        if (text.trim()) sendToIsis(text.trim());
-        else maybeListen();
+        const heard = (text || '').trim();
+        if (!heard) { maybeListen(); return; }
+        // Puerta "Isis" (v14): la música del restaurante no llega al
+        // servidor. Sin "Isis" ni respuesta pendiente ni voz dominante,
+        // se ignora en silencio y se vuelve a escuchar.
+        const gate = gateHeard(heard, { followUpOpen,
+          voicePresent: voiceBandMeter.voicePresent(), musicLikely: voiceBandMeter.musicLikely() });
+        if (!gate.accept) {
+          ignoredHeard += 1;
+          try { console.log('Isis: ignorado (música/ruido):', heard); } catch (_) {}
+          if (ignoredHeard % 3 === 0) {
+            // Pista en pantalla, sin voz: que sepa que tiene que decir "Isis".
+            status('Oigo música de fondo: dime "Isis" antes de pedirme algo.', '');
+            clearTimeout(listenTimer);
+            listenTimer = setTimeout(maybeListen, 2000);
+          } else {
+            maybeListen();
+          }
+          return;
+        }
+        ignoredHeard = 0;
+        if (gate.reason === 'attention') {
+          // Solo dijo "Isis": abre el turno sin gastar una petición.
+          followUpOpen = true;
+          status('Te escucho, dime.', 'listening');
+          maybeListen();
+          return;
+        }
+        sendToIsis(gate.cleaned);
       };
       recognizer.onerror = (e) => {
         listening = false;
@@ -1471,6 +1823,12 @@
     inCall = true;
     muted = false;
     busy = false;
+    // Puerta "Isis" (v14): al arrancar, el saludo pregunta y el primer
+    // turno entra sin la palabra; el medidor de banda arranca en
+    // paralelo (si no puede, la puerta sigue solo con la palabra).
+    followUpOpen = true;
+    ignoredHeard = 0;
+    voiceBandMeter.start();
     updateCallUI();
     startCallTimer();
     lastMidCheck = Date.now();
@@ -1481,6 +1839,10 @@
     inCall = false;
     muted = false;
     busy = false;
+    // Puerta "Isis" (v14): se apaga el medidor y se resetea la puerta.
+    followUpOpen = false;
+    ignoredHeard = 0;
+    voiceBandMeter.stop();
     // v13: abortar el stream en curso, para que no siga llegando nada.
     try { if (streamCtl) streamCtl.abort(); } catch (e) {}
     streamCtl = null;
@@ -1505,6 +1867,10 @@
     if (!inCall) return;
     muted = !muted;
     if (muted) {
+      // Freno seguro (v14): si se toca mientras Isis habla, la calla al
+      // instante sin depender del reconocimiento (que puede fallar con
+      // música). Silenciar = callarla + no escucharla.
+      stopSpeaking();
       stopListening();
       status('Micrófono en silencio, no te escucho.', '');
     } else {
@@ -1619,6 +1985,11 @@
       if (rep) rep.textContent = (rep.textContent || 'Isis: ') + ' ' + morningBrief;
       await speak(morningBrief);
     }
+    // Puerta "Isis" (v14): el saludo pregunta, así que el primer turno
+    // entra sin la palabra; el medidor de banda arranca en paralelo.
+    followUpOpen = true;
+    ignoredHeard = 0;
+    voiceBandMeter.start();
     maybeListen();
   }
 
@@ -1637,6 +2008,14 @@
     if (mic) mic.addEventListener('click', () => (inCall ? endCall() : startCall()));
     const mute = $('#isis-mute');
     if (mute) mute.addEventListener('click', toggleMute);
+    // Chat escrito (v14): Enviar con el botón o con Enter. No exige
+    // micrófono ni permisos: funciona también sin reconocimiento de voz.
+    const txtSend = $('#isis-text-send');
+    if (txtSend) txtSend.addEventListener('click', sendIsisText);
+    const txtIn = $('#isis-text-input');
+    if (txtIn) txtIn.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); sendIsisText(); }
+    });
     const dl = $('#isis-download-voice');
     if (dl) dl.addEventListener('click', () => loadKokoro({ announce: true }));
     const engK = $('#isis-engine-kokoro');
@@ -1685,5 +2064,13 @@
       splitIntoSpeechParts, mergeSpeechParts, setDetail, playWaitTone,
       requestOpenAIPart, makeOpenAIVoicePlayer: makeOpenAIPlayer,
       setOpenaiAvailable: (v) => { openaiTTS = !!v; applyVoiceEngine(); }, speak,
-      sendToIsis, setInCall: (v) => { inCall = !!v; } } };
+      sendToIsis, setInCall: (v) => { inCall = !!v; },
+      isisWakeCheck, isisVoiceBandRatio, isisBandLevel, gateHeard, gateInterrupt,
+      createVoiceBandMeter, voiceBandMeter,
+      getFollowUpOpen: () => followUpOpen, setFollowUpOpen: (v) => { followUpOpen = !!v; },
+      getIgnoredHeard: () => ignoredHeard, sendIsisText,
+      startInterruptListener, stopInterruptListener, handleInterrupt,
+      getInterruptRecognizer: () => interruptRecognizer,
+      setSpeaking: (v) => { speaking = !!v; speakStartedAt = Date.now() - 2000; },
+      getSpeaking: () => speaking } };
 })();
