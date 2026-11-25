@@ -843,6 +843,43 @@ FABLEAI_MODEL = os.getenv('FABLEAI_MODEL', 'claude-sonnet-5-5').strip()
 FABLEAI_URL = os.getenv('FABLEAI_URL', 'https://api.fableaiapi.com/v1/chat/completions').strip()
 _ISIS_CONFIRM = {}  # token -> {'intent': dict, 'expires': float}
 
+# --- Memoria de conversación (v4): solo en memoria del servidor, nunca en BD ---
+# Cada llamada guarda sus últimos intercambios para que Isis siga el hilo
+# ("¿y esa mesa?" se refiere a lo último que se habló). Se borra a los 30
+# minutos sin uso o cuando se cuelga (POST /api/isis-voice/end-call).
+_ISIS_HISTORY = {}  # user_id -> {'turns': [(usuario, isis)], 'last': float}
+_ISIS_HISTORY_TTL = 1800  # 30 minutos sin uso
+_ISIS_HISTORY_MAX = 8  # últimos intercambios
+
+
+def _isis_history_get(user_id):
+    entry = _ISIS_HISTORY.get(user_id)
+    if not entry or time.time() - entry['last'] > _ISIS_HISTORY_TTL:
+        _ISIS_HISTORY.pop(user_id, None)
+        return []
+    return list(entry['turns'])
+
+
+def _isis_history_add(user_id, user_msg, reply):
+    entry = _ISIS_HISTORY.get(user_id)
+    if not entry or time.time() - entry['last'] > _ISIS_HISTORY_TTL:
+        entry = {'turns': [], 'last': time.time()}
+    entry['turns'].append((str(user_msg or '')[:500], str(reply or '')[:500]))
+    entry['turns'] = entry['turns'][-_ISIS_HISTORY_MAX:]
+    entry['last'] = time.time()
+    _ISIS_HISTORY[user_id] = entry
+
+
+def _isis_history_clear(user_id):
+    _ISIS_HISTORY.pop(user_id, None)
+
+
+def _isis_history_text(user_id):
+    turns = _isis_history_get(user_id)
+    if not turns:
+        return ''
+    return '\n'.join(f"Usuario: {u}\nIsis: {r}" for u, r in turns)
+
 # PERSONALIDAD DE ISIS (v2) — NOTA HONESTA: esto es personalidad SIMULADA,
 # un estilo de respuesta programado, no consciencia real. Isis no siente,
 # no tiene conciencia ni emociones de verdad: solo responde con un tono
@@ -907,11 +944,17 @@ _ISIS_SYSTEM = (
     "escritura, pon action unknown y en question pregunta solo por ese "
     "dato, en espanol. Si el mensaje es una pregunta o una charla que no "
     "corresponde a ninguna accion concreta (un saludo, como va la noche, "
-    "un consejo), usa chat con una respuesta corta de 1-2 frases, calida, "
-    "con tono mexicano de restaurante, usando SOLO los datos del contexto; "
-    "nunca inventes numeros ni datos. Si la pregunta necesita datos que "
-    "no estan en el contexto, usa la accion de lectura mas cercana o "
-    "unknown con una pregunta."
+    "un consejo), usa chat con una respuesta corta y calida, con tono "
+    "mexicano de restaurante, usando SOLO los datos del contexto; nunca "
+    "inventes numeros ni datos. Si el usuario pide recomendacion, opinion "
+    "o analisis (que me recomiendas, como va la noche, que hago con, como "
+    "ves), responde con criterio en 2-4 frases cortas: que ves en los "
+    "datos, que recomiendas hacer y por que, y ofrece ejecutar la accion "
+    "(tu solo propones, la ejecucion siempre pide confirmacion). Si la "
+    "pregunta necesita datos que no estan en el contexto, usa la accion "
+    "de lectura mas cercana o unknown con una pregunta. La conversacion "
+    "reciente de esta llamada viene en el contexto: usala para seguir el "
+    "hilo (por ejemplo, 'y esa mesa?' se refiere a lo ultimo que se hablo)."
 )
 
 def _isis_norm(s):
@@ -1189,11 +1232,52 @@ def _isis_parse_reservation_time(text):
         return None
     return base.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-def _isis_parse_local(db, user, raw):
+def _isis_resolve_followup(db, user, text, history):
+    """Resuelve un seguimiento corto ("¿y la de 1.2?") usando el último intercambio (v4).
+    Solo para preguntas de precio de un producto de la misma familia que el último
+    que se mencionó (Corona 355 -> Corona 1.2). Si no hay a qué referirse, None."""
+    if not history:
+        return None
+    words = text.split()
+    if len(words) > 6:
+        return None
+    if not (text.startswith('y ') or re.match(r'^(y\s+)?(la|el|esa|ese|eso|esta|este)\b', text)):
+        return None
+    last_user = (history[-1][0] or '') if history else ''
+    last_prod = _isis_find_product(db, user, last_user)
+    if not last_prod:
+        return None
+    fam = _isis_norm(last_prod.get('name', '')).split()
+    if not fam:
+        return None
+    try:
+        prods = products(db, user)
+    except Exception:
+        return None
+    best = None
+    for p in prods:
+        name = _isis_norm(p.get('name', ''))
+        parts = name.split()
+        if not parts or parts[0] != fam[0] or p.get('id') == last_prod.get('id'):
+            continue
+        rest = parts[1:]
+        if rest and all(re.search(r'\b' + re.escape(w) + r'\b', text) for w in rest):
+            if best is None or len(name) > len(_isis_norm(best.get('name', ''))):
+                best = p
+    if not best:
+        return None
+    return {'action': 'product_price', 'params': {'product_id': best.get('id'), 'product': best.get('name')}}
+
+
+def _isis_parse_local(db, user, raw, history=None):
     """Interprete local, sin IA externa. Devuelve intent o None."""
     text = _isis_norm(raw)
     if not text:
         return None
+    # --- Seguimiento del hilo (v4): "¿y la de 1.2?" tras preguntar por la Corona 355 ---
+    follow = _isis_resolve_followup(db, user, text, history)
+    if follow is not None:
+        return follow
     # --- Memoria (v2) ---
     if 'recuerdas' in text or 'que sabes de' in text or 'que tienes guardado' in text:
         q = text
@@ -1552,11 +1636,22 @@ def _isis_parse_local(db, user, raw):
         return {'action': 'cash_movement', 'params': {'kind': 'out' if 'salida' in text else 'in', 'amount': amt, 'reason': raw.strip()[:200]}}
     return None
 
+# Palabras que delatan una pregunta de criterio (v4): ahí Claude opina y
+# recomienda en vez de solo clasificar, con un poco más de libertad.
+_ISIS_ANALYSIS_WORDS = ('recomiendas', 'recomienda', 'que hago', 'que me aconsejas',
+                        'como va', 'como ves', 'que opinas', 'conviene', 'consejo',
+                        'analiza', 'analizame', 'que harias', 'te parece', 'como andamos')
+
+
 def _isis_call_fableai(message, context):
     """Llama a Claude via FableAI y devuelve un intent, o None si no se puede."""
     if not FABLEAI_API_KEY:
         return None
-    payload = {'model': FABLEAI_MODEL, 'temperature': 0, 'max_tokens': 600,
+    # Criterio (v4): en preguntas de recomendación/opinión Claude razona con
+    # temperature 0.3 y más tokens; las acciones concretas siguen exactas (0).
+    is_analysis = any(w in _isis_norm(message) for w in _ISIS_ANALYSIS_WORDS)
+    payload = {'model': FABLEAI_MODEL, 'temperature': 0.3 if is_analysis else 0,
+               'max_tokens': 900 if is_analysis else 600,
                'messages': [{'role': 'system', 'content': _ISIS_SYSTEM},
                             {'role': 'user', 'content': 'Contexto del restaurante (mesas, productos y cuentas abiertas, resumido):\n' + context + '\n\nOrden del usuario: ' + message}]}
     req = urllib.request.Request(FABLEAI_URL, data=json.dumps(payload).encode('utf-8'),
@@ -1609,6 +1704,169 @@ def _isis_sales_context(db, user):
         parts.append('Cuentas pendientes: no disponible.')
     return ' '.join(parts)
 
+_ISIS_LOW_STOCK = 5  # existencias a las que un producto se considera "por acabarse"
+
+
+def _isis_parse_dt(value):
+    """Fecha ISO (de account_dict/reservation_dict) a datetime con zona; None si no se puede."""
+    if not value:
+        return None
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _isis_sold_today(db, user):
+    """Productos vendidos hoy (por fecha, scope history): lista por cantidad desc.
+    'Hoy' es el día local del restaurante, no el día UTC (de noche son días distintos)."""
+    try:
+        local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+        today = datetime.now(local_tz).date()
+        d = mitote_extensions.owner_analytics(start=today, end=today, scope='history', db=db, user=user)
+        return d.get('products') or []
+    except Exception:
+        return []
+
+
+def _isis_decision_context(db, user):
+    """Para decidir (v4): comparaciones y riesgos para que Claude recomiende con criterio.
+    Cada sección con su propio try/except: un fallo no rompe el contexto."""
+    parts = []
+    try:
+        local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+        today = datetime.now(local_tz).date()
+        d_today = mitote_extensions.owner_analytics(start=today, end=today, scope='history', db=db, user=user)
+        d_yday = mitote_extensions.owner_analytics(start=today - timedelta(days=1), end=today - timedelta(days=1), scope='history', db=db, user=user)
+        s_t = float(d_today.get('sales') or 0)
+        s_y = float(d_yday.get('sales') or 0)
+        diff = s_t - s_y
+        if diff > 0:
+            comp = f"${diff:.2f} más que ayer"
+        elif diff < 0:
+            comp = f"${abs(diff):.2f} menos que ayer"
+        else:
+            comp = 'igual que ayer'
+        parts.append(f"Ventas: hoy ${s_t:.2f} en {d_today.get('paid_accounts')} cuentas pagadas, ayer ${s_y:.2f}. Hoy va {comp}.")
+    except Exception:
+        parts.append('Ventas hoy vs ayer: no disponible.')
+    try:
+        sold = _isis_sold_today(db, user)
+        if sold:
+            top_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in sold[:3])
+            bottom = sold[-3:] if len(sold) > 3 else []
+            bottom_txt = ', '.join(f"{x.get('name')} ({x.get('quantity')})" for x in bottom)
+            parts.append(f"Más vendidos hoy: {top_txt}." + (f" Menos vendidos hoy: {bottom_txt}." if bottom_txt else ''))
+        else:
+            parts.append('Hoy no se ha vendido nada todavía.')
+    except Exception:
+        parts.append('Más/menos vendidos: no disponible.')
+    try:
+        sold = _isis_sold_today(db, user)
+        sold_ids = {x.get('product_id') for x in sold}
+        prods = products(db, user)
+        low = [p for p in prods if p.get('inventory_enabled') and p.get('id') in sold_ids
+               and p.get('stock') is not None and float(p.get('stock') or 0) <= _ISIS_LOW_STOCK]
+        if low:
+            parts.append('Se venden y están por acabarse: ' + ', '.join(f"{p.get('name')} (quedan {p.get('stock')})" for p in low[:5]) + '.')
+        else:
+            parts.append('Ningún producto vendido hoy está por acabarse.')
+    except Exception:
+        parts.append('Productos por acabarse: no disponible.')
+    try:
+        accs = accounts(db, user)
+        now = datetime.now(timezone.utc)
+        old = []
+        for a in accs:
+            if a.get('status') not in ('open', 'pending'):
+                continue
+            created = _isis_parse_dt(a.get('created_at'))
+            if not created:
+                continue
+            hours = (now - created).total_seconds() / 3600
+            if hours > 2:
+                old.append(f"{a.get('table_name') or a.get('name')} debe ${a.get('due')}, abierta hace {hours:.1f} h")
+        parts.append('Cuentas abiertas hace más de 2 horas: ' + ('; '.join(old) if old else 'ninguna') + '.')
+    except Exception:
+        parts.append('Cuentas viejas: no disponible.')
+    try:
+        tables = dining_tables(db, user)
+        free = sum(1 for t in tables if t.get('status') == 'available' and t.get('active'))
+        occ = sum(1 for t in tables if t.get('status') == 'occupied' and t.get('active'))
+        parts.append(f"Mesas: {free} libres, {occ} ocupadas.")
+    except Exception:
+        parts.append('Mesas libres/ocupadas: no disponible.')
+    try:
+        pend = db.scalars(select(Approval).where(Approval.status == 'pending')).all()
+        if pend:
+            parts.append('Autorizaciones pendientes: ' + ', '.join(f"#{a.id} {a.kind} (cuenta {a.account_id})" for a in pend[:5]) + '.')
+        else:
+            parts.append('Sin autorizaciones pendientes.')
+    except Exception:
+        parts.append('Autorizaciones pendientes: no disponible.')
+    try:
+        rows = mitote_extensions.reservations(db, user)
+        local_tz = getattr(mitote_extensions, 'LOCAL_TZ', timezone.utc)
+        today_local = datetime.now(local_tz).date()
+        pend_res = [r for r in rows if r.get('status') in ('pending', 'confirmed')
+                    and _isis_parse_dt(r.get('scheduled_at')) is not None
+                    and _isis_parse_dt(r.get('scheduled_at')).astimezone(local_tz).date() == today_local]
+        if pend_res:
+            parts.append('Reservaciones de hoy pendientes: ' + ', '.join(f"{r.get('name')} ({r.get('party_size')} personas)" for r in pend_res[:5]) + '.')
+        else:
+            parts.append('Sin reservaciones pendientes para hoy.')
+    except Exception:
+        parts.append('Reservaciones de hoy: no disponible.')
+    return ' '.join(parts)
+
+
+def _isis_alerts(db, user):
+    """Hasta 3 alertas cortas de lo que necesita atención AHORA (v4). Solo lectura."""
+    alerts = []
+    try:
+        c = cash(db, user)
+        if not c.get('open'):
+            alerts.append('La caja todavía no está abierta.')
+    except Exception:
+        pass
+    try:
+        accs = accounts(db, user)
+        now = datetime.now(timezone.utc)
+        for a in accs:
+            if a.get('status') not in ('open', 'pending'):
+                continue
+            created = _isis_parse_dt(a.get('created_at'))
+            if not created:
+                continue
+            hours = int((now - created).total_seconds() // 3600)
+            if hours > 2:
+                alerts.append(f"La {a.get('table_name') or a.get('name')} lleva {hours} horas abierta y debe ${a.get('due')}.")
+    except Exception:
+        pass
+    try:
+        sold = _isis_sold_today(db, user)
+        sold_ids = {x.get('product_id') for x in sold}
+        prods = products(db, user)
+        for p in prods:
+            if p.get('inventory_enabled') and p.get('id') in sold_ids and p.get('stock') is not None and float(p.get('stock') or 0) <= _ISIS_LOW_STOCK:
+                alerts.append(f"{p.get('name')} se está vendiendo y solo quedan {p.get('stock')}.")
+    except Exception:
+        pass
+    try:
+        pend = db.scalars(select(Approval).where(Approval.status == 'pending')).all()
+        if pend:
+            alerts.append(f"Hay {len(pend)} {'autorización' if len(pend) == 1 else 'autorizaciones'} pendientes de decidir.")
+    except Exception:
+        pass
+    return alerts[:3]
+
+
 def _isis_context(db, user):
     try:
         tables = dining_tables(db, user)
@@ -1635,9 +1893,13 @@ def _isis_context(db, user):
         s_txt = _isis_sales_context(db, user)
     except Exception:
         s_txt = 'Ventas y caja: no disponible.'
+    try:
+        d_txt = _isis_decision_context(db, user)
+    except Exception:
+        d_txt = 'Para decidir: no disponible.'
     return (f"Mesas: {t_txt}\nProductos con inventario: {p_txt}\nCuentas abiertas: {a_txt}\n"
             f"Memoria de Isis: {m_txt}\nResumen del día: {_isis_day_summary(db, user)}\n"
-            f"Ventas y caja: {s_txt}")
+            f"Ventas y caja: {s_txt}\nPara decidir: {d_txt}")
 
 _READ_ACTIONS = {'tables', 'overview', 'cash', 'cash_history', 'inventory', 'inventory_movements',
                  'account_detail', 'accounts_list', 'tickets_list', 'cashier_overview',
@@ -2072,8 +2334,22 @@ async def isis_voice_setup(data: IsisSetupIn, db: Session = Depends(db_session),
 def isis_voice_status(db: Session = Depends(db_session), user: User = Depends(auth)):
     allow(user, 'owner')
     exists = db.scalar(select(User).where(User.username == 'isis', User.active.is_(True))) is not None
+    # Alertas proactivas (v4): lo que necesita atención AHORA; nunca rompen el status.
+    try:
+        alerts = _isis_alerts(db, user)
+    except Exception:
+        alerts = []
     return {'ok': True, 'isis_user_exists': exists, 'fableai_configured': bool(FABLEAI_API_KEY),
-            'voice': 'kokoro-ef-dora', 'mode': 'solo-mitote'}
+            'voice': 'kokoro-ef-dora', 'mode': 'solo-mitote', 'alerts': alerts}
+
+
+@app.post('/api/isis-voice/end-call')
+def isis_voice_end_call(user: User = Depends(auth)):
+    """Isis (o el propietario) cuelga: se borra el historial de la conversación (v4)."""
+    if user.username != 'isis' and user.role != 'owner':
+        raise HTTPException(403, 'Este panel de voz es solo para Isis')
+    _isis_history_clear(user.id)
+    return {'ok': True}
 
 class IsisChatIn(BaseModel):
     message: str = Field(min_length=1, max_length=1000)
@@ -2085,42 +2361,66 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
     if user.username != 'isis' and user.role != 'owner':
         raise HTTPException(403, 'Este panel de voz es solo para Isis')
     actor = user.username
+    # Memoria de conversación (v4): cada intercambio se guarda para que Isis
+    # siga el hilo de la llamada; se borra a los 30 min sin uso o al colgar.
+    def _record(reply):
+        _isis_history_add(user.id, data.message, reply)
     # Confirmacion de una accion pendiente
     if data.confirm_token:
         entry = _ISIS_CONFIRM.pop(data.confirm_token, None)
         if not entry or entry['expires'] < time.time():
-            return {'ok': True, 'reply': 'Esa confirmación ya venció. Dime de nuevo qué quieres hacer.', 'executed': False}
+            reply = 'Esa confirmación ya venció. Dime de nuevo qué quieres hacer.'
+            _record(reply)
+            return {'ok': True, 'reply': reply, 'executed': False}
         if any(w in _isis_norm(data.message) for w in ('no', 'cancela', 'olvida')):
-            return {'ok': True, 'reply': 'Cancelado, no hice nada.', 'executed': False}
+            reply = 'Cancelado, no hice nada.'
+            _record(reply)
+            return {'ok': True, 'reply': reply, 'executed': False}
         try:
             reply = await _isis_execute(db, user, entry['intent'])
         except HTTPException as e:
-            return {'ok': True, 'reply': 'No se pudo: ' + str(e.detail), 'executed': False}
+            reply = 'No se pudo: ' + str(e.detail)
+            _record(reply)
+            return {'ok': True, 'reply': reply, 'executed': False}
         audit(db, user, 'isis.voice_execute', actor=actor, isis_action=entry['intent'].get('action'))
+        _record(reply)
         return {'ok': True, 'reply': reply, 'executed': True}
     # Nueva orden: interprete local primero, IA despues
-    intent = _isis_parse_local(db, user, data.message)
+    intent = _isis_parse_local(db, user, data.message, history=_isis_history_get(user.id))
     if intent is None or intent.get('action') == 'unknown':
         context = _isis_context(db, user)
+        hist_txt = _isis_history_text(user.id)
+        if hist_txt:
+            context += ('\nConversación reciente en esta llamada (para seguir el hilo):\n' + hist_txt)
         ai_intent = await asyncio.to_thread(_isis_call_fableai, data.message, context)
         if ai_intent:
             intent = ai_intent
     if intent is None:
-        return {'ok': True, 'reply': 'No te entendí, ¿me lo repites? Te ayudo con mesas, cuentas, comandas, cobros, caja, menú, inventario, personal, propinas, autorizaciones, auditoría, reservaciones, tiempos y estadísticas.', 'executed': False}
+        reply = 'No te entendí, ¿me lo repites? Te ayudo con mesas, cuentas, comandas, cobros, caja, menú, inventario, personal, propinas, autorizaciones, auditoría, reservaciones, tiempos y estadísticas.'
+        _record(reply)
+        return {'ok': True, 'reply': reply, 'executed': False}
     if intent.get('action') == 'unknown':
         q = intent.get('question') or '¿Me lo repites con más detalle?'
+        _record(q)
         return {'ok': True, 'reply': q, 'executed': False}
     if intent.get('action') not in _WRITE_ACTIONS and intent.get('action') not in _READ_ACTIONS:
-        return {'ok': True, 'reply': 'Eso no lo hago en El Mitote. Te ayudo con mesas, cuentas, comandas, cobros, caja, menú, inventario, personal, propinas, autorizaciones, auditoría, reservaciones, tiempos y estadísticas.', 'executed': False}
+        reply = 'Eso no lo hago en El Mitote. Te ayudo con mesas, cuentas, comandas, cobros, caja, menú, inventario, personal, propinas, autorizaciones, auditoría, reservaciones, tiempos y estadísticas.'
+        _record(reply)
+        return {'ok': True, 'reply': reply, 'executed': False}
     if intent.get('action') in _WRITE_ACTIONS:
         token = _isis_confirm_token(intent)
         summary = _isis_describe(intent)
         audit(db, user, 'isis.voice_propose', actor=actor, isis_action=intent.get('action'))
-        return {'ok': True, 'reply': _isis_warm() + ' ' + summary + ' ¿Confirmas?', 'needs_confirmation': True, 'confirm_token': token, 'executed': False}
+        reply = _isis_warm() + ' ' + summary + ' ¿Confirmas?'
+        _record(reply)
+        return {'ok': True, 'reply': reply, 'needs_confirmation': True, 'confirm_token': token, 'executed': False}
     try:
         reply = await _isis_execute(db, user, intent)
     except HTTPException as e:
-        return {'ok': True, 'reply': 'No se pudo: ' + str(e.detail), 'executed': False}
+        reply = 'No se pudo: ' + str(e.detail)
+        _record(reply)
+        return {'ok': True, 'reply': reply, 'executed': False}
+    _record(reply)
     return {'ok': True, 'reply': reply, 'executed': True}
 
 def owner_account(db,user,account_id,allowed=('open','pending')):
