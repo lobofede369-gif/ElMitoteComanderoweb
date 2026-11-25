@@ -10,11 +10,19 @@
    al servidor que borre el historial de la llamada.
    Realismo (v7): timbre de teléfono al entrar; si Santiago habla mientras
    Isis habla, ella se calla y lo escucha (interrupción); si la respuesta
-   tarda, Isis dice una frase corta de espera; y cada ~75 segundos, entre
-   turnos, avisa sola si apareció algo nuevo que necesita atención.
+   tarda, suena un tono suave y el estado dice que está revisando (v13:
+   antes decía una frase de espera con la voz del teléfono, que era la
+   voz robótica que se oía cada vez que una petición tardaba); y cada
+   ~75 segundos, entre turnos, avisa sola si apareció algo nuevo que
+   necesita atención.
    Añadido (v10.5): la frase de espera sale a los 3 s (antes a 1.5 s salía
    casi siempre) y se deja terminar antes de la respuesta real, para no
    cortarla a media palabra ("Dame…").
+   Voz rápida (v13): el chat va por streaming (SSE): las frases de la
+   respuesta de Claude se hablan conforme se completan, sin esperar a
+   la respuesta entera; si el stream falla antes del primer evento, va
+   por el chat normal. La espera ya no se habla (tono suave) y la
+   respuesta real ya no espera a que termine ninguna espera.
    Resumen al entrar (v8): después del saludo y las alertas, Isis dice sola
    cómo cerró el día anterior (ventas de ayer, lo más vendido, lo que se
    acabó), una sola vez por entrada al panel.
@@ -70,17 +78,19 @@
   // debe apagar la escucha de interrupción del speak nuevo.
   const saidAlerts = new Set(); // alertas ya dichas (entrada + media llamada)
   let lastMidCheck = 0; // último chequeo de avisos a media llamada
-  const WAIT_PHRASES = ['Dame un segundo, estoy revisando.', 'A ver, déjame checar eso.'];
   // Fluidez (v9, ritmo despierto en v10.5): por frases, para que no suene
   // a robot ni se trabe generando respuestas largas. La velocidad subió
   // (Dora 1.05, pausa 100 ms) porque a 0.95 con pausas de 200 ms la voz
-  // sonaba lenta y adormilada en el teléfono.
+  // sonaba lenta y adormilada en el teléfono. La espera ya no se habla
+  // (v13): es un tono suave, nunca la voz del teléfono.
   const KOKORO_SPEED = 1.05; // kokoro-js: generate(text, { voice, speed })
   const PART_PAUSE_MS = 100; // respiro entre frases
-  const WAIT_DELAY_MS = 3000; // la frase de espera solo sale si la respuesta sí tarda (a 1.5 s salía casi siempre y se cortaba a media palabra)
-  const WAIT_FINISH_MS = 2500; // tope para dejar terminar la frase de espera antes de la respuesta real
+  const WAIT_DELAY_MS = 3000; // el tono de espera solo sale si la respuesta sí tarda (v13: ya no se habla la frase de espera)
   const CHAT_TIMEOUT_MS = 15000; // la petición de chat no cuelga la llamada
   const OPENAI_TTS_TIMEOUT_MS = 8000; // por frase: si tarda, Dora cubre
+  const STREAM_STALL_MS = 15000; // sin ningún trozo del stream en 15 s: se aborta y va por chat normal
+  const STREAM_TIMEOUT_MS = 60000; // tope total del chat en streaming (Claude generando)
+  let streamCtl = null; // AbortController del chat-stream en curso (se aborta al colgar o al pedir otra cosa)
   let openaiTTS = false; // v10: el servidor tiene llave de OpenAI (lo dice /status)
   // Interruptor de voz (v10.1): motor efectivo ('openai' | 'kokoro'). Se
   // resuelve al entrar con lo guardado y lo que dice el servidor; el de
@@ -314,12 +324,9 @@
     status('Hablando…', 'speaking');
     startInterruptListener();
     try {
-      // La frase de espera siempre va con la voz del teléfono (opts.forcePhone):
-      // arranca al instante, sin esperar a que Dora genere el audio.
       // Voz (v10.1): OpenAI solo si el interruptor está en de paga y el
       // servidor tiene llave; si no, Dora, luego teléfono.
-      if (opts && opts.forcePhone) await speakPhone(text);
-      else if (voiceEngineAllowsOpenAI()) await speakOpenAI(text, opts && opts.forceVoice);
+      if (voiceEngineAllowsOpenAI()) await speakOpenAI(text, opts && opts.forceVoice);
       else if (kokoroTTS) await speakKokoro(text);
       else await speakPhone(text);
     } finally {
@@ -610,6 +617,33 @@
       ring(t, 0.4);
       ring(t + 0.6, 0.4);
       await new Promise((resolve) => setTimeout(resolve, 1100));
+      try { await ctx.close(); } catch (e) {}
+    } catch (e) {}
+  }
+
+  // Tono de espera (v13): cuando la respuesta tarda, suena un bip suave
+  // y el estado dice que está revisando. NADA de voz del teléfono: la
+  // frase de espera hablada era justo la voz robótica que Santiago oía
+  // cada vez que una petición tardaba. Usa WebAudio, como el timbre, y
+  // no rompe nada si el audio no está permitido.
+  async function playWaitTone() {
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      const ctx = new Ctx();
+      if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = 'sine';
+      o.frequency.value = 880;
+      o.connect(g); g.connect(ctx.destination);
+      const t = ctx.currentTime + 0.05;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.05, t + 0.03);
+      g.gain.setValueAtTime(0.05, t + 0.12);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+      o.start(t); o.stop(t + 0.2);
+      await new Promise((resolve) => setTimeout(resolve, 250));
       try { await ctx.close(); } catch (e) {}
     } catch (e) {}
   }
@@ -1032,11 +1066,68 @@
     speaking = false;
   }
 
+  // Habla las frases que van llegando por el stream, en orden (v13).
+  // Es la misma cadena que speakOpenAI por frase (OpenAI con prefetch
+  // de la siguiente parte ya en cola, Dora, teléfono) pero la cola se
+  // llena mientras Claude sigue respondiendo, así Isis empieza a hablar
+  // sin esperar a la respuesta completa. queue: {parts: [], done: false}.
+  // Devuelve cuando se hablaron todas las partes y el stream terminó.
+  async function speakStreamParts(queue, gen) {
+    let i = 0;
+    let openaiFails = 0;
+    let useOpenAI = voiceEngineAllowsOpenAI();
+    let nextPlayer = null;
+    const cancelNext = () => {
+      if (nextPlayer) nextPlayer.then((pl) => { if (pl) pl.cancel(); }).catch(() => {});
+      nextPlayer = null;
+    };
+    for (;;) {
+      if (gen !== speakGen || !speaking) { cancelNext(); return; }
+      if (i >= queue.parts.length) {
+        if (queue.done) break;
+        await new Promise((r) => setTimeout(r, 60));
+        continue;
+      }
+      const part = queue.parts[i];
+      let heard = false;
+      if (useOpenAI) {
+        let player = nextPlayer;
+        nextPlayer = null;
+        if (!player) player = await requestOpenAIPart(part, gen);
+        if (gen !== speakGen || !speaking) { if (player) player.cancel(); cancelNext(); return; }
+        if (player) {
+          // Prefetch de la siguiente parte si ya llegó (v10.5: 2 en cola).
+          if (i + 1 < queue.parts.length) nextPlayer = requestOpenAIPart(queue.parts[i + 1], gen);
+          heard = await player.play();
+        }
+      }
+      if (!heard) {
+        if (useOpenAI) {
+          openaiFails += 1;
+          if (openaiFails >= 2) useOpenAI = false;
+        }
+        if (kokoroTTS) {
+          const url = await generateKokoroPart(part, gen);
+          if (url) await playAudioUrl(url);
+          else await speakPhone(part, true);
+        } else {
+          await speakPhone(part, true);
+        }
+      } else {
+        openaiFails = 0;
+      }
+      if (gen !== speakGen || !speaking) { cancelNext(); return; }
+      i++;
+      if (i < queue.parts.length || !queue.done) await new Promise((r) => setTimeout(r, PART_PAUSE_MS));
+    }
+    speaking = false;
+  }
+
   // El servidor gratis de Render se duerme si nadie lo usa y tarda en
   // despertar: la primera petición puede fallar aunque internet esté bien.
   // Por eso se despierta una sola vez al entrar a la llamada (en show(), sin
   // esperar), y antes de cada mensaje solo un wake corto con tope: si tarda,
-  // no se bloquea la llamada, la frase de espera cubre el hueco.
+  // no se bloquea la llamada, el tono de espera cubre el hueco.
   async function wakeServer(timeoutMs) {
     try {
       const c = new AbortController();
@@ -1048,15 +1139,17 @@
 
   // La petición de chat con tope: si el servidor se cuelga (no solo falla),
   // no deja la llamada en silencio para siempre; el reintento es el que
-  // decide si fue un error o solo lentitud.
-  async function postChat(message) {
+  // decide si fue un error o solo lentitud. client_key (v13): una llave
+  // única por frase; si el reintento repite la misma llave, el servidor
+  // devuelve la respuesta guardada sin ejecutar nada dos veces.
+  async function postChat(message, clientKey) {
     const c = new AbortController();
     const t = setTimeout(() => c.abort(), CHAT_TIMEOUT_MS);
     try {
       return await fetch('/api/isis-voice/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-        body: JSON.stringify({ message, confirm_token: pendingToken || undefined }),
+        body: JSON.stringify({ message, confirm_token: pendingToken || undefined, client_key: clientKey || undefined }),
         cache: 'no-store',
         signal: c.signal,
       });
@@ -1065,82 +1158,198 @@
     }
   }
 
+  // Chat en streaming (v13): el servidor va soltando las frases de la
+  // respuesta de Claude en cuanto se completan (eventos SSE 'part') y el
+  // detalle escrito ('detail'); al final llega 'done' con el mismo JSON
+  // del chat normal. Devuelve {partial, doneData} o lanza si el stream
+  // falló antes del primer evento (entonces el llamador usa el chat
+  // normal). Si se corta a mitad (partial), lo ya hablado no se repite:
+  // el llamador pide la respuesta completa por chat normal.
+  async function postChatStream(message, clientKey, handlers) {
+    const c = new AbortController();
+    streamCtl = c;
+    const overall = setTimeout(() => { try { c.abort(); } catch (e) {} }, STREAM_TIMEOUT_MS);
+    let stall = null;
+    const armStall = () => {
+      clearTimeout(stall);
+      stall = setTimeout(() => { try { c.abort(); } catch (e) {} }, STREAM_STALL_MS);
+    };
+    try {
+      armStall();
+      const r = await fetch('/api/isis-voice/chat-stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+        body: JSON.stringify({ message, confirm_token: pendingToken || undefined, client_key: clientKey || undefined }),
+        cache: 'no-store',
+        signal: c.signal,
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (!r.body || typeof r.body.getReader !== 'function') throw new Error('sin stream');
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      let sawEvent = false;
+      let doneData = null;
+      for (;;) {
+        const res = await reader.read();
+        if (res.done) break;
+        armStall();
+        buf += dec.decode(res.value || new Uint8Array(), { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const raw = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const line of raw.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            let ev;
+            try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+            sawEvent = true;
+            if (ev.type === 'part') handlers.onPart(ev.text);
+            else if (ev.type === 'detail') handlers.onDetail(ev.text);
+            else if (ev.type === 'done') doneData = ev;
+          }
+        }
+      }
+      if (!doneData) {
+        if (!sawEvent) throw new Error('stream sin eventos');
+        return { partial: true, doneData: null };
+      }
+      return { partial: false, doneData };
+    } finally {
+      clearTimeout(overall);
+      clearTimeout(stall);
+      if (streamCtl === c) streamCtl = null;
+    }
+  }
+
   async function sendToIsis(message) {
+    // Si había un stream anterior en curso (interrupción), se aborta: la
+    // petición nueva lo sustituye. El cliente genera una llave única por
+    // frase (v13): el reintento repite la misma llave y el servidor no
+    // ejecuta nada dos veces.
+    try { if (streamCtl) streamCtl.abort(); } catch (e) {}
+    streamCtl = null;
+    const clientKey = (window.crypto && window.crypto.randomUUID)
+      ? window.crypto.randomUUID()
+      : ('m' + Date.now() + Math.floor(Math.random() * 1e9));
     busy = true;
     const heard = $('#isis-heard');
     if (heard) heard.textContent = 'Tú: ' + message;
     status('Pensando…', 'thinking');
-    // Duda natural (v7) con voz instantánea (v9): si la respuesta tarda,
-    // Isis dice una sola frase corta de espera CON LA VOZ DEL TELÉFONO, que
-    // arranca al instante; antes también se generaba con Dora y ella misma
-    // tardaba. Cuando llega la respuesta real, la frase de espera se deja
-    // terminar (waitForWaitPhrase, con tope): cortarla a media palabra
-    // ("Dame…") sonaba como si la voz gratis interrumpiera a la de paga.
-    let waitSaid = false;
-    // La promesa del speak() de la frase de espera, para esperarla cuando
-    // llegue la respuesta (ver waitForWaitPhrase).
-    let waitSpeakPromise = null;
+    // Espera (v13): tono suave + texto, nunca voz del teléfono. La
+    // respuesta real se habla en cuanto llega, sin esperar a nada.
+    let waitTonel = false;
     const waitTimer = setTimeout(async () => {
-      if (!inCall || waitSaid) return;
-      waitSaid = true;
-      const phrase = WAIT_PHRASES[Math.floor(Math.random() * WAIT_PHRASES.length)];
-      waitSpeakPromise = speak(phrase, { forcePhone: true });
-      try { await waitSpeakPromise; } catch (e) {}
+      if (!inCall || waitTonel) return;
+      waitTonel = true;
+      status('Estoy revisando…', 'thinking');
+      await playWaitTone();
     }, WAIT_DELAY_MS);
-    // Espera a que la frase de espera termine (con tope): si ya terminó o
-    // nunca salió, no espera nada. Colgar o interrumpir la corta igual que
-    // antes, porque stopSpeaking() resuelve su promesa al cancelar la voz.
-    const waitForWaitPhrase = async () => {
-      if (!waitSpeakPromise) return;
-      await Promise.race([
-        waitSpeakPromise.catch(() => {}),
-        new Promise((r) => setTimeout(r, WAIT_FINISH_MS)),
-      ]);
-    };
     await wakeServer(2000);
-    let data = {};
-    let r = null;
+    // Cola de frases del stream + hablador que arranca con la primera.
+    const queue = { parts: [], done: false };
+    let spokeStream = false;
+    let speakerPromise = null;
+    const startSpeaker = () => {
+      if (speakerPromise) return;
+      stopSpeaking();
+      const gen = ++speakGen;
+      speaking = true;
+      speakStartedAt = Date.now();
+      interruptRestarts = 0;
+      status('Hablando…', 'speaking');
+      startInterruptListener();
+      speakerPromise = (async () => {
+        try { await speakStreamParts(queue, gen); }
+        finally { if (gen === speakGen) stopInterruptListener(); }
+      })();
+    };
+    const applyDone = (data) => {
+      pendingToken = data.needs_confirmation ? data.confirm_token : null;
+      const reply = data.reply || 'Listo.';
+      const rep = $('#isis-reply');
+      if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di "sí" para confirmar o "no" para cancelar.)' : '');
+      // v12: el detalle escrito se muestra sin hablarse; sin detalle, se limpia.
+      setDetail(data.detail || '');
+      return reply;
+    };
+    // 1) Streaming; si ni arranca, chat normal con su reintento.
+    let streamRes = null;
+    let streamFailedEarly = false;
     try {
-      r = await postChat(message);
-      if (!r.ok) throw new Error('HTTP ' + r.status);
+      streamRes = await postChatStream(message, clientKey, {
+        onPart: (text) => {
+          if (!text) return;
+          queue.parts.push(text);
+          spokeStream = true;
+          if (inCall) startSpeaker();
+        },
+        onDetail: (text) => { setDetail(text || ''); },
+      });
     } catch (e) {
-      // Un reintento solo, con espera corta: la frase de espera ya está
-      // sonando, así que no hace falta esperar 4 s en silencio.
-      status('Estoy despertando el servidor, dame un momento…', 'thinking');
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      await wakeServer(2000);
-      try {
-        r = await postChat(message);
-      } catch (e2) { r = null; }
+      streamFailedEarly = true;
     }
     clearTimeout(waitTimer);
-    if (!r || !r.ok) {
-      const reply = (r && (r.status === 401 || r.status === 403))
-        ? 'Tu sesión se venció. Sal y vuelve a entrar con el PIN de Isis.'
-        : 'No me pude conectar al restaurante, parece que el servidor está dormido o no hay internet. Espérame tantito e inténtalo de nuevo.';
-      const rep = $('#isis-reply');
-      if (rep) rep.textContent = 'Isis: ' + reply;
-      setDetail('');
-      // Si el usuario colgó mientras llegaba la respuesta, ya no se habla.
-      await waitForWaitPhrase();
+    if (!streamFailedEarly && streamRes && streamRes.partial) {
+      // Se cortó a mitad de una respuesta que ya se estaba hablando:
+      // se pide la respuesta completa por chat normal. Nada se ejecutó
+      // dos veces: la respuesta parcial era solo texto.
+      queue.done = true;
+      if (speakerPromise) await speakerPromise;
+      streamFailedEarly = true;
+    }
+    if (streamFailedEarly) {
+      let data = {};
+      let r = null;
+      try {
+        r = await postChat(message, clientKey);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+      } catch (e) {
+        // Un reintento solo, con espera corta y la misma llave.
+        status('Estoy despertando el servidor, dame un momento…', 'thinking');
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        await wakeServer(2000);
+        try {
+          r = await postChat(message, clientKey);
+        } catch (e2) { r = null; }
+      }
+      if (!r || !r.ok) {
+        const reply = (r && (r.status === 401 || r.status === 403))
+          ? 'Tu sesión se venció. Sal y vuelve a entrar con el PIN de Isis.'
+          : 'No me pude conectar al restaurante, parece que el servidor está dormido o no hay internet. Espérame tantito e inténtalo de nuevo.';
+        const rep = $('#isis-reply');
+        if (rep) rep.textContent = 'Isis: ' + reply;
+        setDetail('');
+        // Si el usuario colgó mientras llegaba la respuesta, ya no se habla.
+        if (inCall) await speak(reply);
+        busy = false;
+        maybeListen();
+        return;
+      }
+      try {
+        data = await r.json();
+      } catch (e) {
+        data = {};
+      }
+      const reply = applyDone(data);
       if (inCall) await speak(reply);
       busy = false;
+      await maybeMidCallAlert();
       maybeListen();
       return;
     }
-    try {
-      data = await r.json();
-    } catch (e) {
-      data = {};
+    // El stream respondió: 'done' trae el mismo JSON del chat normal.
+    queue.done = true;
+    const data = (streamRes && streamRes.doneData) || {};
+    const reply = applyDone(data);
+    if (spokeStream) {
+      // Las frases ya se hablaron por el stream: no se vuelve a hablar
+      // la respuesta (eso la repetiría). Solo se espera a que el
+      // hablador termine y se vuelve a escuchar.
+      if (speakerPromise) await speakerPromise;
+    } else if (inCall) {
+      await speak(reply);
     }
-    pendingToken = data.needs_confirmation ? data.confirm_token : null;
-    const reply = data.reply || 'Listo.';
-    const rep = $('#isis-reply');
-    if (rep) rep.textContent = 'Isis: ' + reply + (pendingToken ? ' (Di "sí" para confirmar o "no" para cancelar.)' : '');
-    // v12: el detalle escrito se muestra sin hablarse; sin detalle, se limpia.
-    setDetail(data.detail || '');
-    await waitForWaitPhrase();
-    if (inCall) await speak(reply);
     busy = false;
     await maybeMidCallAlert();
     maybeListen();
@@ -1272,6 +1481,9 @@
     inCall = false;
     muted = false;
     busy = false;
+    // v13: abortar el stream en curso, para que no siga llegando nada.
+    try { if (streamCtl) streamCtl.abort(); } catch (e) {}
+    streamCtl = null;
     stopListening();
     stopSpeaking();
     stopCallTimer();
@@ -1465,12 +1677,12 @@
   // _test es solo para las pruebas locales (sin navegador): expone la
   // decisión del motor y el habla para verificar que en modo gratis no se
   // llama nunca al endpoint de OpenAI; sendToIsis con setInCall sirve
-  // para verificar la frase de espera en VM (que no se corte a media
-  // palabra y que colgar la corte de inmediato).
+  // para verificar el tono de espera en VM (que no use la voz del
+  // teléfono y que colgar lo corte de inmediato).
   window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit, startCall, endCall, toggleMute,
     _test: { resolveVoiceEngine, getVoiceEngine: () => voiceEngine, setVoiceEngine,
       resolveOpenAIVoice, getOpenAIVoice, setOpenAIVoice, playVoiceSample, isisTtsText,
-      splitIntoSpeechParts, mergeSpeechParts, setDetail,
+      splitIntoSpeechParts, mergeSpeechParts, setDetail, playWaitTone,
       requestOpenAIPart, makeOpenAIVoicePlayer: makeOpenAIPlayer,
       setOpenaiAvailable: (v) => { openaiTTS = !!v; applyVoiceEngine(); }, speak,
       sendToIsis, setInCall: (v) => { inCall = !!v; } } };
