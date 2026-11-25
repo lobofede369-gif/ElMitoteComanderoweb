@@ -1501,6 +1501,14 @@ _ISIS_SYSTEM = (
     "Las acciones delicadas (unir o dividir cuentas, reabrir una cuenta "
     "cerrada, pagar la propina de un empleado) siempre piden dos "
     "confirmaciones: Isis repite los datos y pregunta dos veces. Las "
+    "acciones rutinarias y reversibles (abrir una cuenta, agregar a una "
+    "mesa, reponer inventario, cambiar el estado de una comanda, anotar "
+    "un pendiente) se ejecutan de inmediato sin preguntar antes, y la "
+    "respuesta dice exactamente lo que se hizo. Solo preguntan antes las "
+    "acciones con dinero (cobrar, cerrar, descuentos, movimientos de "
+    "caja, propinas), las delicadas y las que no se pueden deshacer "
+    "(crear una reservación); si falta un dato o hay ambigüedad real, "
+    "se pregunta solo por ese dato. Las "
     "cuentas se pueden buscar por nombre de cliente ('la mesa de Juanita', "
     "'mesa Juanita'); las mesas por numero en palabra ('mesa cinco'); los "
     "productos por tamano o palabra distintiva ('la de 355', 'la corona'). "
@@ -4091,14 +4099,27 @@ _WRITE_ACTIONS = {'open_cash', 'close_cash', 'create_table', 'update_table', 'ne
                   'reopen_closed', 'tip_payout', 'todo_add', 'todo_remove',
                   'pay_and_close_account', 'cancel_item'}
 
-# v13: añadir a mesa se ejecuta directo, sin pedir confirmación antes:
-# es rutinario y reversible (el producto se puede quitar con la voz),
-# y pedirla duplicaba el viaje de cada orden (proponer + responder con
-# "sí" + ejecutar + hablar). Lo delicado sigue pidiendo confirmación
-# previa (y doble, ver _DELICATE_ACTIONS). La respuesta hablada tras
-# ejecutar dice exactamente lo agregado, para que Santiago lo oiga y
-# lo corrija si se entendió mal.
-_ISIS_DIRECT_ACTIONS = {'add_order'}
+# v13+v14: lo rutinario y reversible se ejecuta DIRECTO, sin pedir
+# confirmación antes, y la respuesta dice exactamente lo que se hizo
+# para que Santiago lo oiga y lo corrija si se entendió mal. Pedirla
+# duplicaba el viaje de cada orden (proponer + responder con "sí" +
+# ejecutar + hablar): eso eran las "vueltas" que Santiago reportó en
+# vivo (11:07). Directo: abrir una cuenta, agregar a una mesa (v13),
+# mover una cuenta de mesa, reponer o ajustar inventario, cambiar el
+# estado de una comanda, crear un producto del menú, confirmar una
+# reservación o marcar su llegada, y anotar/olvidar cosas y pendientes
+# (memoria y lista, triviales y reversibles). Con confirmación previa
+# sigue TODO lo que mueve dinero (cobrar, cerrar, descuentos,
+# movimientos de caja, propinas, abrir/cerrar turno), lo que no se
+# puede deshacer (crear una reservación — no hay cancelación —, anular
+# una cuenta, archivar un producto, cambiar precios, personal y PINs,
+# configuraciones) y lo delicado con DOBLE confirmación (ver
+# _DELICATE_ACTIONS). Las escrituras directas también quedan en
+# auditoría (isis.voice_execute en _isis_chat_flow).
+_ISIS_DIRECT_ACTIONS = {'add_order', 'new_account', 'transfer_account', 'restock',
+                        'inventory_adjust', 'ticket_status', 'create_product',
+                        'confirm_reservation', 'reservation_arrive', 'remember',
+                        'forget', 'todo_add', 'todo_remove'}
 
 def _isis_describe(intent):
     """Resumen de lo que Isis propone hacer, para pedir confirmación por voz.
