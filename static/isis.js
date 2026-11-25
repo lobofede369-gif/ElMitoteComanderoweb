@@ -39,6 +39,23 @@
   // del navegador (los archivos del modelo ya están guardados ahí).
   const KOKORO_FLAG = 'isis-kokoro-ready';
 
+  // Saludos de Isis (v5 "persona real"): rotan para no sonar siempre igual.
+  // La hora es la del teléfono, así que "buenas tardes" o "buenas noches"
+  // salen solas. Bloque autocontenido (nada fuera de él se usa aquí).
+  // ISIS_GREETINGS_BEGIN
+  const ISIS_GREETINGS = [
+    'Hola, Santiago. Buenas {parte}, ¿qué necesitas?',
+    'Hola, Santiago, soy Isis. Dime, ¿qué se ofrece?',
+    '¿Qué onda, Santiago? Aquí estoy, ¿qué necesitas?',
+    'Hola, Santiago. Te escucho, ¿qué hacemos?',
+  ];
+  function isisGreeting(hour) {
+    const parte = hour < 12 ? 'días' : hour < 19 ? 'tardes' : 'noches';
+    const g = ISIS_GREETINGS[Math.floor(Math.random() * ISIS_GREETINGS.length)];
+    return g.replace('{parte}', parte);
+  }
+  // ISIS_GREETINGS_END
+
   function status(text, mode) {
     const el = $('#isis-status');
     if (el) el.textContent = text || '';
@@ -413,7 +430,8 @@
       status('Este navegador no tiene reconocimiento de voz. Usa Chrome en Android.', '');
       return;
     }
-    const greet = 'Hola, soy Isis, tu asistente de El Mitote. Te ayudo con todo lo del restaurante: puedo decirte qué mesas están libres, cuánto debe una mesa, cuánto queda en inventario, cómo va la caja, o hacer el corte. Dime, ¿qué necesitas?';
+    // Saludo corto y distinto cada vez (v5), según la hora del teléfono.
+    const greet = isisGreeting(new Date().getHours());
     const rep = $('#isis-reply');
     if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (Voz de Dora aún no cargada: toca "Descargar voz de Isis".)');
     inCall = true;
