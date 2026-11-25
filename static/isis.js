@@ -314,6 +314,30 @@
   }
   // ISIS_DETAIL_END
 
+  // Resumen escrito al entrar (v15, ítem 5): el resumen de ayer, las
+  // alertas, los pendientes y lo de la última llamada, ya escritos en
+  // el panel al entrar, sin esperar a la llamada ni a que Isis hable.
+  // Se escribe ANTES del saludo, así se lee también sin micrófono
+  // (app instalada) y en modo silencio. No se habla: solo se muestra.
+  function renderEntryBrief(d) {
+    const el = $('#isis-brief');
+    if (!el) return;
+    const lines = [];
+    if (d && typeof d.morning_brief === 'string' && d.morning_brief.trim()) lines.push(d.morning_brief.trim());
+    if (d && Array.isArray(d.alerts)) {
+      const a = d.alerts.filter((x) => typeof x === 'string' && x.trim()).slice(0, 3);
+      if (a.length) lines.push('Ojo: ' + a.join(' '));
+    }
+    if (d && Array.isArray(d.todos)) {
+      const t = d.todos.filter((x) => typeof x === 'string' && x.trim()).slice(0, 5);
+      if (t.length) lines.push('Pendientes: ' + t.join('; ') + '.');
+    }
+    if (d && typeof d.last_session === 'string' && d.last_session.trim()) lines.push('Última vez: ' + d.last_session.trim());
+    if (!lines.length) { el.textContent = ''; el.hidden = true; return; }
+    el.textContent = lines.join(' ');
+    el.hidden = false;
+  }
+
   // Puerta "Isis" + medidor de banda de voz (v14, gratis, solo cliente).
   // REGLA (documentada, para no redescubrirla): la puerta bloquea la
   // MÚSICA, no a Santiago. Lo que el reconocedor escucha llega al
@@ -1960,6 +1984,9 @@
       if (Array.isArray(d.alerts)) entryAlerts = d.alerts.filter((a) => typeof a === 'string' && a.trim()).slice(0, 3);
       // Resumen de ayer (v8): cómo cerró el día anterior.
       if (typeof d.morning_brief === 'string' && d.morning_brief.trim()) morningBrief = d.morning_brief.trim();
+      // Resumen escrito al entrar (v15, ítem 5): se escribe aquí, antes
+      // del saludo y antes de la salida temprana sin micrófono.
+      renderEntryBrief(d);
     } catch (e) {}
     // Interruptor de voz (v10.1): resuelve el motor con lo guardado y lo
     // que dice el servidor, y refresca los botones (el de paga se
@@ -2057,6 +2084,15 @@
     if (txtIn) txtIn.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); sendIsisText(); }
     });
+    // Atajos de un toque (v15, ítem 4): el chip escribe el mensaje y lo
+    // manda por el mismo camino que la voz y el texto.
+    document.querySelectorAll('[data-isis-chip]').forEach((b) =>
+      b.addEventListener('click', () => {
+        const msg = b.getAttribute('data-isis-chip');
+        const inp = $('#isis-text-input');
+        if (inp) inp.value = msg || '';
+        sendIsisText();
+      }));
     const dl = $('#isis-download-voice');
     if (dl) dl.addEventListener('click', () => loadKokoro({ announce: true }));
     const engK = $('#isis-engine-kokoro');
@@ -2102,7 +2138,7 @@
   window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit, startCall, endCall, toggleSilent, toggleMute: toggleSilent,
     _test: { resolveVoiceEngine, getVoiceEngine: () => voiceEngine, setVoiceEngine,
       resolveOpenAIVoice, getOpenAIVoice, setOpenAIVoice, playVoiceSample, isisTtsText,
-      splitIntoSpeechParts, mergeSpeechParts, setDetail, playWaitTone,
+      splitIntoSpeechParts, mergeSpeechParts, setDetail, playWaitTone, renderEntryBrief,
       requestOpenAIPart, makeOpenAIVoicePlayer: makeOpenAIPlayer,
       setOpenaiAvailable: (v) => { openaiTTS = !!v; applyVoiceEngine(); }, speak,
       sendToIsis, setInCall: (v) => { inCall = !!v; },

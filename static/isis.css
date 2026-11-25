@@ -56,3 +56,10 @@
 #isis-text-input:focus{border-color:#ffc400}
 #isis-text-input::placeholder{color:#8a7d68}
 #isis-text-send{background:none;border:1px solid #ffc400;color:#ffc400;border-radius:999px;padding:11px 18px;font-size:.9rem;font-weight:600}
+/* Resumen escrito al entrar (v15): ya visible sin llamar. */
+.isis-brief{width:100%;max-width:420px;color:#cdbfa8;font-size:.85rem;text-align:center;margin:14px 0 0;line-height:1.6}
+.isis-brief[hidden]{display:none}
+/* Atajos de un toque (v15): mismo estilo discreto que el interruptor. */
+.isis-chips{width:100%;max-width:420px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:12px}
+.isis-chips button{background:none;border:1px solid #5c5345;color:#cdbfa8;border-radius:999px;padding:7px 14px;font-size:.8rem}
+.isis-chips button:active{border-color:#ffc400;color:#ffc400}
