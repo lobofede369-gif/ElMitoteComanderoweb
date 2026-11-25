@@ -5,6 +5,9 @@
    cuando Isis termina de responder, vuelve a escuchar sola; mientras
    ella habla no escucha (para no oírse a sí misma). Colgar termina la
    llamada y deja el botón "Llamar a Isis" para volver a empezar.
+   Al entrar, Isis avisa por voz lo que necesita atención ahora
+   (alertas del servidor, una sola vez por entrada) y al colgar le pide
+   al servidor que borre el historial de la llamada.
    Reconocimiento: Web Speech API (es-MX). Voz: Kokoro ef_dora, que se
    descarga solo cuando el usuario toca "Descargar voz de Isis" (~88 MB,
    una sola vez); si no esta descargada, habla con la voz del telefono. */
@@ -341,6 +344,16 @@
     stopSpeaking();
     stopCallTimer();
     updateCallUI();
+    // Limpieza en el servidor (v4): borrar el historial de la llamada.
+    // Best effort: no se espera el resultado ni se bloquea el colgado si
+    // el servidor no responde (el historial expira solo a los 30 min).
+    try {
+      fetch('/api/isis-voice/end-call', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + token },
+        cache: 'no-store',
+      }).catch(() => {});
+    } catch (e) {}
     status(message || 'Llamada terminada. Toca "Llamar a Isis" para volver a empezar.', '');
   }
 
@@ -365,11 +378,18 @@
     const micBtn = $('#isis-mic');
     if (micBtn) micBtn.disabled = true;
     status('Conectando con Isis…', '');
+    // Alertas proactivas (v4): hasta 3 frases cortas de lo que necesita
+    // atención ahora (caja sin abrir, cuenta vieja, stock bajo,
+    // autorización pendiente). Se piden solo aquí, una vez por entrada al
+    // panel: si cuelga y vuelve a llamar en la misma sesión no se repiten.
+    // Si el status falla o no trae alertas, la llamada sigue normal.
+    let entryAlerts = [];
     try {
       const r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
       const d = await r.json().catch(() => ({}));
       const stateEl = $('#isis-voice-state');
       if (stateEl && !d.fableai_configured) stateEl.textContent = 'Sin clave de FableAI: Isis entiende órdenes directas en español. El propietario la configura en el servidor.';
+      if (Array.isArray(d.alerts)) entryAlerts = d.alerts.filter((a) => typeof a === 'string' && a.trim()).slice(0, 3);
     } catch (e) {}
     // Si la voz ya se descargó una vez, cargarla sola al entrar (desde la
     // caché del navegador, sin descargar de nuevo) para que el saludo y las
@@ -402,6 +422,14 @@
     updateCallUI();
     startCallTimer();
     await speak(greet);
+    // Después del saludo, Isis avisa lo que necesita atención ahora, en
+    // corto (una frase por alerta, "Ojo:" al inicio si hay más de una).
+    // Solo si la llamada sigue activa (no colgó durante el saludo).
+    if (entryAlerts.length && inCall) {
+      const alertsText = (entryAlerts.length > 1 ? 'Ojo: ' : '') + entryAlerts.join(' ');
+      if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (Voz de Dora aún no cargada: toca "Descargar voz de Isis".)') + ' ' + alertsText;
+      await speak(alertsText);
+    }
     maybeListen();
   }
 
