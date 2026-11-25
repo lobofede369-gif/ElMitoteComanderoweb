@@ -12,6 +12,9 @@
    Isis habla, ella se calla y lo escucha (interrupción); si la respuesta
    tarda, Isis dice una frase corta de espera; y cada ~75 segundos, entre
    turnos, avisa sola si apareció algo nuevo que necesita atención.
+   Resumen al entrar (v8): después del saludo y las alertas, Isis dice sola
+   cómo cerró el día anterior (ventas de ayer, lo más vendido, lo que se
+   acabó), una sola vez por entrada al panel.
    Reconocimiento: Web Speech API (es-MX). Voz: Kokoro ef_dora, que se
    descarga solo cuando el usuario toca "Descargar voz de Isis" (~88 MB,
    una sola vez); si no esta descargada, habla con la voz del telefono. */
@@ -550,12 +553,15 @@
     // panel: si cuelga y vuelve a llamar en la misma sesión no se repiten.
     // Si el status falla o no trae alertas, la llamada sigue normal.
     let entryAlerts = [];
+    let morningBrief = '';
     try {
       const r = await fetch('/api/isis-voice/status', { headers: { Authorization: 'Bearer ' + token }, cache: 'no-store' });
       const d = await r.json().catch(() => ({}));
       const stateEl = $('#isis-voice-state');
       if (stateEl && !d.fableai_configured) stateEl.textContent = 'Sin clave de FableAI, solo entiendo órdenes directas en español. La clave se pone en el servidor.';
       if (Array.isArray(d.alerts)) entryAlerts = d.alerts.filter((a) => typeof a === 'string' && a.trim()).slice(0, 3);
+      // Resumen de ayer (v8): cómo cerró el día anterior.
+      if (typeof d.morning_brief === 'string' && d.morning_brief.trim()) morningBrief = d.morning_brief.trim();
     } catch (e) {}
     // Las alertas de entrada ya quedan marcadas como dichas, para que los
     // avisos de media llamada no las repitan.
@@ -603,6 +609,12 @@
       const alertsText = (entryAlerts.length > 1 ? 'Ojo: ' : '') + entryAlerts.join(' ');
       if (rep) rep.textContent = 'Isis: ' + greet + (kokoroReady ? '' : ' (La voz de Dora todavía no está lista, toca "Descargar voz de Isis".)') + ' ' + alertsText;
       await speak(alertsText);
+    }
+    // Después de las alertas, Isis dice sola cómo cerró ayer (v8), en
+    // corto, una sola vez por entrada. Solo si la llamada sigue activa.
+    if (morningBrief && inCall) {
+      if (rep) rep.textContent = (rep.textContent || 'Isis: ') + ' ' + morningBrief;
+      await speak(morningBrief);
     }
     maybeListen();
   }
