@@ -881,15 +881,81 @@ def _isis_history_text(user_id):
         return ''
     return '\n'.join(f"Usuario: {u}\nIsis: {r}" for u, r in turns)
 
-# --- Corte de caja guiado (v8): estado por usuario, vive junto a la memoria
-# de conversación: se borra al colgar (end-call) y expira a los 30 minutos
-# sin uso, igual que el historial. Nunca se ejecuta un cierre sin la
-# confirmación de Santiago (el token de confirmación que ya existe).
-_ISIS_CASH_CUT = {}  # user_id -> {'step': 'cash'|'card'|'transfer', 'cash': float, 'card': float, 'transfer': float, 'last': float}
+# --- Corte de caja guiado (v8, corregido v8.1): estado por usuario, vive
+# junto a la memoria de conversación: se borra al colgar (end-call) y expira
+# a los 30 minutos sin uso, igual que el historial. Nunca se ejecuta un
+# cierre sin la confirmación de Santiago (el token de confirmación que ya
+# existe).
+# v8.1: el corte usa LOS MISMOS DATOS que la pantalla de Caja de la app.
+# La app (GET /api/cash + static/app.js) muestra: fondo inicial, ventas en
+# efectivo, tarjeta y transferencia, propinas por método, propinas pagadas
+# en efectivo, entradas/retiros netos y "Efectivo esperado" =
+#   fondo + ventas efectivo + propinas efectivo + movimientos netos
+#   - propinas pagadas en efectivo
+# Esa es la fórmula de cash_expected_cents, que también usan period_summary
+# y cash_report para el ticket y el PDF del corte. El formulario de cierre
+# de la app solo pide UN número físico: "Efectivo contado". Tarjeta y
+# transferencia nunca se cuentan: son totales del sistema. Por eso Isis
+# v8.1 solo pregunta por el efectivo del cajón y toma lo demás del sistema:
+# la v8 pedía dictar los tres métodos y comparaba la tarjeta dictada contra
+# las ventas con tarjeta sin propinas, y el "efectivo" era ambiguo (la
+# pantalla muestra "Efectivo" = ventas en efectivo y "Efectivo esperado"
+# = lo que debe haber en el cajón), así que los números no cuadraban con
+# los de la app.
+def _isis_cash_state(db):
+    """Estado de caja con los mismos datos que la app, en centavos.
+
+    Devuelve el periodo abierto, el desglose del esperado y los bloqueos
+    con las mismas condiciones que cash()/close_cash: cuentas abiertas o
+    por cobrar, movimientos pendientes y reparto de propinas."""
+    p = db.scalar(select(CashPeriod).where(CashPeriod.closed_at.is_(None)).order_by(CashPeriod.id.desc()))
+    if not p:
+        return {'open': False}
+    totals = {m: 0 for m in ('cash', 'card', 'transfer')}
+    for method, value in db.execute(
+            select(Payment.method, func.coalesce(func.sum(Payment.cents), 0))
+            .where(Payment.period_id == p.id).group_by(Payment.method)).all():
+        if method in totals:
+            totals[method] = int(value or 0)
+    tips = period_tip_totals(db, p.id)
+    moves = db.scalars(select(CashMovement).where(
+        CashMovement.period_id == p.id, CashMovement.status == 'approved')).all()
+    net = sum((1 if x.kind == 'in' else -1) * x.cents for x in moves)
+    # v8.2: el desglose hablado separa los movimientos en ingresos (entradas)
+    # y gastos operativos (salidas). La app no tiene un concepto aparte de
+    # "gastos operativos": son los movimientos de caja de salida ('out') del
+    # turno, con motivo libre; la pantalla de Caja solo los muestra como neto
+    # ("+/- Entradas / retiros"), pero in - out es ese mismo neto.
+    moves_in = sum(x.cents for x in moves if x.kind == 'in')
+    moves_out = sum(x.cents for x in moves if x.kind == 'out')
+    pending_moves = int(db.scalar(select(func.count(CashMovement.id)).where(
+        CashMovement.period_id == p.id, CashMovement.status == 'pending')) or 0)
+    tip_payout = tip_payout_cash_total(db, p.id)
+    blocking = int(db.scalar(select(func.count(Account.id)).where(
+        Account.status.notin_(('paid', 'cancelled')))) or 0)
+    tip_total = sum(tips.values())
+    distribution = db.scalar(select(TipDistribution).where(TipDistribution.period_id == p.id))
+    blockers = []
+    if blocking:
+        blockers.append(f"hay {_isis_n(blocking, 'cuenta abierta', 'cuentas abiertas')}")
+    if pending_moves:
+        blockers.append(f"hay {_isis_n(pending_moves, 'movimiento pendiente', 'movimientos pendientes')}")
+    if tip_total > 0 and not distribution:
+        blockers.append('falta el reparto de propinas')
+    if distribution and distribution.total_cents != tip_total:
+        blockers.append('el reparto de propinas ya no cuadra con el total')
+    return {'open': True, 'period_id': p.id, 'opening': p.opening_cents,
+            'cash_sales': totals['cash'], 'card': totals['card'], 'transfer': totals['transfer'],
+            'tip_cash': tips['cash'], 'tip_card': tips['card'], 'tip_transfer': tips['transfer'],
+            'net_movements': net, 'tip_payout_cash': tip_payout,
+            'moves_in': moves_in, 'moves_out': moves_out,
+            'expected': cash_expected_cents(db, p), 'blockers': blockers,
+            'can_close': not blockers}
+
+
+_ISIS_CASH_CUT = {}  # user_id -> {'step': 'cash', 'cash': float (pesos), 'last': float}
 _ISIS_CASH_CUT_QUESTIONS = {
-    'cash': '¿Cuánto hay en efectivo?',
-    'card': '¿Y en tarjeta?',
-    'transfer': '¿Y por transferencias?',
+    'cash': '¿Cuánto efectivo hay en el cajón?',
 }
 
 
@@ -902,8 +968,7 @@ def _isis_cash_cut_get(user_id):
 
 
 def _isis_cash_cut_start(user_id):
-    _ISIS_CASH_CUT[user_id] = {'step': 'cash', 'cash': 0.0, 'card': 0.0, 'transfer': 0.0,
-                               'last': time.time()}
+    _ISIS_CASH_CUT[user_id] = {'step': 'cash', 'cash': 0.0, 'last': time.time()}
 
 
 def _isis_cash_cut_clear(user_id):
@@ -915,32 +980,86 @@ def _isis_cash_cut_question(step, repeat=False):
     return q + (' Dime el monto en pesos.' if repeat else '')
 
 
+def _isis_cash_cut_breakdown(db):
+    """Desglose hablado del corte (v8.2), en el orden que pidió Santiago,
+    con los mismos datos de la app. Cada línea es una frase corta para que
+    la voz haga pausa. Siempre trae las 8 líneas, aunque el monto sea cero
+    ("cero pesos"). Devuelve None si no hay turno abierto.
+
+    Mapeo línea por línea (todo del turno abierto, en centavos):
+    - Fondo inicial: CashPeriod.opening_cents.
+    - Venta en efectivo / transferencia / tarjeta: suma de Payment.cents
+      por método del turno (sin propinas, como el "TOTAL VENTAS" del ticket).
+    - Venta total final: suma de las ventas de los 3 métodos.
+    - Ingresos en caja: movimientos de caja aprobados de entrada ('in').
+    - Gastos operativos: movimientos de caja aprobados de salida ('out').
+      La app no tiene un concepto aparte de "gastos operativos": son las
+      salidas del turno (retiros, con motivo libre); la pantalla solo las
+      muestra en el neto, pero ingresos - gastos es ese mismo neto.
+    - Efectivo esperado: cash_expected_cents (la fórmula de la app)."""
+    st = _isis_cash_state(db)
+    if not st.get('open'):
+        return None
+
+    def pesos_c(cents):
+        return 'cero pesos' if not cents else _isis_pesos(cents / 100)
+
+    total_sales_c = st['cash_sales'] + st['card'] + st['transfer']
+    lines = [
+        'Claro, en un momento.',
+        f"Fondo inicial, {pesos_c(st['opening'])}.",
+        f"Venta en efectivo, {pesos_c(st['cash_sales'])}.",
+        f"Venta en transferencia, {pesos_c(st['transfer'])}.",
+        f"Venta en tarjeta, {pesos_c(st['card'])}.",
+        f"Venta total final, {pesos_c(total_sales_c)}.",
+        f"Ingresos en caja, {pesos_c(st['moves_in'])}.",
+        f"Gastos operativos, {pesos_c(st['moves_out'])}.",
+        f"Efectivo esperado, {pesos_c(st['expected'])}.",
+    ]
+    return ' '.join(lines)
+
+
+def _isis_cash_cut_start_reply(db, user):
+    """Inicia el flujo guiado y devuelve el desglose + la pregunta por el
+    efectivo del cajón (v8.2)."""
+    _isis_cash_cut_start(user.id)
+    breakdown = _isis_cash_cut_breakdown(db)
+    return (breakdown + ' ' if breakdown else '') + _isis_cash_cut_question('cash')
+
+
 def _isis_cash_cut_summary(db, user, flow):
-    """Compara lo dictado con lo que espera el sistema, en corto y en pesos."""
-    total = flow['cash'] + flow['card'] + flow['transfer']
-    base = (f"Conté {_isis_pesos(total)} en total: {_isis_pesos(flow['cash'])} en efectivo, "
-            f"{_isis_pesos(flow['card'])} con tarjeta y {_isis_pesos(flow['transfer'])} por transferencias.")
-    try:
-        c = cash(db, user)
-        if not c.get('open'):
-            return base + ' No hay turno abierto, así que no tengo con qué compararlo.'
-        exp_cash = float(str(c.get('expected') or '0').replace(',', ''))
-        exp_card = float(str(c.get('card') or '0').replace(',', ''))
-        exp_tr = float(str(c.get('transfer') or '0').replace(',', ''))
-        diffs = []
-        for label, got, exp in (('efectivo', flow['cash'], exp_cash),
-                                ('tarjeta', flow['card'], exp_card),
-                                ('transferencias', flow['transfer'], exp_tr)):
-            d = round(got - exp, 2)
-            if d > 0:
-                diffs.append(f"en {label} sobran {_isis_pesos(d)}")
-            elif d < 0:
-                diffs.append(f"en {label} faltan {_isis_pesos(abs(d))}")
-        if not diffs:
-            return base + ' Cuadra perfecto con lo del sistema.'
-        return base + ' ' + '. '.join(x[0].upper() + x[1:] for x in diffs) + '.'
-    except Exception:
-        return base
+    """Compara el efectivo contado con el esperado de la app, en corto y en pesos.
+
+    Solo el efectivo se cuenta físicamente (así lo pide el formulario de
+    cierre de la app); tarjeta y transferencia son totales del sistema y se
+    dicen como dato, no se dictan ni se comparan. La diferencia es la misma
+    que mostraría la pantalla de Caja: contado menos esperado."""
+    counted_c = int(round(float(flow['cash']) * 100))
+    st = _isis_cash_state(db)
+    if not st.get('open'):
+        return (f"Conté {_isis_pesos(flow['cash'])} en efectivo, pero no hay turno abierto, "
+                'así que no tengo con qué compararlo.')
+    exp_c = st['expected']
+    parts = [f"{_isis_pesos(st['opening'] / 100)} de fondo",
+             f"{_isis_pesos(st['cash_sales'] / 100)} de ventas en efectivo"]
+    if st['tip_cash']:
+        parts.append(f"{_isis_pesos(st['tip_cash'] / 100)} de propinas en efectivo")
+    if st['net_movements']:
+        parts.append(f"{'más' if st['net_movements'] > 0 else 'menos'} {_isis_pesos(abs(st['net_movements']) / 100)} de movimientos")
+    if st['tip_payout_cash']:
+        parts.append(f"menos {_isis_pesos(st['tip_payout_cash'] / 100)} de propinas pagadas")
+    base = (f"Conté {_isis_pesos(flow['cash'])} en efectivo en el cajón. "
+            f"El sistema espera {_isis_pesos(exp_c / 100)}: " + ', '.join(parts) + '.')
+    diff_c = counted_c - exp_c
+    if diff_c == 0:
+        verdict = 'Cuadra perfecto con lo de la app.'
+    elif diff_c > 0:
+        verdict = f"En efectivo sobran {_isis_pesos(diff_c / 100)}."
+    else:
+        verdict = f"En efectivo faltan {_isis_pesos(abs(diff_c) / 100)}."
+    methods = (f"Con tarjeta van {_isis_pesos(st['card'] / 100)} y por transferencia "
+               f"{_isis_pesos(st['transfer'] / 100)}, según el sistema.")
+    return base + ' ' + verdict + ' ' + methods
 
 
 def _isis_cash_cut_step(db, user, raw):
@@ -951,32 +1070,37 @@ def _isis_cash_cut_step(db, user, raw):
     if not flow:
         return None
     text = _isis_norm(raw)
-    # Volver a pedir el corte en medio del flujo: se reinicia desde cero.
+    # Volver a pedir el corte en medio del flujo: se reinicia desde cero
+    # (y se vuelve a leer el desglose, como al iniciar).
     if ('corte de caja' in text or 'haz el corte' in text or 'cierra el turno' in text) \
             and _isis_money_spoken(text) is None:
-        _isis_cash_cut_start(uid)
-        return {'reply': 'Va, empezamos de nuevo el corte. ¿Cuánto hay en efectivo?',
+        return {'reply': 'Va, empezamos de nuevo el corte. ' + _isis_cash_cut_start_reply(db, user),
                 'needs_confirmation': False, 'confirm_token': None}
     if re.search(r'\b(cancela|cancelar|olvidalo|olvida|mejor no|dejalo)\b', text) or text.strip() == 'no':
         _isis_cash_cut_clear(uid)
         return {'reply': 'Sale, cancelado. No cerré nada.',
                 'needs_confirmation': False, 'confirm_token': None}
     amt = _isis_money_spoken(text)
-    step = flow['step']
     if amt is None:
-        return {'reply': _isis_cash_cut_question(step, repeat=True),
+        return {'reply': _isis_cash_cut_question('cash', repeat=True),
                 'needs_confirmation': False, 'confirm_token': None}
-    flow[step] = float(amt)
+    flow['cash'] = float(amt)
     flow['last'] = time.time()
-    nxt = {'cash': 'card', 'card': 'transfer', 'transfer': None}[step]
-    if nxt:
-        flow['step'] = nxt
-        return {'reply': _isis_cash_cut_question(nxt),
-                'needs_confirmation': False, 'confirm_token': None}
-    # Último paso: comparar y pedir confirmación; el cierre usa el token
-    # que ya existe, nunca se ejecuta solo con decir los montos.
+    # El efectivo es lo único que se cuenta físicamente: tarjeta y
+    # transferencia las toma el sistema, como en la pantalla de Caja.
+    # Antes de proponer el cierre se revisan los bloqueos con las mismas
+    # condiciones que la app: si algo lo bloquea, Isis lo dice en corto y
+    # no propone cerrar (antes el error solo salía al confirmar).
     _isis_cash_cut_clear(uid)
     summary = _isis_cash_cut_summary(db, user, flow)
+    st = _isis_cash_state(db)
+    if not st.get('open'):
+        return {'reply': summary, 'needs_confirmation': False, 'confirm_token': None}
+    if st.get('blockers'):
+        return {'reply': summary + ' No puedo cerrar todavía: ' + ' y '.join(st['blockers']) + '.',
+                'needs_confirmation': False, 'confirm_token': None}
+    # Último paso: pedir confirmación; el cierre usa el token que ya
+    # existe, nunca se ejecuta solo con decir los montos.
     intent = {'action': 'close_cash',
               'params': {'counted': flow['cash'], 'note': 'Corte guiado por voz con Isis'}}
     token = _isis_confirm_token(intent)
@@ -2972,8 +3096,19 @@ async def isis_voice_chat(data: IsisChatIn, db: Session = Depends(db_session), u
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
     if intent.get('action') == 'cash_cut_start':
-        _isis_cash_cut_start(user.id)
-        reply = 'Va, hacemos el corte. ¿Cuánto hay en efectivo?'
+        # Antes de empezar se revisa lo mismo que la app revisa para poder
+        # cerrar: turno abierto y sin bloqueos (cuentas abiertas, movimientos
+        # pendientes, reparto de propinas). Si algo lo bloquea, Isis lo dice
+        # en corto en vez de guiar un corte que no se puede cerrar.
+        st = _isis_cash_state(db)
+        if not st.get('open'):
+            reply = 'No hay turno abierto, así que no hay corte que hacer.'
+        elif st.get('blockers'):
+            reply = 'No puedo cerrar todavía: ' + ' y '.join(st['blockers']) + '.'
+        else:
+            # v8.2: al iniciar, Isis lee primero el desglose completo con los
+            # datos de la app y luego pregunta por el efectivo del cajón.
+            reply = _isis_cash_cut_start_reply(db, user)
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
     if intent.get('action') in _WRITE_ACTIONS:
