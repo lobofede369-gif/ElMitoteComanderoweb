@@ -47,6 +47,18 @@
    micrófono ni permisos, funciona también en la app instalada.
    (5) Velocidad gratis: el despertar del servidor ya no se espera en
    serie antes de pedir, y el hueco entre turnos bajó de 700 a 400 ms.
+   Modo silencio (v14.1, "Solo mensajes"): el botón que antes era
+   "Silenciar micrófono" congelaba toda la conversación (callaba a Isis
+   Y dejaba de escucharte, y encima un mensaje escrito en silencio igual
+   se hablaba, porque los speak de sendToIsis solo miraban inCall).
+   Ahora es un modo de conversación por texto: Isis no emite ni una
+   palabra hablada (ni respuestas, ni alertas, ni tonos de espera) y
+   todo sale escrito en el panel; la entrada puede ser voz o texto y
+   ella sigue escuchando. El freno vive en speak() (choke point de toda
+   la voz), en startSpeaker (streaming), en playWaitTone y en las
+   alertas a media llamada (que siguen corriendo pero solo por texto).
+   Colgar sigue siendo la forma de dejar de escuchar del todo. Por
+   llamada, no persistente.
    Resumen al entrar (v8): después del saludo y las alertas, Isis dice sola
    cómo cerró el día anterior (ventas de ayer, lo más vendido, lo que se
    acabó), una sola vez por entrada al panel.
@@ -82,11 +94,12 @@
   let kokoroPromise = null;
   let speaking = false;
   let kokoroAudio = null; // el <audio> de la frase actual (Dora u OpenAI)
-  // Modo llamada: inCall = la llamada está activa; muted = micrófono
-  // silenciado (la llamada sigue, Isis deja de oírte); busy = Isis está
+  // Modo llamada: inCall = la llamada está activa; silent = modo
+  // silencio v14.1 ("Solo mensajes"): Isis no habla nada y contesta
+  // solo por escrito, pero sigue escuchando; busy = Isis está
   // pensando o contestando, así que todavía no se debe escuchar.
   let inCall = false;
-  let muted = false;
+  let silent = false;
   let busy = false;
   let listenTimer = null;
   let listenErrors = 0; // errores seguidos de reconocimiento (sin contar no-speech)
@@ -529,8 +542,8 @@
     const mute = $('#isis-mute');
     if (mute) {
       mute.hidden = !inCall;
-      mute.textContent = muted ? 'Quitar silencio' : 'Silenciar micrófono';
-      mute.classList.toggle('muted', muted);
+      mute.textContent = silent ? 'Volver a hablar' : 'Solo mensajes';
+      mute.classList.toggle('muted', silent);
     }
   }
 
@@ -562,6 +575,13 @@
 
   async function speak(text, opts) {
     if (!text) return;
+    // Modo silencio (v14.1): el freno de voz vive AQUÍ, el único
+    // camino por el que sale cualquier frase hablada (respuestas por
+    // chat normal, saludos, alertas, aviso de voz lista, muestras).
+    // En silencio no suena nada: la respuesta ya quedó escrita en el
+    // panel por quien llamó a speak(). Sin excepciones: en este modo
+    // NADIE habla con voz, ni siquiera "Probar voces".
+    if (silent) return;
     stopSpeaking();
     const gen = ++speakGen;
     speaking = true;
@@ -795,12 +815,12 @@
   // (gateInterrupt: con "Isis" corta al instante, sin esperar; con voz
   // presente clara corta tras 700 ms y con 2+ palabras); se rearma
   // hasta 20 veces por respuesta, también en onerror, y si el arranque
-  // falla se reintenta a los 500 ms (3 intentos). El botón de silenciar
-  // es el freno seguro: si se toca mientras habla, la calla al instante
-  // sin depender del reconocimiento.
+  // falla se reintenta a los 500 ms (3 intentos). El botón de silencio
+  // (v14.1 "Solo mensajes") es el freno seguro: si se toca mientras
+  // habla, la calla al instante sin depender del reconocimiento.
   let interruptStartTries = 0; // intentos de arranque por respuesta hablada
   function startInterruptListener() {
-    if (!SpeechRecognition || !inCall || muted || interruptRecognizer) return;
+    if (!SpeechRecognition || !inCall || silent || interruptRecognizer) return;
     interruptOff = false;
     // El reconocedor principal puede seguir cerrándose: matarlo antes
     // quita la contienda por el único reconocimiento de Android.
@@ -812,7 +832,7 @@
       r.continuous = true;
       r.maxAlternatives = 1;
       r.onresult = (e) => {
-        if (!speaking || !inCall || muted) return;
+        if (!speaking || !inCall || silent) return;
         for (let i = e.resultIndex; i < e.results.length; i++) {
           const res = e.results[i];
           if (res[0] && res[0].transcript && res[0].transcript.trim()) {
@@ -828,9 +848,9 @@
         // Se cortó solo (silencio, ruido, error): si Isis sigue
         // hablando, rearmar con pausa, con tope para no girar en bucle
         // si el servicio falla de plano.
-        if (!interruptOff && speaking && inCall && !muted && interruptRestarts < 20) {
+        if (!interruptOff && speaking && inCall && !silent && interruptRestarts < 20) {
           interruptRestarts += 1;
-          setTimeout(() => { if (!interruptOff && speaking && inCall && !muted) startInterruptListener(); }, 300);
+          setTimeout(() => { if (!interruptOff && speaking && inCall && !silent) startInterruptListener(); }, 300);
         }
       };
       r.onerror = () => { rearm(); };
@@ -842,9 +862,9 @@
       interruptRecognizer = null;
       // El arranque falló (contienda con el principal): reintentar en
       // 500 ms, no dejarla sorda para toda la respuesta.
-      if (!interruptOff && speaking && inCall && !muted && interruptStartTries < 3) {
+      if (!interruptOff && speaking && inCall && !silent && interruptStartTries < 3) {
         interruptStartTries += 1;
-        setTimeout(() => { if (!interruptOff && speaking && inCall && !muted) startInterruptListener(); }, 500);
+        setTimeout(() => { if (!interruptOff && speaking && inCall && !silent) startInterruptListener(); }, 500);
       }
     }
   }
@@ -911,6 +931,9 @@
   // cada vez que una petición tardaba. Usa WebAudio, como el timbre, y
   // no rompe nada si el audio no está permitido.
   async function playWaitTone() {
+    // Modo silencio (v14.1): ni el tono de espera suena; el estado ya
+    // dice que está revisando.
+    if (silent) return;
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
@@ -1509,9 +1532,11 @@
   // sendToIsis(message, opts): el mismo camino para voz y texto (v14).
   // opts.via === 'text' (chat escrito): sin tono de espera (el tono es
   // solo para voz) y sin depender del micrófono. La respuesta se habla
-  // si hay llamada y no está silenciada; si no, solo se muestra el
-  // texto (así el chat escrito funciona también en la app instalada,
-  // donde no hay reconocimiento de voz).
+  // solo si hay llamada y NO está el modo silencio (v14.1): el freno
+  // vive en speak() y en startSpeaker, así que el camino de texto
+  // tampoco habla en silencio; si no, solo se muestra el texto (así el
+  // chat escrito funciona también en la app instalada, donde no hay
+  // reconocimiento de voz).
   async function sendToIsis(message, opts) {
     const viaText = !!(opts && opts.via === 'text');
     // Si había un stream anterior en curso (interrupción), se aborta: la
@@ -1546,6 +1571,11 @@
     let spokeStream = false;
     let speakerPromise = null;
     const startSpeaker = () => {
+      // Modo silencio (v14.1): el stream sigue llegando (las frases se
+      // acumulan en la cola), pero nunca se habla ninguna: la respuesta
+      // ya queda escrita por applyDone. Sin este freno, un stream en
+      // curso hablaría aunque speak() estuviera frenado.
+      if (silent) return;
       if (speakerPromise) return;
       stopSpeaking();
       const gen = ++speakGen;
@@ -1662,8 +1692,9 @@
   // la voz no se entiende. Funciona también en la app instalada
   // (WebView), donde SpeechRecognition es undefined: no toca el
   // reconocimiento ni getUserMedia. Escribir corta la respuesta hablada
-  // en curso, como interrumpir por voz; la respuesta nueva se habla si
-  // hay llamada y no está silenciada, si no solo se muestra el texto.
+  // en curso, como interrumpir por voz; la respuesta nueva se habla
+  // solo si hay llamada y no está el modo silencio (v14.1), si no solo
+  // se muestra el texto.
   // ISIS_TEXT_CHAT_BEGIN
   function sendIsisText() {
     const input = $('#isis-text-input');
@@ -1681,8 +1712,11 @@
   // revisa si apareció algo nuevo que necesita atención y lo dice en corto.
   // Nunca interrumpe a Santiago a media frase (solo corre después de que
   // Isis termina de hablar) y nunca repite una alerta ya dicha.
+  // Modo silencio (v14.1): el aviso SIGUE corriendo, pero solo por
+  // texto: el speak() de abajo está frenado y la alerta ya quedó
+  // escrita en el panel. Antes (v14) el silencio cortaba el chequeo.
   async function maybeMidCallAlert() {
-    if (!inCall || muted) return;
+    if (!inCall) return;
     if (Date.now() - lastMidCheck < 75000) return;
     lastMidCheck = Date.now();
     try {
@@ -1717,10 +1751,12 @@
     } catch (e) {}
   }
 
-  // Vuelve a escuchar solo si la llamada sigue activa, el micrófono no
-  // está silenciado y Isis no está pensando ni hablando.
+  // Vuelve a escuchar solo si la llamada sigue activa y Isis no está
+  // pensando ni hablando. Modo silencio (v14.1): el silencio YA NO
+  // corta la escucha — en silencio ella sigue oyendo y contestando por
+  // escrito; colgar es lo que deja de escuchar del todo.
   function maybeListen() {
-    if (!inCall || muted || listening || speaking || busy) return;
+    if (!inCall || listening || speaking || busy) return;
     if (!SpeechRecognition) return;
     clearTimeout(listenTimer);
     listenTimer = setTimeout(startListening, 400);
@@ -1800,7 +1836,8 @@
       recognizer.start();
       listening = true;
       listenErrors = 0; // arrancó bien: los errores de antes no cuentan
-      status('Te escucho, dime.', 'listening');
+      // Modo silencio (v14.1): que quede claro que oye pero no habla.
+      status(silent ? 'Te escucho · modo silencio: te contesto por escrito.' : 'Te escucho, dime.', 'listening');
     } catch (e) {
       listening = false;
       status('No pude abrir el micrófono. Revisa el permiso.', '');
@@ -1821,7 +1858,7 @@
       return;
     }
     inCall = true;
-    muted = false;
+    silent = false;
     busy = false;
     // Puerta "Isis" (v14): al arrancar, el saludo pregunta y el primer
     // turno entra sin la palabra; el medidor de banda arranca en
@@ -1837,7 +1874,7 @@
 
   function endCall(message) {
     inCall = false;
-    muted = false;
+    silent = false;
     busy = false;
     // Puerta "Isis" (v14): se apaga el medidor y se resetea la puerta.
     followUpOpen = false;
@@ -1863,17 +1900,21 @@
     status(message || 'Llamada terminada. Toca "Llamar a Isis" si quieres volver a empezar.', '');
   }
 
-  function toggleMute() {
+  function toggleSilent() {
     if (!inCall) return;
-    muted = !muted;
-    if (muted) {
-      // Freno seguro (v14): si se toca mientras Isis habla, la calla al
-      // instante sin depender del reconocimiento (que puede fallar con
-      // música). Silenciar = callarla + no escucharla.
+    silent = !silent;
+    if (silent) {
+      // Modo silencio (v14.1, "Solo mensajes"): si se toca mientras
+      // Isis habla, la calla al instante sin depender del
+      // reconocimiento (freno seguro, como el silenciar de v14). PERO
+      // a diferencia del silenciar viejo, la llamada NO se congela:
+      // ella sigue escuchando y sus respuestas salen solo por escrito
+      // en el panel. Colgar sigue siendo la forma de dejar de escuchar.
       stopSpeaking();
-      stopListening();
-      status('Micrófono en silencio, no te escucho.', '');
+      status('Modo silencio: te escucho y te contesto por escrito.', '');
+      maybeListen();
     } else {
+      status('Te escucho, dime.', 'listening');
       maybeListen();
     }
     updateCallUI();
@@ -1965,7 +2006,7 @@
     if (rep) rep.textContent = 'Isis: ' + greet + voiceNote;
     setDetail('');
     inCall = true;
-    muted = false;
+    silent = false;
     busy = false;
     updateCallUI();
     startCallTimer();
@@ -2007,7 +2048,7 @@
     const mic = $('#isis-mic');
     if (mic) mic.addEventListener('click', () => (inCall ? endCall() : startCall()));
     const mute = $('#isis-mute');
-    if (mute) mute.addEventListener('click', toggleMute);
+    if (mute) mute.addEventListener('click', toggleSilent);
     // Chat escrito (v14): Enviar con el botón o con Enter. No exige
     // micrófono ni permisos: funciona también sin reconocimiento de voz.
     const txtSend = $('#isis-text-send');
@@ -2058,13 +2099,14 @@
   // llama nunca al endpoint de OpenAI; sendToIsis con setInCall sirve
   // para verificar el tono de espera en VM (que no use la voz del
   // teléfono y que colgar lo corte de inmediato).
-  window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit, startCall, endCall, toggleMute,
+  window.IsisVoice = { show, startListening, stopListening, loadKokoro, exit, startCall, endCall, toggleSilent, toggleMute: toggleSilent,
     _test: { resolveVoiceEngine, getVoiceEngine: () => voiceEngine, setVoiceEngine,
       resolveOpenAIVoice, getOpenAIVoice, setOpenAIVoice, playVoiceSample, isisTtsText,
       splitIntoSpeechParts, mergeSpeechParts, setDetail, playWaitTone,
       requestOpenAIPart, makeOpenAIVoicePlayer: makeOpenAIPlayer,
       setOpenaiAvailable: (v) => { openaiTTS = !!v; applyVoiceEngine(); }, speak,
       sendToIsis, setInCall: (v) => { inCall = !!v; },
+      getSilent: () => silent, setSilent: (v) => { silent = !!v; updateCallUI(); },
       isisWakeCheck, isisVoiceBandRatio, isisBandLevel, gateHeard, gateInterrupt,
       createVoiceBandMeter, voiceBandMeter,
       getFollowUpOpen: () => followUpOpen, setFollowUpOpen: (v) => { followUpOpen = !!v; },
