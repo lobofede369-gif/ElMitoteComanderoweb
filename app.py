@@ -1503,7 +1503,7 @@ _ISIS_SYSTEM = (
     "shift_handover, pay_and_close_account, shopping_list, oldest_ticket, "
     "cancel_item. Params segun la accion: open_cash {opening}, "
     "close_cash {counted, note}, create_table {name, area, capacity}, "
-    "update_table {table_id, capacity}, new_account {table_id, table_name}, "
+    "update_table {table_id, capacity}, new_account {table_id, table_name, client_name}, "
     "add_order {account_id, items: [{product_id, product, qty, note}]}, product_price {product_id, product}, "
     "pay_account {account_id, amount, method, all}, close_account "
     "{account_id}, transfer_account {account_id, table_id}, restock "
@@ -1566,7 +1566,7 @@ _ISIS_SYSTEM = (
     "transfer. mode de descuento: percent o fixed. role: waiter, cashier, "
     "kitchen, bar, admin. Si falta un dato indispensable para una "
     "escritura, pon action unknown y en question pregunta solo por ese "
-    "dato, en espanol. Si el mensaje es una pregunta o una charla que no "
+    "dato, en espanol. Nunca inventes folios ni ids de cuentas, productos o comandas. Si el mensaje es una pregunta o una charla que no "
     "corresponde a ninguna accion concreta (un saludo, como va la noche, "
     "un consejo), usa chat con una respuesta corta y calida, con tono "
     "mexicano de restaurante, usando SOLO los datos del contexto; nunca "
@@ -1777,6 +1777,25 @@ def _isis_table_name(text):
     return name
 
 
+def _isis_client_name_from_open(text):
+    """Nombre de cliente al abrir una mesa (v15.3): 'abre una mesa
+    llamada Lopez Perez en la mesa 1', 'abre la mesa 5 para Juanita'.
+    El texto ya viene normalizado (sin acentos, en minúsculas). Devuelve
+    el nombre en título o None. 'para llevar' no es un nombre."""
+    m = re.search(r'llamad[oa]?\s+([a-z ]+?)(?:\s+en\s+(?:la\s+)?mesa|\s*$)', text)
+    name = m.group(1).strip() if m else ''
+    if not name:
+        m = re.search(r'\bpara\s+([a-z ]+?)(?:\s+en\s+(?:la\s+)?mesa|\s*$)', text)
+        name = m.group(1).strip() if m else ''
+    name = re.sub(r'\s+(por favor|porfa)\s*$', '', name).strip()
+    if not name or name in ('llevar', 'aqui', 'mesa', 'cuenta'):
+        return None
+    words = name.split()
+    if not (1 <= len(words) <= 3):
+        return None
+    return ' '.join(w.capitalize() for w in words)
+
+
 # Números de mesa, en dígito o en palabra, para quitar la referencia de
 # mesa del texto antes de leer cantidades o dinero ("mesa cinco" no es
 # una cantidad ni un monto).
@@ -1820,6 +1839,15 @@ def _isis_cached(key, loader):
     if key not in memo:
         memo[key] = loader()
     return memo[key]
+
+
+def _isis_memo_drop(key):
+    """Olvida una lista memoizada de esta llamada (v15.3): tras una
+    escritura, la siguiente lectura vuelve a cargar fresco en vez de
+    servir la lista de antes de escribir."""
+    memo = _ISIS_MEMO.get()
+    if memo is not None:
+        memo.pop(key, None)
 
 def _isis_analytics_cached(db, user, start, end, scope):
     """owner_analytics con memo por llamada (misma fecha/alcance = 1 query)."""
@@ -2798,6 +2826,27 @@ def _isis_parse_local(db, user, raw, history=None):
     text = _isis_norm(raw)
     if not text:
         return None
+    # v15.3: "A la 1" como respuesta a "¿A qué mesa le agrego el pedido?":
+    # completar el pedido anterior con la mesa contestada (la cuenta ya
+    # existe en esa mesa). Si la cuenta aún no existe, no se adivina: la
+    # cadena (que reintenta la frase original) lo resuelve antes.
+    if history:
+        last_user, last_reply = history[-1]
+        lu = _isis_norm(last_user or '')
+        if last_reply and 'a que mesa' in _isis_norm(last_reply) \
+                and _isis_find_table(db, user, text) is not None and len(text.split()) <= 3 \
+                and ('agrega' in lu or 'anade' in lu or 'pon ' in lu or 'pide' in lu or 'sumale' in lu):
+            acc = _isis_find_account(db, user, text)
+            prod = _isis_find_product(db, user, last_user or '')
+            if acc is not None and prod is not None:
+                item = {'product_id': prod.get('id'), 'product': prod.get('name'),
+                        'qty': _isis_qty_for_product(last_user, prod)}
+                note = _isis_parse_order_note(last_user)
+                if note:
+                    item['note'] = note
+                return {'action': 'add_order', 'params': {'account_id': acc.get('id'), 'items': [item],
+                                                          'table_name': acc.get('table_name'),
+                                                          'client_name': _isis_client_name_of(acc)}}
     # --- Seguimiento del hilo (v4): "¿y la de 1.2?" tras preguntar por la Corona 355 ---
     follow = _isis_resolve_followup(db, user, text, history)
     if follow is not None:
@@ -3309,12 +3358,18 @@ def _isis_parse_local(db, user, raw, history=None):
         m_raw = re.search(r'mesa\s+([A-Za-z0-9 ]+?)\s*$', raw.strip(), re.IGNORECASE)
         name = m_raw.group(1).strip().title() if m_raw else (_isis_table_name(text) or 'Nueva mesa')
         return {'action': 'create_table', 'params': {'name': name, 'area': 'Salon', 'capacity': 4}}
-    if 'abre la mesa' in text or 'abre mesa' in text or 'nueva cuenta' in text \
+    if 'abre la mesa' in text or 'abre mesa' in text or 'abre una mesa' in text or 'nueva cuenta' in text \
             or re.search(r'\babre la \d', text):  # v15: "abre la 6"
+        # v15.3: "abre la mesa 1 y agrega..." es una cadena (abrir + pedir):
+        # el parseo local de una sola acción no la resuelve; la cadena o
+        # Claude la toman. Sin esto, el pedido se perdía en silencio.
+        if ' y ' in text and re.search(r'\b(agrega|anade|pon|pide|sumale)\b', text):
+            return None
         t = _isis_find_table(db, user, text)
         if not t:
             return {'action': 'unknown', 'params': {}, 'question': '¿Qué mesa quieres abrir? Dime el nombre o el número.'}
-        return {'action': 'new_account', 'params': {'table_id': t.get('id'), 'table_name': t.get('name')}}
+        return {'action': 'new_account', 'params': {'table_id': t.get('id'), 'table_name': t.get('name'),
+                                                    'client_name': _isis_client_name_from_open(text)}}
     if 'anula' in text and 'cuenta' in text:
         a, missing = _isis_resolve_account(db, user, text, '¿Qué cuenta quieres anular? Dime la mesa.')
         if missing:
@@ -4412,7 +4467,7 @@ def _isis_describe(intent):
     if a == 'create_table':
         return f"Creo {mesa(p.get('name'))}."
     if a == 'new_account':
-        return f"Abro una cuenta en {mesa(p.get('table_name'))}."
+        return f"Abro una cuenta en {mesa(p.get('table_name'))}" + (f" para {p.get('client_name')}." if p.get('client_name') else ".")
     if a == 'add_order':
         def _it(i):
             t = f"{i.get('qty')} {i.get('product')}"
@@ -4541,16 +4596,47 @@ def _isis_confirm_token(intent, delicate=False, stage=1):
 _CHAIN_SPLIT = re.compile(r'\s+(?:y|luego)\s+|;\s*')
 
 
+def _isis_provisional_order(db, user, seg, pending_new):
+    """Pedido sobre una cuenta que se acaba de abrir en la misma frase
+    (v15.3): la cuenta aún no existe al parsear, así que el pedido queda
+    con account_id None y 'pending_table_id'; el ejecutor de la cadena
+    le pone el id real tras abrir la cuenta."""
+    p = _isis_find_product(db, user, seg)
+    if not p:
+        return None
+    item = {'product_id': p.get('id'), 'product': p.get('name'),
+            'qty': _isis_qty_for_product(seg, p)}
+    note = _isis_parse_order_note(seg)
+    if note:
+        item['note'] = note
+    return {'action': 'add_order', 'params': {'account_id': None, 'items': [item],
+                                              'table_name': pending_new.get('table_name'),
+                                              'client_name': pending_new.get('client_name'),
+                                              'pending_table_id': pending_new.get('table_id')}}
+
+
 def _isis_parse_chain(db, user, text, history=None):
     """Parte una orden en cadena en intents, o None si no es cadena o
     algún segmento no se entiende (entonces manda el parseo normal de
     la frase entera). El segundo segmento puede venir sin verbo ('una
     coca a la 6'): hereda el pedido anterior, con su propia mesa."""
+    # v15.3: "A la 1" como respuesta a "¿A qué mesa...?": reintentar la
+    # frase original de la llamada (ella ya trae mesa y productos).
+    if history:
+        last_user, last_reply = history[-1]
+        lu = _isis_norm(last_user or '')
+        if last_user and last_reply and 'a que mesa' in _isis_norm(last_reply or '') \
+                and _isis_find_table(db, user, text) is not None \
+                and len(_isis_norm(text).split()) <= 3 \
+                and ('agrega' in lu or 'anade' in lu or 'pon ' in lu or 'pide' in lu
+                     or 'abre' in lu or 'sumale' in lu):
+            text = last_user
     parts = [p.strip() for p in _CHAIN_SPLIT.split(text) if p.strip()]
     if len(parts) < 2:
         return None
     intents = []
     last_action = None
+    pending_new = None  # v15.3: cuenta que se abre en esta misma cadena
     for i, seg in enumerate(parts):
         # El segmento anterior es el "hilo" del siguiente: "y una coca"
         # se refiere a lo que se acaba de pedir en el mismo mensaje.
@@ -4565,27 +4651,41 @@ def _isis_parse_chain(db, user, text, history=None):
             prev = intents[-1]
             if last_action == 'add_order':
                 acc = _isis_find_account(db, user, seg)
-                p = _isis_find_product(db, user, seg)
-                if acc is not None and p is not None:
-                    item = {'product_id': p.get('id'), 'product': p.get('name'),
-                            'qty': _isis_qty_for_product(seg, p)}
-                    note = _isis_parse_order_note(seg)
-                    if note:
-                        item['note'] = note
-                    intent = {'action': 'add_order', 'params': {
-                        'account_id': acc.get('id'), 'items': [item],
-                        'table_name': acc.get('table_name'),
-                        'client_name': _isis_client_name_of(acc)}}
+                if acc is None and pending_new is not None:
+                    # v15.3: la cuenta se abre en esta misma frase.
+                    intent = _isis_provisional_order(db, user, seg, pending_new)
+                elif acc is not None:
+                    p = _isis_find_product(db, user, seg)
+                    if p is not None:
+                        item = {'product_id': p.get('id'), 'product': p.get('name'),
+                                'qty': _isis_qty_for_product(seg, p)}
+                        note = _isis_parse_order_note(seg)
+                        if note:
+                            item['note'] = note
+                        intent = {'action': 'add_order', 'params': {
+                            'account_id': acc.get('id'), 'items': [item],
+                            'table_name': acc.get('table_name'),
+                            'client_name': _isis_client_name_of(acc)}}
             elif last_action == 'account_detail':
                 acc = _isis_find_account(db, user, seg)
                 if acc is not None:
                     intent = {'action': 'account_detail', 'params': {'account_id': acc.get('id')}}
+        # v15.3: el segmento pide mesa pero la cuenta se abre en esta
+        # misma frase ("agrega quesabirrias" tras abrir la mesa 1).
+        if (intent is None or intent.get('action') == 'unknown') and pending_new is not None:
+            prov = _isis_provisional_order(db, user, seg, pending_new)
+            if prov is not None:
+                intent = prov
         if intent is None or intent.get('action') == 'unknown':
             return None
         if intent.get('action') in ('cash_cut_start', 'split_account_start'):
             return None  # los flujos guiados no se encadenan
         intents.append(intent)
         last_action = intent.get('action')
+        if intent.get('action') == 'new_account':
+            pending_new = {'table_id': intent['params'].get('table_id'),
+                           'table_name': intent['params'].get('table_name'),
+                           'client_name': intent['params'].get('client_name')}
     if len(intents) < 2:
         return None
     return intents
@@ -4598,6 +4698,7 @@ async def _isis_execute_chain(db, user, intents, done=None):
     hay), con el resto guardado en _ISIS_CHAIN."""
     done = list(done or [])
     executed_any = bool(done)
+    created_by_table = {}  # v15.3: mesa -> cuenta recién abierta en esta cadena
     i = 0
     while i < len(intents):
         intent = intents[i]
@@ -4619,6 +4720,30 @@ async def _isis_execute_chain(db, user, intents, done=None):
             return {'replies': done + [f"No pude con eso: {e.detail}"],
                     'needs_confirmation': False, 'confirm_token': None, 'gate_reply': None,
                     'executed_any': executed_any}
+        except Exception:
+            # v15.3: un fallo inesperado en un paso ya no tumba la llamada
+            # entera con el mensaje genérico: se reporta lo hecho y se
+            # pregunta, y el error queda en los logs del servidor.
+            logging.exception('isis cadena fallo inesperado action=%s', a)
+            _ISIS_CHAIN.pop(user.id, None)
+            return {'replies': done + ['No pude con eso, ¿me lo repites con más detalle?'],
+                    'needs_confirmation': False, 'confirm_token': None, 'gate_reply': None,
+                    'executed_any': executed_any}
+        if a == 'new_account':
+            # v15.3: la cuenta recién creada, fresca (el memo de la llamada
+            # aún no la conoce); los pedidos provisionales de esta cadena
+            # piden sobre ella.
+            _isis_memo_drop('accounts')
+            acc = _isis_find_account(db, user, intent['params'].get('table_name') or '')
+            if acc is not None and intent['params'].get('table_id') is not None:
+                created_by_table[intent['params']['table_id']] = acc.get('id')
+        elif a in _WRITE_ACTIONS:
+            _isis_memo_drop('accounts')
+        for nxt in intents[i + 1:]:
+            pend = nxt.get('params', {}).get('pending_table_id')
+            if pend is not None and pend in created_by_table:
+                nxt['params']['account_id'] = created_by_table[pend]
+                nxt['params'].pop('pending_table_id', None)
         done.append(reply)
         executed_any = True
         i += 1
@@ -4706,11 +4831,26 @@ async def _isis_execute(db, user, intent):
         r = await create_dining_table(DiningTableIn(name=str(p.get('name')), area=str(p.get('area') or 'Salon'), capacity=int(p.get('capacity') or 4)), db, user)
         return f"La {p.get('name')} ya está creada."
     if a == 'new_account':
-        r = await new_account(AccountIn(name=None, table_id=int(p.get('table_id')) if p.get('table_id') else None, client_key=secrets.token_urlsafe(16)), db, user)
-        return f"Cuenta abierta en la {_isis_mesa_txt(p.get('table_name'))}, folio {r.get('id')}."
+        r = await new_account(AccountIn(name=p.get('client_name') or None, table_id=int(p.get('table_id')) if p.get('table_id') else None, client_key=secrets.token_urlsafe(16)), db, user)
+        client = p.get('client_name')
+        return f"Cuenta abierta en la {_isis_mesa_txt(p.get('table_name'))}" + (f" para {client}" if client else "") + f", folio {r.get('id')}."
     if a == 'add_order':
+        if not p.get('account_id'):
+            # v15.3: sin cuenta no se puede pedir; resolver por mesa o
+            # nombre en vez de reventar con int(None).
+            ref = ' '.join(x for x in (p.get('table_name'), p.get('client_name')) if x)
+            acc = _isis_find_account(db, user, ref) if ref else None
+            if acc is None:
+                raise HTTPException(400, '¿A qué mesa le agrego el pedido?')
+            p = dict(p, account_id=acc.get('id'), table_name=acc.get('table_name'),
+                     client_name=_isis_client_name_of(acc))
+        raw_items = p.get('items') or []
+        if not raw_items:
+            raise HTTPException(400, '¿Qué le agrego a esa mesa? Dime el producto.')
+        if any(i.get('product_id') is None for i in raw_items):
+            raise HTTPException(400, '¿Qué producto le agrego? Dime su nombre.')
         items = [OrderLine(product_id=int(i.get('product_id')), qty=int(i.get('qty') or 1),
-                           note=str(i.get('note') or '')) for i in p.get('items') or []]
+                           note=str(i.get('note') or '')) for i in raw_items]
         r = await send_order(int(p.get('account_id')), OrderIn(items=items, client_key=secrets.token_urlsafe(16)), db, user)
         # v13: sin confirmación previa, la respuesta dice exactamente lo
         # agregado ('Ya agregué 2 Corona 355 a la cuenta de Juanita en la
@@ -4928,6 +5068,8 @@ async def _isis_execute(db, user, intent):
         warn = " Ojo, hay comandas sin recibir todavía." if late else ""
         return _isis_say(f"Hay {_isis_n(len(rows), 'comanda', 'comandas')} en este turno: {txt}{warn}", warm=True)
     if a == 'ticket_status':
+        if not p.get('ticket_id') or not p.get('status'):
+            raise HTTPException(400, '¿Qué comanda? Dime el número y a qué estado la cambio.')
         await ticket_status(int(p.get('ticket_id')), StatusIn(status=str(p.get('status'))), db, user)
         estado = {'received': 'recibida', 'preparing': 'en preparación', 'ready': 'lista'}.get(p.get('status'), p.get('status'))
         return _isis_say(f"La comanda {p.get('ticket_id')} ya está {estado}.", warm=True)
@@ -5490,6 +5632,9 @@ async def isis_voice_chat_stream(data: IsisChatIn, db: Session = Depends(db_sess
             except HTTPException as e:
                 out = {'ok': False, 'reply': str(e.detail), 'executed': False}
             except Exception:
+                # v15.3: el fallo queda en los logs del servidor (antes se
+                # tragaba en silencio y nadie podía saber qué pasó).
+                logging.exception('isis chat-stream fallo inesperado')
                 out = {'ok': False, 'reply': 'No me pude conectar al restaurante, inténtalo de nuevo.', 'executed': False}
             yield 'data: ' + json.dumps({'type': 'done', **out}, ensure_ascii=False) + '\n\n'
         finally:
@@ -5505,7 +5650,14 @@ async def _isis_chat_run(db, user, data, emit=None):
     cached = _isis_chat_idem_get(user.id, data.client_key)
     if cached is not None:
         return cached
-    out = await _isis_chat_flow(db, user, data, emit=emit)
+    try:
+        out = await _isis_chat_flow(db, user, data, emit=emit)
+    except Exception:
+        # v15.3: red de seguridad final — un turno de Isis nunca se cae
+        # con un error genérico: se pregunta de nuevo y el fallo queda en
+        # los logs del servidor.
+        logging.exception('isis chat_run fallo inesperado')
+        out = {'ok': True, 'reply': 'No te entendí, ¿me lo repites? Te ayudo con todo lo del restaurante: mesas, cuentas, caja, menú, inventario y ventas.', 'executed': False}
     _isis_chat_idem_put(user.id, data.client_key, out)
     return out
 
@@ -5681,6 +5833,14 @@ async def _isis_chat_flow(db, user, data, emit=None):
             audit(db, user, 'isis.voice_execute', actor=actor, isis_action=intent.get('action'))
     except HTTPException as e:
         reply = 'No se pudo: ' + str(e.detail)
+        _record(reply)
+        return {'ok': True, 'reply': reply, 'executed': False}
+    except Exception:
+        # v15.3: un fallo inesperado ya no tumba el turno con el mensaje
+        # genérico de conexión: se pregunta de nuevo y el error queda en
+        # los logs del servidor para poder ver qué pasó.
+        logging.exception('isis execute fallo inesperado action=%s', intent.get('action'))
+        reply = 'No se pudo hacer eso, ¿me lo repites con más detalle?'
         _record(reply)
         return {'ok': True, 'reply': reply, 'executed': False}
     # v12: en respuestas chat (explicaciones/análisis) el detalle escrito
