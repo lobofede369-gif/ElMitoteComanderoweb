@@ -59,6 +59,11 @@
    alertas a media llamada (que siguen corriendo pero solo por texto).
    Colgar sigue siendo la forma de dejar de escuchar del todo. Por
    llamada, no persistente.
+   Una sola voz (v15.1): la de paga, Dora y la del teléfono sonaban por
+   tuberías separadas y se mezclaban (Santiago lo oyó en vivo). Ahora
+   toda la voz pasa por una cola serializada con registro de cada salida
+   audible: la voz nueva no arranca hasta comprobar que la vieja paró de
+   verdad, y la frase de prueba de Kokoro nunca suena en llamada.
    Resumen al entrar (v8): después del saludo y las alertas, Isis dice sola
    cómo cerró el día anterior (ventas de ayer, lo más vendido, lo que se
    acabó), una sola vez por entrada al panel.
@@ -597,6 +602,51 @@
     if (el) el.hidden = true;
   }
 
+  // Una sola voz (v15.1): registro de todo lo audible + cola serializada.
+  // La voz de paga (<audio>/MediaSource), Dora (<audio>) y la del teléfono
+  // (speechSynthesis) son tres tuberías distintas; antes stopSpeaking()
+  // solo les PEDÍA que pararan y speak() arrancaba la nueva de inmediato,
+  // así que en Android (donde speechSynthesis.cancel() no siempre mata el
+  // utterance) se oían dos voces a la vez. Ahora: cada salida audible se
+  // registra al sonar y se da de baja al terminar, y TODO speak() pasa por
+  // la cola — la voz nueva no arranca hasta comprobar que la vieja paró
+  // de verdad (sondeo cada 25 ms, reintentando cancel(), tope 1500 ms).
+  // stopSpeaking() (colgar/silencio/barge-in) sigue siendo síncrono:
+  // sube speakGen (invalida la cadena en curso y lo encolado), pide parar
+  // a todo y apaga `speaking`. Los `if (gen !== speakGen)` quedan como
+  // segunda capa, no como única defensa.
+  const voiceOutputs = new Set(); // handles {stop(), isAlive()}
+  let voiceQueue = Promise.resolve(); // cadena única: un speak a la vez
+  const STOP_WAIT_MS = 1500;
+  function registerVoiceOutput(handle) {
+    voiceOutputs.add(handle);
+    return () => { try { voiceOutputs.delete(handle); } catch (e) {} };
+  }
+  function anyVoiceAlive() {
+    for (const h of voiceOutputs) { try { if (h.isAlive()) return true; } catch (e) {} }
+    try { if (window.speechSynthesis && window.speechSynthesis.speaking) return true; } catch (e) {}
+    return false;
+  }
+  function stopAllVoicesNow() {
+    for (const h of [...voiceOutputs]) { try { h.stop(); } catch (e) {} }
+    try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) {}
+    try { if (openaiStreamPlayer) openaiStreamPlayer.cancel(); } catch (e) {}
+    openaiStreamPlayer = null;
+    try { if (kokoroAudio) { kokoroAudio.pause(); kokoroAudio = null; } } catch (e) {}
+  }
+  async function waitVoicesStopped() {
+    const t0 = Date.now();
+    let lastCancel = 0;
+    while (anyVoiceAlive() && Date.now() - t0 < STOP_WAIT_MS) {
+      // Reintentar cancel(): en Chrome de Android un solo cancel() no
+      // siempre mata el utterance; repetirlo suele lograrlo.
+      if (Date.now() - lastCancel >= 100) {
+        lastCancel = Date.now();
+        stopAllVoicesNow();
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
   async function speak(text, opts) {
     if (!text) return;
     // Modo silencio (v14.1): el freno de voz vive AQUÍ, el único
@@ -606,36 +656,38 @@
     // panel por quien llamó a speak(). Sin excepciones: en este modo
     // NADIE habla con voz, ni siquiera "Probar voces".
     if (silent) return;
-    stopSpeaking();
-    const gen = ++speakGen;
-    speaking = true;
-    speakStartedAt = Date.now();
-    interruptRestarts = 0;
-    interruptStartTries = 0;
-    status('Hablando…', 'speaking');
-    startInterruptListener();
-    try {
-      // Voz (v10.1): OpenAI solo si el interruptor está en de paga y el
-      // servidor tiene llave; si no, Dora, luego teléfono.
-      if (voiceEngineAllowsOpenAI()) await speakOpenAI(text, opts && opts.forceVoice);
-      else if (kokoroTTS) await speakKokoro(text);
-      else await speakPhone(text);
-    } finally {
-      // Solo apaga la escucha si este sigue siendo el speak en curso.
-      if (gen === speakGen) stopInterruptListener();
-    }
+    const gen = ++speakGen; // invalida la cadena anterior
+    const task = voiceQueue.then(async () => {
+      if (gen !== speakGen || silent) return; // invalidada después
+      // Parada comprobada de la voz anterior (no solo pedida).
+      stopAllVoicesNow();
+      await waitVoicesStopped();
+      if (gen !== speakGen || silent) return;
+      speaking = true;
+      speakStartedAt = Date.now();
+      interruptRestarts = 0;
+      interruptStartTries = 0;
+      status('Hablando…', 'speaking');
+      startInterruptListener();
+      try {
+        // Voz (v10.1): OpenAI solo si el interruptor está en de paga y el
+        // servidor tiene llave; si no, Dora, luego teléfono.
+        if (voiceEngineAllowsOpenAI()) await speakOpenAI(text, opts && opts.forceVoice);
+        else if (kokoroTTS) await speakKokoro(text);
+        else await speakPhone(text);
+      } finally {
+        // Solo apaga la escucha si este sigue siendo el speak en curso.
+        if (gen === speakGen) stopInterruptListener();
+      }
+    });
+    voiceQueue = task.catch(() => {});
+    return voiceQueue;
   }
 
   function stopSpeaking() {
+    speakGen++; // invalida la cadena en curso y lo encolado
     stopInterruptListener();
-    try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (e) {}
-    // El audio en streaming de OpenAI también se cancela: si no, seguiría
-    // llegando y sonando aunque Isis ya se haya callado.
-    try { if (openaiStreamPlayer) openaiStreamPlayer.cancel(); } catch (e) {}
-    openaiStreamPlayer = null;
-    // La voz de Kokoro no usa speechSynthesis sino un <audio>: hay que
-    // pausarlo aparte o seguiría sonando al colgar.
-    try { if (kokoroAudio) { kokoroAudio.pause(); kokoroAudio = null; } } catch (e) {}
+    stopAllVoicesNow();
     // Los audios de Dora ya generados pero aún no sonados se liberan: si no,
     // quedarían colgados en memoria tras una interrupción.
     kokoroUrls.forEach((u) => { try { URL.revokeObjectURL(u); } catch (e) {} });
@@ -985,7 +1037,8 @@
   function speakPhonePart(text, gen) {
     return new Promise((resolve) => {
       let done = false;
-      const finish = () => { if (!done) { done = true; resolve(); } };
+      let unregister = () => {};
+      const finish = () => { if (!done) { done = true; try { unregister(); } catch (e) {} resolve(); } };
       try {
         // Solo la copia para la voz pasa por el normalizador (v10.4):
         // la voz del teléfono leería "1 0 0" dígito por dígito si no.
@@ -1000,6 +1053,14 @@
         u.onend = finish;
         u.onerror = finish;
         window.speechSynthesis.speak(u);
+        // v15.1: registrar el utterance para que la cola de voz pueda
+        // comprobar que de verdad paró antes de arrancar la siguiente
+        // voz (en Android cancel() no siempre lo mata: el sondeo de la
+        // cola mira speechSynthesis.speaking y espera a que se calle).
+        unregister = registerVoiceOutput({
+          stop: () => { try { window.speechSynthesis.cancel(); } catch (e) {} },
+          isAlive: () => { try { return !!(window.speechSynthesis && window.speechSynthesis.speaking); } catch (e) { return false; } },
+        });
         setTimeout(() => {
           if (!done && gen === speakGen) {
             try { window.speechSynthesis.cancel(); } catch (e) {}
@@ -1024,6 +1085,24 @@
     if (!keepSpeaking) speaking = false;
   }
 
+  // Anuncio de voz lista (v15.1): la frase de prueba NUNCA suena en
+  // llamada — antes se programaba al tocar "Descargar voz de Isis" y
+  // sonaba cuando el modelo (~88 MB) terminaba de cargar, encima de la
+  // respuesta en curso (una de las mezclas que reportó Santiago). El
+  // texto ("Voz de Isis lista ✓") sí se actualiza siempre; la frase
+  // hablada solo suena fuera de llamada y sin nada sonando (por la cola
+  // de speak(), nunca encima de otra voz).
+  async function announceKokoroReady(announce) {
+    const stateEl = $('#isis-voice-state');
+    if (stateEl) stateEl.textContent = 'Voz de Isis lista (Dora).';
+    const btn = $('#isis-download-voice');
+    if (btn) btn.textContent = 'Voz de Isis lista ✓';
+    if (announce && !inCall && !speaking && !silent) {
+      await speak('Hola, soy Isis. Ya tengo mi voz lista.');
+      if (inCall) maybeListen();
+    }
+  }
+
   async function loadKokoro(opts) {
     if (kokoroState === 'ready') return kokoroTTS;
     if (kokoroState === 'loading') return kokoroPromise;
@@ -1039,14 +1118,11 @@
         kokoroTTS = tts;
         kokoroState = 'ready';
         try { localStorage.setItem(KOKORO_FLAG, '1'); } catch (_) {}
-        if (stateEl) stateEl.textContent = 'Voz de Isis lista (Dora).';
-        const btn = $('#isis-download-voice');
-        if (btn) btn.textContent = 'Voz de Isis lista ✓';
-        // Que se escuche el cambio de inmediato con la voz nueva.
-        if (opts && opts.announce) {
-          await speak('Hola, soy Isis. Ya tengo mi voz lista.');
-          if (inCall) maybeListen();
-        }
+        // v15.1: el anuncio va por announceKokoroReady() — en llamada
+        // NUNCA habla (antes la frase se programaba al tocar el botón y
+        // sonaba cuando el modelo terminaba de cargar, encima de la
+        // respuesta en curso). El texto sí se actualiza siempre.
+        await announceKokoroReady(opts && opts.announce);
         return tts;
       } catch (e) {
         try { console.error('Kokoro:', e); } catch (_) {}
@@ -1086,16 +1162,24 @@
   async function playAudioUrl(url) {
     const el = new Audio(url);
     kokoroAudio = el;
+    // v15.1: registrar el <audio> para que la cola de voz pueda
+    // comprobar que de verdad paró antes de arrancar la siguiente voz.
+    const unregister = registerVoiceOutput({
+      stop: () => { try { el.pause(); } catch (e) {} },
+      isAlive: () => { try { return !el.paused && !el.ended; } catch (e) { return false; } },
+    });
     try { await el.play(); } catch (e) {
       if (kokoroAudio === el) kokoroAudio = null;
       kokoroUrls.delete(url);
       try { URL.revokeObjectURL(url); } catch (e2) {}
+      try { unregister(); } catch (e3) {}
       return;
     }
     await new Promise((resolve) => { el.onended = resolve; el.onerror = resolve; el.onpause = resolve; });
     if (kokoroAudio === el) kokoroAudio = null;
     kokoroUrls.delete(url);
     try { URL.revokeObjectURL(url); } catch (e) {}
+    try { unregister(); } catch (e2) {}
   }
 
   // Voz de Dora (v9): por frases, con la siguiente ya generándose mientras
@@ -1188,6 +1272,7 @@
     let cancelled = false;
     let el = null;
     let msUrl = null;
+    let unregisterAudio = () => {}; // v15.1: baja del registro al limpiar
     function cancel() {
       cancelled = true;
       try { abortCtl.abort(); } catch (e) {}
@@ -1195,6 +1280,7 @@
       try { if (el) el.pause(); } catch (e) {}
     }
     function cleanup() {
+      try { unregisterAudio(); } catch (e) {}
       if (openaiStreamPlayer && openaiStreamPlayer.cancel === cancel) openaiStreamPlayer = null;
       if (kokoroAudio === el) kokoroAudio = null;
       if (msUrl) { kokoroUrls.delete(msUrl); try { URL.revokeObjectURL(msUrl); } catch (e) {} msUrl = null; }
@@ -1223,6 +1309,12 @@
       el = new Audio();
       el.src = msUrl;
       kokoroAudio = el;
+      // v15.1: registrar el <audio> del stream para que la cola de voz
+      // pueda comprobar que de verdad paró antes de la siguiente voz.
+      unregisterAudio = registerVoiceOutput({
+        stop: () => { try { el.pause(); } catch (e) {} },
+        isAlive: () => { try { return !el.paused && !el.ended; } catch (e) { return false; } },
+      });
       let heard = false; // al menos un trozo se anexó (la frase sí sonó)
       const endedP = new Promise((resolve) => {
         el.onended = () => resolve(true);
@@ -1422,7 +1514,12 @@
       const part = queue.parts[i];
       let heard = false;
       if (useOpenAI) {
-        let player = nextPlayer;
+        // v15.1: el prefetch devuelve una PROMESA — hay que esperarla.
+        // Antes se usaba tal cual y `player.play()` reventaba con
+        // "player.play is not a function" en la segunda parte del stream
+        // (bug real cazado por el test de voz de v15.1: el stream solo
+        // hablaba la primera frase y moría en silencio).
+        let player = nextPlayer ? await nextPlayer : null;
         nextPlayer = null;
         if (!player) player = await requestOpenAIPart(part, gen);
         if (gen !== speakGen || !speaking) { if (player) player.cancel(); cancelNext(); return; }
@@ -1601,18 +1698,26 @@
       // curso hablaría aunque speak() estuviera frenado.
       if (silent) return;
       if (speakerPromise) return;
-      stopSpeaking();
+      // v15.1: el hablador del stream pasa por la misma cola serializada
+      // que speak() — una sola voz a la vez, con parada comprobada antes
+      // de arrancar (ver speak()).
       const gen = ++speakGen;
-      speaking = true;
-      speakStartedAt = Date.now();
-      interruptRestarts = 0;
-      interruptStartTries = 0;
-      status('Hablando…', 'speaking');
-      startInterruptListener();
-      speakerPromise = (async () => {
+      const task = voiceQueue.then(async () => {
+        if (gen !== speakGen || silent) return;
+        stopAllVoicesNow();
+        await waitVoicesStopped();
+        if (gen !== speakGen || silent) return;
+        speaking = true;
+        speakStartedAt = Date.now();
+        interruptRestarts = 0;
+        interruptStartTries = 0;
+        status('Hablando…', 'speaking');
+        startInterruptListener();
         try { await speakStreamParts(queue, gen); }
         finally { if (gen === speakGen) stopInterruptListener(); }
-      })();
+      });
+      voiceQueue = task.catch(() => {});
+      speakerPromise = task;
     };
     const applyDone = (data) => {
       pendingToken = data.needs_confirmation ? data.confirm_token : null;
@@ -2146,7 +2251,7 @@
       isisWakeCheck, isisVoiceBandRatio, isisBandLevel, gateHeard, gateInterrupt,
       createVoiceBandMeter, voiceBandMeter,
       getFollowUpOpen: () => followUpOpen, setFollowUpOpen: (v) => { followUpOpen = !!v; },
-      getIgnoredHeard: () => ignoredHeard, sendIsisText,
+      getIgnoredHeard: () => ignoredHeard, sendIsisText, announceKokoroReady,
       startInterruptListener, stopInterruptListener, handleInterrupt,
       getInterruptRecognizer: () => interruptRecognizer,
       setSpeaking: (v) => { speaking = !!v; speakStartedAt = Date.now() - 2000; },
