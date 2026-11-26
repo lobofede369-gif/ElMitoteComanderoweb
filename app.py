@@ -1067,9 +1067,10 @@ OPENAI_TTS_SPEED = _env_tts_speed()
 # teléfono con su jefe, pero despierta y con energía: ritmo ágil y
 # pausas cortas, sin arrastrar las palabras ni sonar robot o exagerada.
 _ISIS_TTS_INSTRUCTIONS_DEFAULT = ('Habla con voz cálida y natural, como la gerente de un restaurante '
-    'mexicano hablando por teléfono con su jefe: cercana, segura y clara, despierta y con energía, '
-    'con ritmo ágil y pausas cortas, sin arrastrar las palabras. Nunca suenes robot, ni lenta, '
-    'ni exagerada.')
+    'mexicano hablando por teléfono con su jefe: cercana, segura y clara, despierta y con energía. '
+    'Varía la entonación como una persona: sube un poco la voz en lo importante, baja al cerrar cada '
+    'idea, y respira entre frases. No hables plana ni apurada, tampoco lenta ni exagerada. '
+    'Nunca suenes robot.')
 OPENAI_TTS_INSTRUCTIONS = (os.getenv('OPENAI_TTS_INSTRUCTIONS', '') or _ISIS_TTS_INSTRUCTIONS_DEFAULT).strip() or _ISIS_TTS_INSTRUCTIONS_DEFAULT
 OPENAI_TTS_URL = 'https://api.openai.com/v1/audio/speech'
 _ISIS_CONFIRM = {}  # token -> {'intent': dict, 'expires': float}
