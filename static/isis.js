@@ -134,7 +134,20 @@
   // sonaba lenta y adormilada en el teléfono. La espera ya no se habla
   // (v13): es un tono suave, nunca la voz del teléfono.
   const KOKORO_SPEED = 1.05; // kokoro-js: generate(text, { voice, speed })
-  const PART_PAUSE_MS = 100; // respiro entre frases
+  const PART_PAUSE_MS = 100; // respiro base entre frases
+  // Pausa con ritmo natural (v15.2): antes todas las pausas entre frases
+  // eran 100 ms iguales y la voz sonaba mecánica. Una persona respira
+  // más al cerrar una idea que tras una coma, y casi nada si la frase se
+  // cortó a mitad de idea. La pausa se decide por cómo termina la parte
+  // (las partes conservan su signo final; ver splitIntoSpeechParts).
+  const PAUSE_COMMA_MS = 180; // tras coma, punto y coma o dos puntos
+  const PAUSE_SENTENCE_MS = 350; // tras punto, ?, ! o …
+  function pauseAfterPart(part) {
+    const t = (part || '').trim();
+    if (/[.!?…]$/.test(t)) return PAUSE_SENTENCE_MS;
+    if (/[,;:]$/.test(t)) return PAUSE_COMMA_MS;
+    return PART_PAUSE_MS; // corte a mitad de idea: respiro corto
+  }
   const WAIT_DELAY_MS = 3000; // el tono de espera solo sale si la respuesta sí tarda (v13: ya no se habla la frase de espera)
   const CHAT_TIMEOUT_MS = 15000; // la petición de chat no cuelga la llamada
   const OPENAI_TTS_TIMEOUT_MS = 8000; // por frase: si tarda, Dora cubre
@@ -1078,7 +1091,7 @@
       if (gen !== speakGen || !speaking) return;
       await speakPhonePart(parts[i], gen);
       if (gen !== speakGen || !speaking) return;
-      if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, PART_PAUSE_MS));
+      if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, pauseAfterPart(parts[i])));
     }
     // keepSpeaking: se usa como respaldo de una parte de Dora; el `speaking`
     // lo apaga el speak de Dora en curso, no esta parte.
@@ -1213,7 +1226,7 @@
       }
       if (gen !== speakGen || !speaking) return;
       // Pausa corta entre frases, para que respire.
-      if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, PART_PAUSE_MS));
+      if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, pauseAfterPart(parts[i])));
     }
     speaking = false;
   }
@@ -1484,7 +1497,7 @@
         return;
       }
       // Pausa corta entre frases, para que respire.
-      if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, PART_PAUSE_MS));
+      if (i + 1 < parts.length) await new Promise((r) => setTimeout(r, pauseAfterPart(parts[i])));
     }
     speaking = false;
   }
@@ -1546,7 +1559,7 @@
       }
       if (gen !== speakGen || !speaking) { cancelNext(); return; }
       i++;
-      if (i < queue.parts.length || !queue.done) await new Promise((r) => setTimeout(r, PART_PAUSE_MS));
+      if (i < queue.parts.length || !queue.done) await new Promise((r) => setTimeout(r, pauseAfterPart(part)));
     }
     speaking = false;
   }
@@ -2252,6 +2265,7 @@
       createVoiceBandMeter, voiceBandMeter,
       getFollowUpOpen: () => followUpOpen, setFollowUpOpen: (v) => { followUpOpen = !!v; },
       getIgnoredHeard: () => ignoredHeard, sendIsisText, announceKokoroReady,
+      pauseAfterPart,
       startInterruptListener, stopInterruptListener, handleInterrupt,
       getInterruptRecognizer: () => interruptRecognizer,
       setSpeaking: (v) => { speaking = !!v; speakStartedAt = Date.now() - 2000; },
