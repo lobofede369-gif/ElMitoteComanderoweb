@@ -20,7 +20,7 @@ import menu_photo_import as photo
 # Prepara un catálogo con 38 artículos existentes y seis precios antiguos.
 app.bootstrap()
 manifest,sha=photo.photo_manifest()
-assert len(manifest["entries"])==61
+assert len(manifest["entries"])==70
 with app.SessionLocal() as db:
     for i,item in enumerate(manifest["entries"][:38]):
         db.add(app.Product(name=item["aliases"][0] if item["aliases"] else item["name"],
@@ -30,16 +30,16 @@ with app.SessionLocal() as db:
     db.commit()
 
 os.environ["MENU_PHOTO_IMPORT_APPROVED_VERSION"]=manifest["version"]
-os.environ["MENU_PHOTO_IMPORT_EXPECT_NEW"]="23"
+os.environ["MENU_PHOTO_IMPORT_EXPECT_NEW"]="32"
 os.environ["MENU_PHOTO_IMPORT_EXPECT_EXISTING"]="38"
 app.bootstrap()
 with app.SessionLocal() as db:
     r=db.scalars(app.select(app.Product)).all()
-    assert len(r)==61
-    assert len({p.category for p in r})==12
-    assert len({photo.norm(p.name) for p in r})==61
+    assert len(r)==70
+    assert len({p.category for p in r})==13
+    assert len({photo.norm(p.name) for p in r})==70
     approved=db.get(photo.MenuPhotoApplied,sha)
-    assert approved and approved.created_count==23
+    assert approved and approved.created_count==32
     assert approved.updated_count==38
     assert [x.price_cents for x in r if x.name=="Costillas BBQ"]==[17000]
     assert len([p for p in r if p.stock==8])==38
@@ -49,7 +49,7 @@ with app.SessionLocal() as db:
 
 app.bootstrap()
 with app.SessionLocal() as db:
-    assert db.scalar(app.select(app.func.count()).select_from(app.Product))==61
+    assert db.scalar(app.select(app.func.count()).select_from(app.Product))==70
     assert db.scalar(app.select(app.func.count()).select_from(app.Audit).where(
         app.Audit.action=="menu.photo_approved_import"))==1
     assert db.scalar(app.select(app.func.count()).select_from(photo.MenuPhotoApplied))==1
@@ -57,5 +57,5 @@ with app.SessionLocal() as db:
 os.environ.pop("MENU_PHOTO_IMPORT_APPROVED_VERSION",None)
 os.environ.pop("MENU_PHOTO_IMPORT_EXPECT_NEW",None)
 os.environ.pop("MENU_PHOTO_IMPORT_EXPECT_EXISTING",None)
-print("OK: 61 productos, 12 categorías, 23 nuevos, 38 actualizados, seis cambios de precio, reinicio idempotente")
+print("OK: 70 productos, 13 categorías, 32 nuevos, 38 actualizados, seis cambios de precio, reinicio idempotente")
 file.unlink(missing_ok=True)

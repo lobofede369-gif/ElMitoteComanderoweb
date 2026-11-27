@@ -23,17 +23,17 @@ with TestClient(app.app) as client:
     preview=client.get("/api/menu/photo-preview",headers=headers)
     assert preview.status_code==200,preview.text
     data=preview.json()
-    assert data["total"]==61 and data["counts"]["update"]==1
-    assert data["counts"]["create"]==60
+    assert data["total"]==70 and data["counts"]["update"]==1
+    assert data["counts"]["create"]==69
     result=client.post("/api/menu/photo-apply",headers=headers,
       json={"preview_token":data["preview_token"],"confirm":True})
     assert result.status_code==200,result.text
     all_products=client.get("/api/products",headers=headers).json()
-    assert len(all_products)==61
-    assert len({x["category"] for x in all_products})==12
+    assert len(all_products)==70
+    assert len({x["category"] for x in all_products})==13
     assert next(x for x in all_products if x["name"]=="Birriaquiles")["price"]=="110.00"
     refreshed=client.get("/api/menu/photo-preview",headers=headers).json()
-    assert refreshed["counts"]["unchanged"]==61
+    assert refreshed["counts"]["unchanged"]==70
     invalid=client.post("/api/categories/remove",headers=headers,
       json={"name":"SODAS ITALIANAS","destination":"Refrescos preparados",
             "expected_visible_count":2})
@@ -45,5 +45,5 @@ with TestClient(app.app) as client:
     after=client.get("/api/products",headers=headers).json()
     assert not any(x["category"]=="SODAS ITALIANAS" for x in after)
     assert len([x for x in after if x["category"]=="Refrescos preparados"])==3
-print("OK importador: 61 productos, 12 categorias, sin duplicados, cambios de precio y borrar categoria")
+print("OK importador: 70 productos, 13 categorias, sin duplicados, cambios de precio y borrar categoria")
 p.unlink(missing_ok=True)
