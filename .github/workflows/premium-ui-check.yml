@@ -41,7 +41,7 @@ jobs:
           # desde index.html y lo valida scripts/test_performance_regressions.py.
           assert '/static/theme-obsidian-titanium.css?v=1' in html
           assert '/static/theme-obsidian-modules.css?v=2' in html
-          assert '/static/app.js?v=37' in html
+          assert '/static/app.js?v=38' in html
           assert 'function setConnectionState(connected)' in app
           assert "syncWaiterReadyAlerts" in app
           assert "case 'deliver-ready':" in app
