@@ -40,8 +40,8 @@ def photo_manifest():
     raw = SOURCE.read_bytes()
     payload = json.loads(raw)
     entries = payload["entries"]
-    if len(entries) != 61:
-        raise RuntimeError("El catálogo de fotografías no contiene 61 productos")
+    if len(entries) != 70:
+        raise RuntimeError("El catálogo de fotografías no contiene 70 productos")
     return payload, hashlib.sha256(raw).hexdigest()
 
 
