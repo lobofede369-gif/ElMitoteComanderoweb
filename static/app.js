@@ -406,7 +406,7 @@ async function showOrders(){
   const open=arr.filter(x=>x.status==='open');
   const current=arr.find(x=>x.id===state.account);
   if(current&&current.status==='pending'){
-    const draftNote=state.draft.length?`<div class="note">Tienes una comanda sin enviar en esta cuenta (${state.draft.length} producto(s)). Se conserva hasta que la cuenta se reabra.</div>`'';
+    const draftNote=state.draft.length?`<div class="note">Tienes una comanda sin enviar en esta cuenta (${state.draft.length} producto(s)). Se conserva hasta que la cuenta se reabra.</div>`:'';
     return `<button class="outline small" data-nav="accounts">← Volver</button>${draftNote}${await accountDetailHtml(current.id,false)}`;
   }
   if(!open.length)return '<div class="empty">No tienes cuentas abiertas. Crea una para comenzar.</div><p><button class="primary" data-nav="new">Nueva cuenta</button></p>';
