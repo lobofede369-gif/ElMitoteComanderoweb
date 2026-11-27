@@ -1,5 +1,5 @@
 {
-  "version": "2026-11-04-fotos-menu-el-mitote",
+  "version": "2026-11-27-fotos-menu-el-mitote-desayunos",
   "source": "Fotografías proporcionadas por el propietario. Precios expresados en MXN.",
   "entries": [
     {
@@ -485,6 +485,81 @@
       "station": "kitchen",
       "aliases": [
         "Gringa De Birria"
+      ]
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Enfrijoladas",
+      "price": 100,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Chilaquiles verdes o rojos",
+      "price": 120,
+      "station": "kitchen",
+      "aliases": [
+        "Chilaquiles verdes",
+        "Chilaquiles rojos",
+        "Chilaquiles"
+      ]
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Chilaquiles con arrachera",
+      "price": 140,
+      "station": "kitchen",
+      "aliases": [
+        "Chilaquiles arrachera"
+      ]
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Chilaquiles con huevo",
+      "price": 100,
+      "station": "kitchen",
+      "aliases": [
+        "Chilaquiles huevo"
+      ]
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Huevos divorciados",
+      "price": 100,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Huevos Motuleños",
+      "price": 100,
+      "station": "kitchen",
+      "aliases": [
+        "Huevos motuleños"
+      ]
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Enchiladas",
+      "price": 120,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Huevos al gusto",
+      "price": 75,
+      "station": "kitchen",
+      "aliases": []
+    },
+    {
+      "category": "DESAYUNOS",
+      "name": "Hotcakes",
+      "price": 90,
+      "station": "kitchen",
+      "aliases": [
+        "Hot cakes"
       ]
     }
   ]
